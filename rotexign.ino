@@ -84,6 +84,9 @@ volatile uint8_t error_flags = 0;
 bool serial_enabled = false;
 uint32_t last_diagnostic_time = 0;
 
+// Declare runtime_theta_trigger as a global variable
+float runtime_theta_trigger = THETA_TRIGGER; // Initialize with the default value
+
 // ========== UTILITY FUNCTIONS ==========
 inline uint32_t us_to_ticks(uint32_t microseconds) {
   return microseconds * 2UL;  // 0.5µs per tick at prescaler 8
@@ -261,7 +264,7 @@ void handle_serial_commands() {
   } else if (command.startsWith(F("ADVANCE "))) {
     // Real-time advance adjustment (for tuning)
     float new_advance = command.substring(8).toFloat();
-    THETA_TRIGGER = new_advance; // Update global variable
+    runtime_theta_trigger = new_advance; // Update runtime variable
     Serial.print(F("Advance set to: "));
     Serial.println(new_advance);
   }
@@ -447,7 +450,7 @@ void loop() {
         }
 
         // Angle after pickup to fire
-        float delta_theta = THETA_TRIGGER - theta_spark;
+        float delta_theta = runtime_theta_trigger - theta_spark;
         if (delta_theta < 0) delta_theta += 360.0f; // next revolution
 
         // Delay in ticks (float math only in main loop)
