@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors/IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Arduino / AVR build artifacts
+build/
+.arduino*
+*.hex
+*.elf
+*.bin
+*.map
+*.eep
+
+# Logs / temp
+*.log
+*.tmp
+tmp/
+
+# PlatformIO (if used)
+.pio/
+.pioenvs/
+.clangd
