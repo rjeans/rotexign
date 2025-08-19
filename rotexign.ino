@@ -5,7 +5,7 @@
  * Features:
  * - Sub-microsecond timing precision using Timer1 Input Capture
  * - One-revolution-ahead scheduling for high advance angles
- * - CDI and Inductive coil support
+ * - Inductive (smart coil) support only (CDI removed)
  * - Comprehensive safety systems
  * - Serial tuning interface
  * - Real-time diagnostics
@@ -13,13 +13,13 @@
  * Hardware Requirements:
  * - Arduino Uno/Nano (ATmega328P)
  * - Optocoupler for magneto pickup isolation
- * - Output drivers for CDI/Coil control
+ * - Output drivers for smart coil control
  * - Kill switch input
  * 
  * Pin Assignments:
  * - D2 (INT0): Magneto pickup input (via optocoupler, falling edge)
  * - D9 (OC1A): Primary spark output
- * - D10 (OC1B): Secondary output (pulse end/dwell start)
+ * - D10 (OC1B): Dwell marker (HIGH during dwell)
  * - D7: Kill switch input (active low)
  * - D13: Status LED
  * - A0: Optional analog input for real-time tuning
@@ -30,13 +30,13 @@
 #include <avr/pgmspace.h>
 
 // ========== CONFIGURATION ==========
-const bool CDI_MODE = false;             // true=CDI, false=Inductive (smart coil per design notes)
+// CDI mode removed; this firmware now targets a smart coil (inductive)
 const uint8_t PPR = 2;                   // Pulses per revolution (two lobes)                   // Pulses per revolution
 const float THETA_TRIGGER = 47.0;        // Trigger occurs 47° BTDC (TDC = 47° after trigger)        // Pickup angle (degrees BTDC)
 const uint16_t REV_LIMIT = 7000;         // RPM rev limiter per design notes        // RPM rev limiter
 const uint16_t CRANK_RPM = 400;          // Cranking RPM threshold
 const float CRANK_ADV = 3.0;             // Cranking advance (degrees BTDC)
-const uint16_t CDI_PULSE_US = 200;       // CDI trigger pulse width
+// CDI pulse width removed (CDI mode deleted)
 const uint16_t DWELL_MS = 3;             // Inductive dwell time
 const uint16_t MAX_RPM = 8000;           // Maximum valid RPM          // Maximum valid RPM
 const uint16_t MIN_RPM = 200;            // Minimum valid RPM
@@ -47,7 +47,9 @@ const uint8_t TRIGGER_INPUT_PIN = 2;     // INT0 external interrupt (falling edg
 const uint8_t KILL_SWITCH_PIN = 7;
 const uint8_t STATUS_LED_PIN = 13;
 const uint8_t SPARK_OUTPUT_PIN = 9;      // OC1A (PB1)
-const uint8_t AUX_OUTPUT_PIN = 10;       // OC1B (PB2)
+const uint8_t AUX_OUTPUT_PIN = 10;       // OC1B (PB2) — dwell marker output
+const uint8_t COIL_GND_RELAY_PIN = 3;    // Grounds coil control during startup
+const uint8_t OPTO_SHORT_RELAY_PIN = 4;  // Removes short from optocoupler after boot
 
 // Timing curve - RPM vs Advance (degrees BTDC)
 const uint16_t bp_rpm[] PROGMEM = {0, 800, 1500, 3000, 5000, 7000, 9000, 11000, 12000};
@@ -58,7 +60,7 @@ const uint8_t N_BP = sizeof(bp_rpm) / sizeof(bp_rpm[0]);
 
 // ========== GLOBAL VARIABLES ==========
 // Volatile variables shared with ISRs
-volatile uint16_t last_capture = 0;
+volatile uint16_t last_capture = 0;      // last accepted trigger capture (Timer1 ticks)
 volatile uint32_t period_ticks = 0;
 volatile uint16_t rpm_filtered = 0;
 volatile bool new_period_flag = false;
@@ -144,6 +146,19 @@ inline void spark_pin_low()  { PORTB &= (uint8_t)~_BV(PB1); }
 inline void aux_pin_high()   { PORTB |= _BV(PB2); }
 inline void aux_pin_low()    { PORTB &= (uint8_t)~_BV(PB2); }
 
+// Coil control polarity: set to false for hardware where LOW energizes coil (inverted stage)
+const bool COIL_ACTIVE_HIGH = false;
+
+// D10 is used as a dwell marker: HIGH while coil is charging
+inline void coil_on()  {
+  if (COIL_ACTIVE_HIGH) spark_pin_high(); else spark_pin_low();
+  aux_pin_high();
+}
+inline void coil_off() {
+  if (COIL_ACTIVE_HIGH) spark_pin_low();  else spark_pin_high();
+  aux_pin_low();
+}
+
 // ========== TIMER1 + INT0 SETUP ==========
 void setup_timer1() {
   // Disable interrupts during setup
@@ -158,8 +173,8 @@ void setup_timer1() {
   // Prescaler = 8 (0.5µs resolution at 16MHz)
   TCCR1B = _BV(CS11);
   
-  // Enable Compare Match interrupts
-  TIMSK1 = _BV(OCIE1A) | _BV(OCIE1B);
+  // Disable Compare Match interrupts until events are scheduled
+  TIMSK1 = 0;
 
   // Configure External Interrupt INT0 (D2) on falling edge (negative pulse first)
   EICRA = (1 << ISC01);  // ISC01=1, ISC00=0 -> falling edge
@@ -169,8 +184,8 @@ void setup_timer1() {
   // Configure OC1A and OC1B pins as outputs
   pinMode(SPARK_OUTPUT_PIN, OUTPUT);
   pinMode(AUX_OUTPUT_PIN, OUTPUT);
-  digitalWrite(SPARK_OUTPUT_PIN, LOW);
-  digitalWrite(AUX_OUTPUT_PIN, LOW);
+  // Ensure safe idle: coil off, dwell marker low
+  coil_off();
   
   sei();
 }
@@ -178,54 +193,43 @@ void setup_timer1() {
 // ========== EXTERNAL TRIGGER ISR ==========
 ISR(INT0_vect) {
   uint16_t current_capture = TCNT1;
-  uint32_t current_time = millis();
-  
-  // Calculate period with 16-bit overflow handling
-  uint16_t raw_period = current_capture - last_capture;
-  last_capture = current_capture;
-  
-  // Reject impossible periods (< 0.5ms)
-  if (raw_period < us_to_ticks(500)) {
+
+  // Calculate time since last accepted trigger (handles 16-bit wrap naturally)
+  uint16_t dt = current_capture - last_capture;
+
+  // Reject impossible/too-short intervals (glitches, spark noise)
+  if (dt < us_to_ticks(500)) { // <0.5ms
+    glitch_count++;
+    return;
+  }
+  if (dt < us_to_ticks(2000)) { // additional guard: <2ms
     glitch_count++;
     return;
   }
 
-  // Add debounce logic for input pulses
-  if (current_time - last_pulse_time < 2) { // Reject pulses within 2 ms
-    glitch_count++;
-    return;
-  }
-  
-  // Update period (no PPR scaling here) and set flag for main loop processing
-  period_ticks = (uint32_t)raw_period;
+  // Accept this trigger
+  last_capture = current_capture;
+  period_ticks = (uint32_t)dt;
   new_period_flag = true;
-  last_pulse_time = current_time;
+  last_pulse_time = millis(); // only used outside ISR
   pulse_count++;
   missed_pulses = 0;
   engine_running = true;
-  // Defer heavy computation and GPIO reads to main loop
 }
 
 // ========== COMPARE MATCH A ISR (Spark Event) ==========
 ISR(TIMER1_COMPA_vect) {
-  // Primary event: For CDI, start pulse (HIGH). For Inductive, end dwell (LOW = spark)
-  if (CDI_MODE) {
-    spark_pin_high();
-  } else {
-    spark_pin_low();
-  }
+  // Inductive coil: end dwell (spark). One-shot compare: disable A interrupt.
+  coil_off();
+  TIMSK1 &= (uint8_t)~_BV(OCIE1A);
   spark_count++;
 }
 
-// ========== COMPARE MATCH B ISR (Auxiliary Event) ==========
+// ========== COMPARE MATCH B ISR (Dwell Start) ==========
 ISR(TIMER1_COMPB_vect) {
-  if (CDI_MODE) {
-    // End of CDI pulse
-    spark_pin_low();
-  } else {
-    // Inductive: Dwell start (coil ON)
-    spark_pin_high();
-  }
+  // Inductive coil: dwell start (coil ON). One-shot compare: disable B interrupt.
+  coil_on();
+  TIMSK1 &= (uint8_t)~_BV(OCIE1B);
 }
 
 // ========== WATCHDOG AND TIMEOUT HANDLING ==========
@@ -235,8 +239,9 @@ void check_engine_timeout() {
   if (engine_running && (current_time - last_pulse_time) > TIMEOUT_MS) {
     // Engine stopped - disable outputs and reset state
     engine_running = false;
-    spark_pin_low();
-    aux_pin_low();
+    coil_off();
+    // Cancel any scheduled compare matches
+    TIMSK1 &= (uint8_t)~(_BV(OCIE1A) | _BV(OCIE1B));
     error_flags |= ERROR_NO_SIGNAL;
     missed_pulses++;
   } else {
@@ -245,28 +250,61 @@ void check_engine_timeout() {
 }
 
 // ========== SERIAL COMMUNICATION ==========
-void handle_serial_commands() {
-  if (!Serial.available()) return;
-  
-  String command = Serial.readStringUntil('\n');
-  command.trim();
-  
-  if (command == F("STATUS")) {
+static void process_command(char* cmd) {
+  // Convert to uppercase in-place for case-insensitive compare
+  for (char* p = cmd; *p; ++p) {
+    if (*p >= 'a' && *p <= 'z') *p = *p - 'a' + 'A';
+  }
+
+  if (strcmp(cmd, "STATUS") == 0) {
     print_status();
-  } else if (command == F("DIAG")) {
+    return;
+  }
+  if (strcmp(cmd, "DIAG") == 0) {
     print_diagnostics();
-  } else if (command == F("RESET")) {
-    // Reset error counters
+    return;
+  }
+  if (strcmp(cmd, "RESET") == 0) {
     glitch_count = 0;
     rev_limit_count = 0;
     error_flags = 0;
     Serial.println(F("Counters reset"));
-  } else if (command.startsWith(F("ADVANCE "))) {
-    // Real-time advance adjustment (for tuning)
-    float new_advance = command.substring(8).toFloat();
-    runtime_theta_trigger = new_advance; // Update runtime variable
-    Serial.print(F("Advance set to: "));
-    Serial.println(new_advance);
+    return;
+  }
+  if (strncmp(cmd, "ADVANCE", 7) == 0) {
+    char* p = cmd + 7;
+    while (*p == ' ') p++;
+    if (*p) {
+      float new_adv = atof(p);
+      runtime_theta_trigger = new_adv;
+      Serial.print(F("Advance set to: "));
+      Serial.println(new_adv);
+    } else {
+      Serial.print(F("Advance current: "));
+      Serial.println(runtime_theta_trigger);
+    }
+    return;
+  }
+  Serial.print(F("Unknown command: "));
+  Serial.println(cmd);
+}
+
+void handle_serial_commands() {
+  static char buf[48];
+  static uint8_t idx = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      buf[idx] = '\0';
+      if (idx > 0) process_command(buf);
+      idx = 0;
+    } else if (idx < sizeof(buf) - 1) {
+      buf[idx++] = c;
+    } else {
+      // overflow: reset buffer
+      idx = 0;
+    }
   }
 }
 
@@ -338,8 +376,8 @@ bool is_rev_limited(uint16_t rpm, uint16_t limit, uint16_t hysteresis, bool& rev
 
 // Helper function to initialize relay logic during startup
 void initialize_relay() {
-    digitalWrite(3, HIGH);   // Ground the output to the coil
-    digitalWrite(4, HIGH);   // Remove short circuit from optocoupler
+    digitalWrite(COIL_GND_RELAY_PIN, HIGH);   // Ground the output to the coil
+    digitalWrite(OPTO_SHORT_RELAY_PIN, HIGH); // Remove short circuit from optocoupler
 }
 
 // ========== UPDATED SETUP FUNCTION ==========
@@ -354,9 +392,11 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
     pinMode(SPARK_OUTPUT_PIN, OUTPUT);
-    digitalWrite(SPARK_OUTPUT_PIN, LOW);
     pinMode(AUX_OUTPUT_PIN, OUTPUT);
-    digitalWrite(AUX_OUTPUT_PIN, LOW);
+    pinMode(COIL_GND_RELAY_PIN, OUTPUT);
+    pinMode(OPTO_SHORT_RELAY_PIN, OUTPUT);
+    // Safe idle: coil off, dwell marker low
+    coil_off();
 
     // Initialize relay logic
     initialize_relay();
@@ -369,9 +409,9 @@ void setup() {
 
     // Startup message
     Serial.println(F("Arduino Ignition Controller v1.0"));
-    Serial.println(String(F("Mode: ")) + String(CDI_MODE ? F("CDI") : F("Inductive")));
-    Serial.println(String(F("Pickup Angle: ")) + String(THETA_TRIGGER) + String(F("° BTDC")));
-    Serial.println(String(F("Rev Limit: ")) + String(REV_LIMIT) + String(F(" RPM")));
+    Serial.println(F("Mode: Smart coil"));
+    Serial.print(F("Pickup Angle: ")); Serial.print(THETA_TRIGGER); Serial.println(F("° BTDC"));
+    Serial.print(F("Rev Limit: ")); Serial.print(REV_LIMIT); Serial.println(F(" RPM"));
     Serial.println(F("Ready for operation..."));
 
     // Initial LED pattern
@@ -407,8 +447,29 @@ void loop() {
     // Update status LED
     update_status_led();
 
+    // Read and debounce kill switch (active LOW)
+    static bool ks_state = false;           // debounced state
+    static bool ks_last_read = false;       // last sampled level
+    static uint32_t ks_last_change = 0;
+    bool ks_read = (digitalRead(KILL_SWITCH_PIN) == LOW);
+    if (ks_read != ks_last_read) {
+        ks_last_change = millis();
+        ks_last_read = ks_read;
+    } else if (millis() - ks_last_change >= 20) { // 20ms stable
+        ks_state = ks_read;
+    }
+    kill_switch_active = ks_state;
+    if (kill_switch_active) {
+        // Force coil off and cancel any scheduled events
+        coil_off();
+        TIMSK1 &= (uint8_t)~(_BV(OCIE1A) | _BV(OCIE1B));
+        error_flags |= ERROR_KILL_SWITCH;
+    } else {
+        error_flags &= (uint8_t)~ERROR_KILL_SWITCH;
+    }
+
     // Process new period data and schedule events
-    if (new_period_flag) {
+    if (new_period_flag && !kill_switch_active) {
         noInterrupts();
         new_period_flag = false;
         uint32_t pt = period_ticks;
@@ -427,14 +488,6 @@ void loop() {
         // Filter RPM
         rpm_filtered = filter_rpm(current_rpm, rpm_filtered);
 
-        // Kill switch check with debounce
-        static uint32_t last_kill_check = 0;
-        if (!debounce_signal(millis(), last_kill_check, 50)) {
-            digitalWrite(SPARK_OUTPUT_PIN, LOW);
-            digitalWrite(AUX_OUTPUT_PIN, LOW);
-            return;
-        }
-
         // Desired advance
         float theta_spark = (rpm_filtered < CRANK_RPM) ? CRANK_ADV : get_advance_for_rpm(rpm_filtered);
 
@@ -446,6 +499,10 @@ void loop() {
         // Rev limiting: hard cut above limit per design notes
         static bool rev_limit_active = false;
         if (is_rev_limited(rpm_filtered, REV_LIMIT, 100, rev_limit_active)) {
+            // Cancel any scheduled events and keep coil off
+            TIMSK1 &= (uint8_t)~(_BV(OCIE1A) | _BV(OCIE1B));
+            coil_off();
+            rev_limit_count++;
             return; // Skip spark event
         }
 
@@ -458,21 +515,36 @@ void loop() {
         uint32_t delay_ticks = (uint32_t)((float)pt360 * delta_theta / 360.0f);
         uint16_t spark_time = last_cap + (uint16_t)delay_ticks;
 
-        if (CDI_MODE) {
-            // Pulse HIGH then LOW on SPARK pin
-            OCR1A = spark_time;
-            OCR1B = spark_time + (uint16_t)us_to_ticks(CDI_PULSE_US);
-        } else {
-            // Inductive: dwell then spark (same SPARK pin)
-            uint32_t dwell_ticks = ms_to_ticks(DWELL_MS);
-            uint32_t max_dwell_ticks = (pt360 * 40UL) / 100UL;
-            if (dwell_ticks > max_dwell_ticks) dwell_ticks = max_dwell_ticks;
-            if (delay_ticks <= dwell_ticks) {
-                delay_ticks += pt360; // add 360° cycle
-                spark_time = last_cap + (uint16_t)delay_ticks;
-            }
-            OCR1B = spark_time - (uint16_t)dwell_ticks; // coil ON
-            OCR1A = spark_time;                          // coil OFF (spark)
+        // Inductive: dwell then spark (same SPARK pin)
+        uint32_t dwell_ticks = ms_to_ticks(DWELL_MS);
+        uint32_t max_dwell_ticks = (pt360 * 40UL) / 100UL;
+        if (dwell_ticks > max_dwell_ticks) dwell_ticks = max_dwell_ticks;
+        if (delay_ticks <= dwell_ticks) {
+            delay_ticks += pt360; // add 360° cycle
+            spark_time = last_cap + (uint16_t)delay_ticks;
         }
+        uint16_t dwell_start = spark_time - (uint16_t)dwell_ticks;
+
+        // Guard against scheduling too close to now
+        noInterrupts();
+        uint16_t now = TCNT1;
+        OCR1B = dwell_start;
+        OCR1A = spark_time;
+        // Ensure a small margin (~16us) to avoid immediate compare fire
+        const int16_t margin = 32; // ticks (0.5us per tick)
+        int16_t dB = (int16_t)(OCR1B - now);
+        if (dB < margin) {
+            uint16_t shift = (uint16_t)(margin - dB);
+            OCR1B += shift;
+            OCR1A += shift; // maintain dwell duration
+        }
+        int16_t dA = (int16_t)(OCR1A - OCR1B);
+        if (dA < margin) {
+            OCR1A = OCR1B + margin; // ensure ordering
+        }
+        // Arm one-shot compares: clear flags then enable interrupts
+        TIFR1 = _BV(OCF1A) | _BV(OCF1B);
+        TIMSK1 |= _BV(OCIE1A) | _BV(OCIE1B);
+        interrupts();
     }
 }

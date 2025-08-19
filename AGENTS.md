@@ -2,16 +2,16 @@
 
 ## Project Structure & Module Organization
 - `rotexign.ino`: Main Arduino sketch (ATmega328P: Uno/Nano). INT0 (D2) trigger, Timer1 timebase, dwell/spark scheduling, serial.
-- `doc/ignitioncontroller.md`: System overview and hardware wiring.
-- `doc/testing_calibration_guide.md`: Bench testing and calibration steps.
- - `doc/AgentDesignNotes.md`: Canonical design constraints and wiring notes.
+- `doc/IgnitionControllerDesignNotes.md`: System overview and hardware wiring.
+- `doc/TestingCalibrationGuide.md`: Bench testing and calibration steps.
+- `doc/AgentDesignNotes.md`: Canonical design constraints and wiring notes.
 
 ## Build, Test, and Development Commands
 - Arduino IDE: Open the repo folder, select board/port, and upload.
 - Arduino CLI: `arduino-cli core update-index && arduino-cli core install arduino:avr`
   - Compile: `make build FQBN=arduino:avr:uno`
   - Upload: `make upload FQBN=arduino:avr:uno PORT=/dev/tty.usbserial-XXXX`
-- Serial monitor: 115200 baud (`STATUS`, `DIAG`, `RESET`). See testing guide.
+- Serial monitor: 115200 baud (`STATUS`, `DIAG`, `RESET`, `ADVANCE`). See testing guide.
 
 ## Coding Style & Naming Conventions
 - Indentation: 2 spaces; no tabs; keep lines concise.
@@ -20,7 +20,7 @@
 - Comments: brief `//` inline notes; top-of-file block for high-level context.
 
 ## Testing Guidelines
-- Framework: none yet; rely on bench testing per `doc/testing_calibration_guide.md`.
+- Framework: none yet; rely on bench testing per `doc/TestingCalibrationGuide.md`.
 - Verification: use the serial console at 115200. Example: send `STATUS` during run; expect RPM, period (µs), advance (°), and error flags.
 - Hardware checks: verify kill switch logic, LED patterns, and spark scheduling at safe RPMs before live tests.
 
