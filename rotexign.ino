@@ -74,6 +74,7 @@ volatile uint32_t pulse_count = 0;
 volatile uint32_t spark_count = 0;
 volatile uint16_t glitch_count = 0;
 volatile uint16_t rev_limit_count = 0;
+volatile bool rev_limit_engaged = false;
 
 // Status and error flags
 volatile uint8_t error_flags = 0;
@@ -313,6 +314,7 @@ void print_status() {
   Serial.print(F(", Period: ")); Serial.print(ticks_to_us(period_ticks));
   Serial.print(F("us, Advance: ")); Serial.print(get_advance_for_rpm(rpm_filtered));
   Serial.print(F("°, Engine: ")); Serial.print(engine_running ? F("ON") : F("OFF"));
+  Serial.print(F(", RevLim: ")); Serial.print(rev_limit_engaged ? F("ON") : F("OFF"));
   Serial.print(F(", Errors: 0x")); Serial.println(error_flags, HEX);
 }
 
@@ -497,13 +499,16 @@ void loop() {
         }
 
         // Rev limiting: hard cut above limit per design notes
-        static bool rev_limit_active = false;
-        if (is_rev_limited(rpm_filtered, REV_LIMIT, 100, rev_limit_active)) {
+        if (is_rev_limited(rpm_filtered, REV_LIMIT, 100, rev_limit_engaged)) {
             // Cancel any scheduled events and keep coil off
             TIMSK1 &= (uint8_t)~(_BV(OCIE1A) | _BV(OCIE1B));
+            TIFR1 = _BV(OCF1A) | _BV(OCF1B); // clear any pending flags
             coil_off();
+            error_flags |= ERROR_OVERSPEED;
             rev_limit_count++;
             return; // Skip spark event
+        } else {
+            error_flags &= (uint8_t)~ERROR_OVERSPEED;
         }
 
         // Angle after pickup to fire
