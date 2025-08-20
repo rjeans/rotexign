@@ -87,6 +87,9 @@ uint32_t last_diagnostic_time = 0;
 // Declare runtime_theta_trigger as a global variable
 float runtime_theta_trigger = THETA_TRIGGER; // Initialize with the default value
 
+// Last scheduled dwell width (Timer1 ticks)
+uint32_t last_dwell_ticks = 0;
+
 // ========== UTILITY FUNCTIONS ==========
 inline uint32_t us_to_ticks(uint32_t microseconds) {
   return microseconds * 2UL;  // 0.5µs per tick at prescaler 8
@@ -310,6 +313,7 @@ void print_status() {
   Serial.print(F("RPM: ")); Serial.print(rpm_filtered);
   Serial.print(F(", Period: ")); Serial.print(ticks_to_us(period_ticks));
   Serial.print(F("us, Advance: ")); Serial.print(get_advance_for_rpm(rpm_filtered));
+  Serial.print(F("°, Dwell: ")); Serial.print(ticks_to_us(last_dwell_ticks)); Serial.print(F("us"));
   Serial.print(F("°, Engine: ")); Serial.print(engine_running ? F("ON") : F("OFF"));
   Serial.print(F(", RevLim: ")); Serial.print(rev_limit_engaged ? F("ON") : F("OFF"));
   Serial.print(F(", Errors: 0x")); Serial.println(error_flags, HEX);
@@ -505,6 +509,7 @@ void loop() {
             spark_time = last_cap + (uint16_t)delay_ticks;
         }
         uint16_t dwell_start = spark_time - (uint16_t)dwell_ticks;
+        last_dwell_ticks = dwell_ticks;
 
         // Guard against scheduling too close to now
         noInterrupts();
