@@ -12,7 +12,7 @@ Modern, Arduino-based ignition timing controller for the Rotax 787 two-stroke en
 ## Hardware (summary)
 - Board: Arduino Uno/Nano (ATmega328P).
 - Input: D2 (INT0) falling-edge trigger via optocoupler.
-- Output: Smart coil control on D9 (polarity configurable via `COIL_ACTIVE_HIGH`); dwell marker on D10 (HIGH during dwell); status LED D13.
+- Output: Smart coil control on D9 (rising edge = start dwell, falling edge = spark by default; configurable via `COIL_ACTIVE_HIGH`); dwell marker on D10 (HIGH during dwell); status LED D13.
 - Engine: Two trigger lobes (PPR=2); TDC occurs 47° after trigger; hard cut at 7000 RPM with hysteresis.
 - Dwell: Target ~3 ms at 12V, clamped to ≤40% duty at high RPM.
 - Power: Isolate 5V control from 12V coil supply; follow noise/EMI tips in docs.
@@ -51,7 +51,7 @@ Modern, Arduino-based ignition timing controller for the Rotax 787 two-stroke en
 
 These updates address the issues documented in `doc/FirstTestResults.md`:
 
-- D9 polarity: Added `COIL_ACTIVE_HIGH` (default `false`) to safely match an inverted output stage; D9 now idles “coil off” and only energizes during dwell.
+- D9 polarity: Added `COIL_ACTIVE_HIGH` (default `true`) to match the 1GN-1A smart coil (5V rising edge starts dwell, falling edge fires). Set to `false` only if using an external inverting driver.
 - Triple-pulse artifact: Timer1 compare matches are now one-shot; interrupts arm only when scheduled and disable themselves after firing, avoiding stale re-fires.
 - Noise-induced retriggers: INT0 ISR uses Timer1 tick deltas (0.5 µs resolution) to reject pulses closer than 0.5 ms (glitches) and 2.0 ms (spark-noise guard). No `millis()` calls in ISR.
 - D10 meaning: Repurposed as a dwell marker — HIGH while the coil is charging, LOW at spark — for clean scope validation.

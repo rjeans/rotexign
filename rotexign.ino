@@ -147,8 +147,9 @@ inline void spark_pin_low()  { PORTB &= (uint8_t)~_BV(PB1); }
 inline void aux_pin_high()   { PORTB |= _BV(PB2); }
 inline void aux_pin_low()    { PORTB &= (uint8_t)~_BV(PB2); }
 
-// Coil control polarity: set to false for hardware where LOW energizes coil (inverted stage)
-const bool COIL_ACTIVE_HIGH = false;
+// Coil control polarity: smart coil expects HIGH=start dwell, LOW=spark
+// Set true to drive the coil directly; set false only if an external inverter is used
+const bool COIL_ACTIVE_HIGH = true;
 
 // D10 is used as a dwell marker: HIGH while coil is charging
 inline void coil_on()  {
@@ -447,6 +448,15 @@ void loop() {
 
     // Update status LED
     update_status_led();
+
+    // Release coil-ground relay after startup to avoid unintended dwell at boot
+    static bool relay_released = false;
+    if (!relay_released) {
+        if (millis() > 500 || engine_running) {
+            digitalWrite(COIL_GND_RELAY_PIN, LOW); // stop grounding coil control
+            relay_released = true;
+        }
+    }
 
     // Kill switch functionality removed
 
