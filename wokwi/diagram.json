@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "author": "Richard Jeans",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-arduino-uno", "id": "uno", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-logic-analyzer", "id": "logic1", "top": -134.05, "left": 259.2, "attrs": {} },
+    {
+      "type": "chip-pulse-simulator",
+      "id": "chip1",
+      "top": -94.98,
+      "left": -14.4,
+      "attrs": {
+    "rpm": "1000",
+    "sweep_enable": "1",
+    "sweep_duration": "90",
+    "sweep_min_rpm": "200",
+    "sweep_max_rpm": "8000",
+    "startup_delay": "3"
+  }
+
+    }
+  ],
+  "connections": [
+    [ "logic1:GND", "uno:GND.1", "black", [ "h0" ] ],
+    [ "uno:9", "logic1:D1", "green", [ "v-124.2", "h0.2" ] ],
+    [ "chip1:PULSE", "logic1:D0", "green", [ "v0" ] ],
+    [ "chip1:VCC", "uno:5V", "red", [ "h-28.8", "v297.6", "h201.6" ] ],
+    [ "chip1:GND", "uno:GND.1", "black", [ "h-57.6", "v0", "h9.6", "v48", "h172.8" ] ],
+    [ "chip1:PULSE", "uno:2", "green", [ "v9.6", "h136.21" ] ],
+    [ "uno:10", "logic1:D2", "green", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}
