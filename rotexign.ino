@@ -44,7 +44,6 @@ const uint16_t TIMEOUT_MS = 1000;        // Engine stop timeout
 
 // Pin definitions
 const uint8_t TRIGGER_INPUT_PIN = 2;     // INT0 external interrupt (falling edge)
-const uint8_t KILL_SWITCH_PIN = 7;
 const uint8_t STATUS_LED_PIN = 13;
 const uint8_t SPARK_OUTPUT_PIN = 9;      // OC1A (PB1)
 const uint8_t AUX_OUTPUT_PIN = 10;       // OC1B (PB2) — dwell marker output
@@ -64,7 +63,6 @@ volatile uint16_t last_capture = 0;      // last accepted trigger capture (Timer
 volatile uint32_t period_ticks = 0;
 volatile uint16_t rpm_filtered = 0;
 volatile bool new_period_flag = false;
-volatile bool kill_switch_active = false;
 volatile uint32_t last_pulse_time = 0;
 volatile bool engine_running = false;
 volatile uint8_t missed_pulses = 0;
@@ -79,7 +77,6 @@ bool rev_limit_engaged = false;
 // Status and error flags
 volatile uint8_t error_flags = 0;
 #define ERROR_OVERSPEED    0x01
-#define ERROR_KILL_SWITCH  0x02
 #define ERROR_NO_SIGNAL    0x04
 #define ERROR_INVALID_RPM  0x08
 
@@ -325,7 +322,6 @@ void print_diagnostics() {
   Serial.print(F("Glitches: ")); Serial.println(glitch_count);
   Serial.print(F("Rev Limits: ")); Serial.println(rev_limit_count);
   Serial.print(F("Missed Pulses: ")); Serial.println(missed_pulses);
-  Serial.print(F("Kill Switch: ")); Serial.println(kill_switch_active ? F("ACTIVE") : F("OK"));
   Serial.print(F("Uptime: ")); Serial.print(millis() / 1000); Serial.println(F("s"));
 }
 
@@ -390,7 +386,6 @@ void setup() {
 
     // Configure pins
     pinMode(TRIGGER_INPUT_PIN, INPUT_PULLUP); // optocoupler pulls low on trigger
-    pinMode(KILL_SWITCH_PIN, INPUT_PULLUP);
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
     pinMode(SPARK_OUTPUT_PIN, OUTPUT);
@@ -449,29 +444,10 @@ void loop() {
     // Update status LED
     update_status_led();
 
-    // Read and debounce kill switch (active LOW)
-    static bool ks_state = false;           // debounced state
-    static bool ks_last_read = false;       // last sampled level
-    static uint32_t ks_last_change = 0;
-    bool ks_read = (digitalRead(KILL_SWITCH_PIN) == LOW);
-    if (ks_read != ks_last_read) {
-        ks_last_change = millis();
-        ks_last_read = ks_read;
-    } else if (millis() - ks_last_change >= 20) { // 20ms stable
-        ks_state = ks_read;
-    }
-    kill_switch_active = ks_state;
-    if (kill_switch_active) {
-        // Force coil off and cancel any scheduled events
-        coil_off();
-        TIMSK1 &= (uint8_t)~(_BV(OCIE1A) | _BV(OCIE1B));
-        error_flags |= ERROR_KILL_SWITCH;
-    } else {
-        error_flags &= (uint8_t)~ERROR_KILL_SWITCH;
-    }
+    // Kill switch functionality removed
 
     // Process new period data and schedule events
-    if (new_period_flag && !kill_switch_active) {
+    if (new_period_flag) {
         noInterrupts();
         new_period_flag = false;
         uint32_t pt = period_ticks;

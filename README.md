@@ -11,7 +11,7 @@ Modern, Arduino-based ignition timing controller for the Rotax 787 two-stroke en
 
 ## Hardware (summary)
 - Board: Arduino Uno/Nano (ATmega328P).
-- Input: D2 (INT0) falling-edge trigger via optocoupler; kill switch on D7 (debounced).
+- Input: D2 (INT0) falling-edge trigger via optocoupler.
 - Output: Smart coil control on D9 (polarity configurable via `COIL_ACTIVE_HIGH`); dwell marker on D10 (HIGH during dwell); status LED D13.
 - Engine: Two trigger lobes (PPR=2); TDC occurs 47° after trigger; hard cut at 7000 RPM with hysteresis.
 - Dwell: Target ~3 ms at 12V, clamped to ≤40% duty at high RPM.
@@ -35,7 +35,7 @@ Modern, Arduino-based ignition timing controller for the Rotax 787 two-stroke en
 ## Testing & Calibration
 - Bench-test first with a function generator and scope.
 - Verify pickup angle (THETA_TRIGGER) and timing curve; follow `doc/TestingCalibrationGuide.md`.
-- Validate kill switch, rev limiter (with hysteresis), dwell behavior, and relay logic before engine tests.
+- Validate rev limiter (with hysteresis), dwell behavior, and relay logic before engine tests.
 
 ## Code Layout
 - `rotexign.ino`: Main firmware (INT0 trigger, Timer1 timebase, dwell/spark scheduling, safety, serial).
@@ -55,7 +55,6 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 - Triple-pulse artifact: Timer1 compare matches are now one-shot; interrupts arm only when scheduled and disable themselves after firing, avoiding stale re-fires.
 - Noise-induced retriggers: INT0 ISR uses Timer1 tick deltas (0.5 µs resolution) to reject pulses closer than 0.5 ms (glitches) and 2.0 ms (spark-noise guard). No `millis()` calls in ISR.
 - D10 meaning: Repurposed as a dwell marker — HIGH while the coil is charging, LOW at spark — for clean scope validation.
-- Kill switch behavior: Debounced read on D7; when active, coil is forced off and any scheduled events are cancelled; error flag reported in `STATUS`/`DIAG`.
 - Safe startup: On boot and when signal is lost, the coil is off and no compare matches are armed. Relay outputs (pins 3 and 4) are explicitly configured and driven.
 - Serial robustness: Replaced Arduino `String` parsing with a fixed buffer to avoid heap fragmentation.
 
