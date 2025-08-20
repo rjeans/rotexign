@@ -74,7 +74,7 @@ volatile uint32_t pulse_count = 0;
 volatile uint32_t spark_count = 0;
 volatile uint16_t glitch_count = 0;
 volatile uint16_t rev_limit_count = 0;
-volatile bool rev_limit_engaged = false;
+bool rev_limit_engaged = false;
 
 // Status and error flags
 volatile uint8_t error_flags = 0;
