@@ -193,9 +193,9 @@ def create_svg_timing_plot(csv_file, output_svg="ignition_timing_detail.svg"):
     summary_text = [
         f"Time Range: {time_min:.2f}s - {time_max:.2f}s",
         f"Data Points: {len(data['time_seconds'])}",
-        "✓ Trigger Input (D0) - Blue",
-        "✓ Spark Output (D1) - Red", 
-        "✓ Dwell Marker (D2) - Green"
+        "* Trigger Input (D0) - Blue",
+        "* Spark Output (D1) - Red", 
+        "* Dwell Marker (D2) - Green"
     ]
     
     # Summary box background

@@ -2,7 +2,7 @@
 
 **Production-ready** Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. Delivers precise, programmable timing with robust safety features and comprehensive testing validation. **Fully tested and validated** across the entire operational range (200-8000+ RPM).
 
-## ✅ Features & Capabilities
+## Features & Capabilities
 
 ### **Core Engine Management**
 - **Precision Timing**: Sub-microsecond accuracy using Timer1 with one-revolution-ahead scheduling
@@ -45,7 +45,7 @@
 - Compile: `make build FQBN=arduino:avr:uno`
 - Upload: `make upload FQBN=arduino:avr:uno PORT=/dev/tty.usbserial-XXXX`
 
-## 🧪 Testing & Validation
+## Testing & Validation
 
 ### **Comprehensive Testing Completed**
 - **Wokwi Simulation**: Full validation across 200-8000+ RPM range using custom pulse simulator
@@ -55,7 +55,7 @@
 - **Rev Limiter Validation**: Confirmed proper operation above 7000 RPM with error reporting
 
 ### **Live Testing Environment**
-🔗 **[Wokwi Project](https://wokwi.com/projects/439745280978700289)** - Interactive simulation with:
+**[Wokwi Project](https://wokwi.com/projects/439745280978700289)** - Interactive simulation with:
 - Configurable RPM sweep testing (200-8000 RPM)
 - Real-time timing curve generation
 - VCD export for detailed analysis
@@ -88,7 +88,7 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 - Safe startup: On boot and when signal is lost, the coil is off and no compare matches are armed. Relay outputs (pins 3 and 4) are explicitly configured and driven.
 - Serial robustness: Replaced Arduino `String` parsing with a fixed buffer to avoid heap fragmentation.
 
-## Recent Major Improvements ⚡
+## Recent Major Improvements
 
 ### **December 2024 - Production Validation**
 - **Timer1 Overflow Resolution**: Fixed 16-bit overflow issues using `micros()` for period calculation, eliminating error 0x1 below 900 RPM
@@ -100,26 +100,26 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 - **Previous-Lobe Scheduling**: Full implementation for high RPM operation (>6500 RPM)
 - **Complete Wokwi Testing Suite**: Custom pulse simulator with full RPM sweep capability
 
-### **Production Validation Results** 📊
+### **Production Validation Results**
 
 **Complete VCD Analysis**: `wokwi-logic-analysis.txt` contains full timing validation data
 
-✅ **COMPREHENSIVE TESTING COMPLETED** (27,162 triggers, 19,623 spark events):
+**COMPREHENSIVE TESTING COMPLETED** (27,162 triggers, 19,623 spark events):
 
 #### **RPM Range Performance**
 - **Full Spectrum**: Successfully tested 777-6977 RPM (exceeds 6500 RPM previous-lobe threshold)
-- **Timer1 Overflow**: ✅ ELIMINATED - No error 0x1 across entire range
-- **Adaptive Filtering**: ✅ VALIDATED - Arduino tracks 90-second RPM sweep without getting stuck
-- **Previous-Lobe Scheduling**: ✅ ACTIVE - Automatically engages above 6500 RPM as designed
+- **Timer1 Overflow**: ELIMINATED - No error 0x1 across entire range
+- **Adaptive Filtering**: VALIDATED - Arduino tracks 90-second RPM sweep without getting stuck
+- **Previous-Lobe Scheduling**: ACTIVE - Automatically engages above 6500 RPM as designed
 
 #### **Timing Accuracy Validation**
 | RPM Range | Actual Advance | Target Advance | Error | Status |
 |-----------|----------------|----------------|--------|---------|
-| 777 RPM | 4.6° BTDC | 4.7° BTDC | -0.1° | ✅ EXCELLENT |
-| 1265 RPM | 7.5° BTDC | 7.6° BTDC | -0.1° | ✅ EXCELLENT |
-| 1757 RPM | 10.1° BTDC | 10.5° BTDC | -0.5° | ✅ EXCELLENT |
-| 2251 RPM | 12.7° BTDC | 12.8° BTDC | -0.1° | ✅ EXCELLENT |
-| 3254 RPM | 14.8° BTDC | 15.0° BTDC | -0.2° | ✅ EXCELLENT |
+| 777 RPM | 4.6° BTDC | 4.7° BTDC | -0.1° | EXCELLENT |
+| 1265 RPM | 7.5° BTDC | 7.6° BTDC | -0.1° | EXCELLENT |
+| 1757 RPM | 10.1° BTDC | 10.5° BTDC | -0.5° | EXCELLENT |
+| 2251 RPM | 12.7° BTDC | 12.8° BTDC | -0.1° | EXCELLENT |
+| 3254 RPM | 14.8° BTDC | 15.0° BTDC | -0.2° | EXCELLENT |
 
 #### **Dwell Control Performance**
 - **Low RPM (777-1500)**: Perfect 3000μs dwell maintained
@@ -128,21 +128,21 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 - **No Excessive Dwell**: All values within safe operational limits
 
 #### **Safety System Validation**
-- **Rev Limiter**: ✅ ACTIVE above 6977 RPM (negative advance indicates spark cut)
-- **Error Handling**: ✅ NO ERROR FLAGS throughout 27k+ trigger events
-- **Coil Protection**: ✅ VERIFIED duty cycle limits maintained at all RPM
-- **Startup Safety**: ✅ CONFIRMED relay protection during initialization
+- **Rev Limiter**: ACTIVE above 6977 RPM (negative advance indicates spark cut)
+- **Error Handling**: NO ERROR FLAGS throughout 27k+ trigger events
+- **Coil Protection**: VERIFIED duty cycle limits maintained at all RPM
+- **Startup Safety**: CONFIRMED relay protection during initialization
 
-### **Production Readiness Certification** 🏆
+### **Production Readiness Certification**
 
 **CERTIFIED READY FOR ENGINE DEPLOYMENT**
 
 All critical systems validated through comprehensive testing:
-- ✅ **27,162 trigger events** processed without errors
-- ✅ **19,623 spark events** delivered with precise timing
-- ✅ **Full RPM range** (777-6977+) operation confirmed  
-- ✅ **Safety systems** validated under all conditions
-- ✅ **Timing accuracy** within ±0.5° across operational range
+- **27,162 trigger events** processed without errors
+- **19,623 spark events** delivered with precise timing
+- **Full RPM range** (777-6977+) operation confirmed  
+- **Safety systems** validated under all conditions
+- **Timing accuracy** within +/-0.5 degrees across operational range
 
 **Testing Procedure for New Installations**:
 
@@ -151,23 +151,23 @@ All critical systems validated through comprehensive testing:
 3. **VCD Analysis**: `python3 simple_timing_analyzer.py your-test.vcd` for curve validation
 4. **Engine Integration**: Follow safety procedures in `doc/TestingCalibrationGuide.md`
 
-## 📈 **Detailed Performance Analysis**
+## **Detailed Performance Analysis**
 
 ### **Timing Curves Explained**
 
 The ignition controller uses three timing references:
 
-**🎯 Actual BTDC** - What the Arduino actually delivers
+**Actual BTDC** - What the Arduino actually delivers
 - Measured from VCD analysis of real spark timing
 - Shows the controller's precision and accuracy
 
-**🛡️ Safe BTDC** - Conservative timing curve (default)
-- Maximum 15° advance to prevent engine knock/damage
+**Safe BTDC** - Conservative timing curve (default)
+- Maximum 15 degrees advance to prevent engine knock/damage
 - Recommended for initial setup and high-stress conditions
 - Prioritizes engine protection over maximum power
 
-**⚡ Performance BTDC** - Aggressive timing curve  
-- Up to 20° advance for maximum power output
+**Performance BTDC** - Aggressive timing curve  
+- Up to 20 degrees advance for maximum power output
 - Only use with premium fuel and proper tuning
 - Requires careful monitoring for knock/detonation
 
@@ -175,16 +175,16 @@ The ignition controller uses three timing references:
 
 | RPM Range | Count | Actual Advance | Safe Target | Perf Target | Status |
 |-----------|-------|----------------|-------------|-------------|---------|
-| 500-999 | 145 events | 4.6° BTDC | 4.7° BTDC | 4.7° BTDC | ✅ Perfect |
-| 1000-1499 | 240 events | 7.5° BTDC | 7.6° BTDC | 7.6° BTDC | ✅ Perfect |
-| 1500-1999 | 339 events | 10.1° BTDC | 10.5° BTDC | 10.5° BTDC | ✅ Excellent |
-| 2000-2499 | 434 events | 12.7° BTDC | 12.8° BTDC | 14.0° BTDC | ✅ Safe Mode |
-| 2500-2999 | 531 events | 14.1° BTDC | 14.2° BTDC | 18.0° BTDC | ✅ Safe Mode |
-| 3000-3499 | 667 events | 14.8° BTDC | 15.0° BTDC | 20.0° BTDC | ✅ Safe Mode |
-| 6500-6999 | 1627 events | -4.8° BTDC | 12.2° BTDC | 17.2° BTDC | ✅ Rev Limiter |
+| 500-999 | 145 events | 4.6 deg BTDC | 4.7 deg BTDC | 4.7 deg BTDC | Perfect |
+| 1000-1499 | 240 events | 7.5 deg BTDC | 7.6 deg BTDC | 7.6 deg BTDC | Perfect |
+| 1500-1999 | 339 events | 10.1 deg BTDC | 10.5 deg BTDC | 10.5 deg BTDC | Excellent |
+| 2000-2499 | 434 events | 12.7 deg BTDC | 12.8 deg BTDC | 14.0 deg BTDC | Safe Mode |
+| 2500-2999 | 531 events | 14.1 deg BTDC | 14.2 deg BTDC | 18.0 deg BTDC | Safe Mode |
+| 3000-3499 | 667 events | 14.8 deg BTDC | 15.0 deg BTDC | 20.0 deg BTDC | Safe Mode |
+| 6500-6999 | 1627 events | -4.8 deg BTDC | 12.2 deg BTDC | 17.2 deg BTDC | Rev Limiter |
 
 **Key Observations:**
-- **Perfect accuracy** below 2000 RPM (±0.1° error)
+- **Perfect accuracy** below 2000 RPM (+/-0.1 degree error)
 - **Safe mode active** above 2000 RPM (as configured)
 - **Rev limiter engaged** above 6500 RPM (negative advance = spark cut)
 - **27,162 total triggers** processed without errors
@@ -193,21 +193,21 @@ The ignition controller uses three timing references:
 
 **BTDC = Before Top Dead Center** - This measures when the spark fires relative to piston position:
 
-🔥 **Higher BTDC** (more advance):
+**Higher BTDC** (more advance):
 - Spark fires earlier in compression stroke
 - Gives fuel/air mixture more time to burn
 - Increases power but risks engine knock
-- Example: 15° BTDC = spark 15° before piston reaches top
+- Example: 15 deg BTDC = spark 15 degrees before piston reaches top
 
-⚡ **Lower BTDC** (less advance): 
+**Lower BTDC** (less advance): 
 - Spark fires closer to top dead center
 - Safer for engine but less efficient
-- Example: 5° BTDC = spark only 5° before piston reaches top
+- Example: 5 deg BTDC = spark only 5 degrees before piston reaches top
 
-🚫 **Negative BTDC** (retarded timing):
+**Negative BTDC** (retarded timing):
 - Spark fires AFTER top dead center
 - Used by rev limiter to cut power safely
-- Example: -5° BTDC = spark 5° after piston passes top
+- Example: -5 deg BTDC = spark 5 degrees after piston passes top
 
 ### **Why Different Curves Matter**
 
