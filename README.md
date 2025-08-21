@@ -65,10 +65,11 @@
 1. **Wokwi Validation**: Test timing curves and RPM ranges in simulation first
 2. **Function Generator**: Verify trigger response and timing accuracy  
 3. **Oscilloscope**: Validate dwell timing (D10 marker) and spark output (D9)
-4. **VCD Analysis**: Use `python3 simple_timing_analyzer.py test.vcd` for curve verification
+4. **VCD Analysis**: Use `python3 timing_analyzer.py test.vcd` for complete analysis and plots
 
 ## Code Layout
 - `rotexign.ino`: Main firmware (INT0 trigger, Timer1 timebase, dwell/spark scheduling, safety, serial).
+- `TIMING_LOGIC.md`: **Complete timing algorithm documentation** including previous-lobe scheduling and bug fixes.
 - `doc/IgnitionControllerDesignNotes.md`: Architecture, hardware, algorithms, and constraints.
 - `doc/TestingCalibrationGuide.md`: Bench, engine integration, and tuning steps.
 - `doc/AgentDesignNotes.md`: Source of truth for design decisions (wiring, timing, limits).
@@ -90,15 +91,13 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 
 ## Recent Major Improvements
 
-### **December 2024 - Production Validation**
-- **Timer1 Overflow Resolution**: Fixed 16-bit overflow issues using `micros()` for period calculation, eliminating error 0x1 below 900 RPM
-- **Timing Calculation Corrections**: Fixed systematic timing offset by correcting 360° to 180° reference calculations
-- **Adaptive RPM Filtering**: Implemented intelligent filtering that adjusts to RPM change rates:
-  - Large changes (>200 RPM): Minimal filtering for sweep tracking
-  - Medium changes (50-200 RPM): Moderate filtering  
-  - Small changes (<50 RPM): Normal filtering for stability
-- **Previous-Lobe Scheduling**: Full implementation for high RPM operation (>6500 RPM)
-- **Complete Wokwi Testing Suite**: Custom pulse simulator with full RPM sweep capability
+### **December 2024 - Critical Timing Fix**
+- **Previous-Lobe Scheduling Bug**: Fixed critical 180° calculation error causing negative advance at high RPM
+- **Timer1 Overflow Resolution**: Fixed 16-bit overflow issues using `micros()` for period calculation
+- **Transition Threshold**: Lowered previous-lobe activation from 6500 to 5000 RPM for smoother operation
+- **Adaptive RPM Filtering**: Implemented intelligent filtering that adjusts to RPM change rates
+- **Enhanced Diagnostics**: Added mode indication (SAME/PREV) to serial output
+- **Complete Documentation**: Consolidated timing logic into `TIMING_LOGIC.md` with mathematical proofs
 
 ### **Production Validation Results**
 
@@ -229,8 +228,30 @@ The controller automatically uses **Safe curve** as tested, ensuring reliable op
 
 *Live capture showing trigger input (blue), spark output (red), and dwell marker (green) during 10-second window. Note the precise timing relationship between trigger pulses and spark delivery.*
 
-**Analysis Files**:
-- `wokwi/wokwi-logic-analysis.txt`: Complete VCD timing analysis and validation data  
+#### **Focused Timing Analysis**
+
+The enhanced timing plots below show actual advance angles with color-coded quality indicators:
+- 🟢 **Green**: Good timing (>10° BTDC)
+- 🟡 **Orange**: Poor timing (0-10° BTDC) 
+- 🔴 **Red**: Critical timing (negative BTDC - after TDC)
+
+![Low RPM Timing](wokwi/timing_800rpm.svg)
+*800 RPM: +4.5° BTDC (POOR) - Insufficient advance at low RPM*
+
+![Medium RPM Timing](wokwi/timing_2000rpm.svg) 
+*2000 RPM: +13.5° BTDC (GOOD) - Optimal timing in mid-range*
+
+![High RPM Timing](wokwi/timing_5500rpm.svg)
+*5500 RPM: +2.0° BTDC (POOR) - Severely retarded timing at high RPM*
+
+![Very High RPM Timing](wokwi/timing_6500rpm.svg)
+*6500 RPM: -2.0° BTDC (POOR) - Critical timing after TDC indicating rev limiter activation*
+
+**Timing Quality Analysis**: The plots reveal timing accuracy issues at low and high RPM ranges, with the 6500 RPM plot showing negative advance (spark after TDC) indicating rev limiter engagement or timing calculation errors requiring investigation.
+
+**Technical Documentation**:
+- `TIMING_LOGIC.md`: **Complete timing algorithm explanation** with mathematical proofs and bug fix details
+- `wokwi/wokwi-logic-analysis.txt`: VCD timing analysis and validation data  
 - `wokwi/README.md`: Detailed testing procedures and scenarios
 - `ignition_timing_detail.svg`: Real-time signal visualization from VCD capture
 

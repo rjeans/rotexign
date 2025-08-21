@@ -1,0 +1,35 @@
+<?xml version="1.0" ?>
+  <svg width="800" height="300" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+    <style>
+            .grid { stroke: #e8e8e8; stroke-width: 1; stroke-dasharray: 2,2; }
+            .trigger-line { stroke: #2E86C1; stroke-width: 2.5; fill: none; }
+            .spark-line { stroke: #E74C3C; stroke-width: 2.5; fill: none; }
+            .label { font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; }
+            .axis-label { font-family: Arial, sans-serif; font-size: 12px; }
+            .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; }
+            .timing-arrow { stroke: #7B68EE; stroke-width: 1.5; fill: none; stroke-dasharray: 5,2; }
+            .timing-label { font-family: Arial, sans-serif; font-size: 11px; fill: #7B68EE; font-weight: bold; }
+        </style>
+    <rect width="800" height="300" fill="white"/>
+    <line x1="80.0" y1="50" x2="80.0" y2="250" class="grid"/>
+    <line x1="247.5" y1="50" x2="247.5" y2="250" class="grid"/>
+    <line x1="415.0" y1="50" x2="415.0" y2="250" class="grid"/>
+    <line x1="582.5" y1="50" x2="582.5" y2="250" class="grid"/>
+    <line x1="750.0" y1="50" x2="750.0" y2="250" class="grid"/>
+    <line x1="80" y1="150.0" x2="750" y2="150.0" class="grid"/>
+    <path d="M 80.00 60.00 L 80.00 60.00 L 125.28 60.00 L 125.28 100.00 L 128.98 100.00 L 128.98 100.00 L 138.50 100.00 L 138.50 60.00 L 142.21 60.00 L 142.21 60.00 L 187.40 60.00 L 187.40 100.00 L 191.07 100.00 L 191.08 100.00 L 200.61 100.00 L 200.61 60.00 L 204.30 60.00 L 204.30 60.00 L 249.51 60.00 L 249.51 100.00 L 253.09 100.00 L 253.10 100.00 L 262.73 100.00 L 262.73 60.00 L 266.32 60.00 L 266.32 60.00 L 311.63 60.00 L 311.63 100.00 L 315.19 100.00 L 315.19 100.00 L 324.84 100.00 L 324.84 60.00 L 328.42 60.00 L 328.42 60.00 L 373.74 60.00 L 373.74 100.00 L 377.47 100.00 L 377.47 100.00 L 386.95 100.00 L 386.95 60.00 L 390.70 60.00 L 390.70 60.00 L 435.85 60.00 L 435.85 100.00 L 439.49 100.00 L 439.49 100.00 L 449.07 100.00 L 449.07 60.00 L 452.72 60.00 L 452.72 60.00 L 497.97 60.00 L 497.97 100.00 L 501.59 100.00 L 501.60 100.00 L 511.18 100.00 L 511.18 60.00 L 514.82 60.00 L 514.82 60.00 L 560.08 60.00 L 560.08 100.00 L 563.61 100.00 L 563.61 100.00 L 573.29 100.00 L 573.29 60.00 L 576.84 60.00 L 576.84 60.00 L 622.19 60.00 L 622.19 100.00 L 625.71 100.00 L 625.71 100.00 L 635.41 100.00 L 635.41 60.00 L 638.94 60.00 L 638.94 60.00 L 684.31 60.00 L 684.31 100.00 L 687.99 100.00 L 687.99 100.00 L 697.52 100.00 L 697.52 60.00 L 701.22 60.00 L 701.22 60.00 L 746.42 60.00 L 746.42 100.00 L 750.00 100.00" class="trigger-line"/>
+    <path d="M 80.00 200.00 L 80.00 200.00 L 125.28 200.00 L 128.98 200.00 L 128.98 160.00 L 128.98 160.00 L 138.50 160.00 L 142.21 160.00 L 142.21 200.00 L 142.21 200.00 L 187.40 200.00 L 191.07 200.00 L 191.07 160.00 L 191.08 160.00 L 200.61 160.00 L 204.30 160.00 L 204.30 200.00 L 204.30 200.00 L 249.51 200.00 L 253.09 200.00 L 253.09 160.00 L 253.10 160.00 L 262.73 160.00 L 266.32 160.00 L 266.32 200.00 L 266.32 200.00 L 311.63 200.00 L 315.19 200.00 L 315.19 160.00 L 315.19 160.00 L 324.84 160.00 L 328.42 160.00 L 328.42 200.00 L 328.42 200.00 L 373.74 200.00 L 377.47 200.00 L 377.47 160.00 L 377.47 160.00 L 386.95 160.00 L 390.70 160.00 L 390.70 200.00 L 390.70 200.00 L 435.85 200.00 L 439.49 200.00 L 439.49 160.00 L 439.49 160.00 L 449.07 160.00 L 452.72 160.00 L 452.72 200.00 L 452.72 200.00 L 497.97 200.00 L 501.59 200.00 L 501.59 160.00 L 501.60 160.00 L 511.18 160.00 L 514.82 160.00 L 514.82 200.00 L 514.82 200.00 L 560.08 200.00 L 563.61 200.00 L 563.61 160.00 L 563.61 160.00 L 573.29 160.00 L 576.84 160.00 L 576.84 200.00 L 576.84 200.00 L 622.19 200.00 L 625.71 200.00 L 625.71 160.00 L 625.71 160.00 L 635.41 160.00 L 638.94 160.00 L 638.94 200.00 L 638.94 200.00 L 684.31 200.00 L 687.99 200.00 L 687.99 160.00 L 687.99 160.00 L 697.52 160.00 L 701.22 160.00 L 701.22 200.00 L 701.22 200.00 L 746.42 200.00 L 750.00 200.00 L 750.00 160.00" class="spark-line"/>
+    <line x1="125.28493691769805" y1="115.0" x2="125.28493691769805" y2="185.0" class="timing-arrow" stroke="#E74C3C"/>
+    <line x1="142.20587256320448" y1="115.0" x2="142.20587256320448" y2="185.0" class="timing-arrow" stroke="#E74C3C"/>
+    <text x="133.74540474045125" y="130.0" text-anchor="middle" class="timing-label" fill="#E74C3C">1.3 ms</text>
+    <text x="133.74540474045125" y="145.0" text-anchor="middle" class="timing-label" fill="#E74C3C">-2.0° BTDC (POOR)</text>
+    <text x="15" y="100.0" class="label" fill="#2E86C1">TRIGGER</text>
+    <text x="15" y="200.0" class="label" fill="#E74C3C">SPARK</text>
+    <text x="400.0" y="25" text-anchor="middle" class="title">Very High RPM (6382) - Previous-Lobe Mode</text>
+    <text x="80.0" y="260" text-anchor="middle" class="axis-label">0.0</text>
+    <text x="247.5" y="260" text-anchor="middle" class="axis-label">12.7</text>
+    <text x="415.0" y="260" text-anchor="middle" class="axis-label">25.3</text>
+    <text x="582.5" y="260" text-anchor="middle" class="axis-label">38.0</text>
+    <text x="750.0" y="260" text-anchor="middle" class="axis-label">50.7</text>
+    <text x="400.0" y="290" text-anchor="middle" class="axis-label">Time (milliseconds)</text>
+  </svg>

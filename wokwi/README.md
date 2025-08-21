@@ -141,10 +141,16 @@ RPM: 820 (or target RPM)
 3. Download the `.vcd` file
 
 ### **Analyze Timing Curves**
-Use the provided Python analyzer:
+Use the complete timing analyzer:
 ```bash
-python3 simple_timing_analyzer.py your_test.vcd
+python3 timing_analyzer.py your_test.vcd
 ```
+
+This single script:
+- Generates comprehensive timing analysis report (.txt file)
+- Creates focused timing plots (3 SVG files) 
+- Handles both same-lobe and previous-lobe scheduling modes
+- Provides accuracy assessment vs programmed curves
 
 ### **Expected Output**
 The analyzer shows:

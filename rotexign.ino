@@ -425,15 +425,14 @@ namespace EngineManager {
     
     // Calculate timing delay from trigger to spark
     // Trigger occurs 47° BTDC, spark should occur at advance_angle° BTDC
-    // So delay = 47° - advance_angle (same revolution)
     float delta_angle = Engine::TRIGGER_ANGLE_BTDC - advance_angle;
     
     // Use previous lobe at high RPM (schedule from previous trigger)
     bool use_previous_lobe = (sys.filtered_rpm > Engine::HIGH_RPM_THRESHOLD) && have_prev;
     uint16_t reference_trigger = use_previous_lobe ? prev_trigger : last_trigger;
     
-    // For previous lobe scheduling, we don't add 180° to delta_angle
-    // because we're already using the previous trigger as reference
+    // Previous-lobe scheduling: Use same angle calculation
+    // The previous trigger reference naturally accounts for the timing offset
     
     // Normalize angle to 0-360 range
     while (delta_angle < 0) delta_angle += 360.0f;
@@ -479,6 +478,10 @@ namespace SerialInterface {
   void print_status() {
     float advance = get_advance_angle(sys.filtered_rpm);
     float delta = Engine::TRIGGER_ANGLE_BTDC - advance;
+    
+    // Show actual delta angle being used
+    bool prev_mode = sys.filtered_rpm > Engine::HIGH_RPM_THRESHOLD;
+    
     Serial.print(F("RPM: ")); Serial.print(sys.filtered_rpm);
     Serial.print(F(", Period: ")); Serial.print(Utils::ticks_to_us(sys.trigger_period_ticks));
     Serial.print(F("us, Advance: ")); Serial.print(advance);
@@ -486,6 +489,7 @@ namespace SerialInterface {
     Serial.print(F("°, Dwell: ")); Serial.print(Utils::ticks_to_us(sys.scheduled_dwell_ticks));
     Serial.print(F("us, Engine: ")); Serial.print(sys.engine_running ? F("RUN") : F("STOP"));
     Serial.print(F(", RevLim: ")); Serial.print(sys.rev_limit_active ? F("ON") : F("OFF"));
+    Serial.print(F(", Mode: ")); Serial.print(prev_mode ? F("PREV") : F("SAME"));
     Serial.print(F(", Errors: 0x")); Serial.println(sys.error_flags, HEX);
   }
   
