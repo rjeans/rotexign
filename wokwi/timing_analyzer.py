@@ -1,698 +1,489 @@
 #!/usr/bin/env python3
 """
-Complete VCD Timing Analyzer for rotexign
-Analyzes timing data and creates focused timing plots in one script
-
-Features:
-- Comprehensive VCD analysis with mode detection
-- Timing accuracy assessment vs programmed curves
-- Automatic generation of focused timing plots
-- Single script for complete analysis workflow
+VCD Timing Analyzer - First Principles
+Measures trigger falling edge to spark falling edge timing
 """
 
-import sys
-import statistics
-import csv
-from xml.dom.minidom import Document
-
-class TimingAnalyzer:
-    def __init__(self, vcd_filename):
-        self.vcd_filename = vcd_filename
-        self.timing_data = []
-        self.HIGH_RPM_THRESHOLD = 6500  # From Arduino code
-        self.TRIGGER_ANGLE_BTDC = 47.0
-        self.PULSES_PER_REV = 2
-        
-    def analyze_vcd(self):
-        """Parse VCD file and extract timing data"""
-        print(f"Analyzing: {self.vcd_filename}")
-        print(f"Previous-lobe scheduling threshold: {self.HIGH_RPM_THRESHOLD} RPM")
-        
-        # Parse VCD file
-        with open(self.vcd_filename, 'r') as f:
-            lines = f.readlines()
-        
-        # Skip to data section
-        data_start = 0
-        for i, line in enumerate(lines):
-            if line.strip() == '$enddefinitions $end':
-                data_start = i + 1
-                break
-        
-        # Parse timing data
-        current_time = 0
-        trigger_times = []
-        spark_events = []
-        
-        for line in lines[data_start:]:
-            line = line.strip()
-            if not line:
-                continue
-                
-            if line.startswith('#'):
-                current_time = int(line[1:])
-            elif line == '0!':  # D0 falling (trigger)
-                trigger_times.append(current_time)
-            elif line == '1"':  # D1 high (dwell start)
-                spark_events.append(('dwell_start', current_time))
-            elif line == '0"':  # D1 low (spark fire)
-                spark_events.append(('spark_fire', current_time))
-        
-        print(f"Found {len(trigger_times)} triggers, {len(spark_events)} spark events")
-        
-        # Analyze timing relationships
-        for i in range(len(spark_events)):
-            if spark_events[i][0] == 'dwell_start':
-                # Find corresponding spark fire
-                spark_time = None
-                for j in range(i+1, len(spark_events)):
-                    if spark_events[j][0] == 'spark_fire':
-                        spark_time = spark_events[j][1]
-                        break
-                
-                if spark_time is None:
-                    continue
-                    
-                dwell_start_time = spark_events[i][1]
-                
-                # Find preceding trigger
-                trigger_time = None
-                for t in reversed(trigger_times):
-                    if t < dwell_start_time:
-                        trigger_time = t
-                        break
-                
-                if trigger_time is None:
-                    continue
-                
-                # Calculate RPM from trigger interval
-                prev_trigger = None
-                for k, t in enumerate(trigger_times):
-                    if t == trigger_time and k > 0:
-                        prev_trigger = trigger_times[k-1]
-                        break
-                
-                if prev_trigger is None:
-                    continue
-                
-                # Calculate parameters
-                period_ns = trigger_time - prev_trigger
-                period_us = period_ns / 1000.0
-                rpm = (60_000_000.0 / period_us) / self.PULSES_PER_REV
-                
-                trigger_to_spark_ns = spark_time - trigger_time
-                trigger_to_spark_us = trigger_to_spark_ns / 1000.0
-                
-                dwell_duration_ns = spark_time - dwell_start_time
-                dwell_duration_us = dwell_duration_ns / 1000.0
-                
-                # Calculate advance angle
-                degrees_per_us = 180.0 / period_us
-                trigger_to_spark_degrees = trigger_to_spark_us * degrees_per_us
-                advance_angle = self.TRIGGER_ANGLE_BTDC - trigger_to_spark_degrees
-                
-                # Determine scheduling mode
-                scheduling_mode = "PREV" if rpm > self.HIGH_RPM_THRESHOLD else "SAME"
-                
-                self.timing_data.append({
-                    'time_sec': spark_time / 1_000_000_000.0,
-                    'rpm': rpm,
-                    'advance_angle': advance_angle,
-                    'trigger_to_spark_us': trigger_to_spark_us,
-                    'dwell_duration_us': dwell_duration_us,
-                    'scheduling_mode': scheduling_mode
-                })
+def analyze_vcd(vcd_file):
+    """Analyze VCD timing from first principles"""
+    print(f"Analyzing: {vcd_file}")
     
-    def generate_analysis_report(self, output_file):
-        """Generate comprehensive analysis report"""
-        if not self.timing_data:
-            print("No timing data available for analysis")
-            return
-        
-        with open(output_file, 'w') as f:
-            f.write(f"Analyzing: {self.vcd_filename}\n")
-            f.write(f"Found {len(self.timing_data)} complete timing events\n\n")
-            
-            # Detailed timing curve
-            f.write("="*90 + "\n")
-            f.write("EXTRACTED TIMING CURVE\n")
-            f.write("="*90 + "\n")
-            f.write(f"{'Time':>8} {'RPM':>6} {'Advance':>8} {'Trigger→Spark':>13} {'Dwell':>8} {'Mode':>5}\n")
-            f.write(f"{'(sec)':>8} {'':>6} {'(°BTDC)':>8} {'(μs)':>13} {'(μs)':>8} {'':>5}\n")
-            f.write("-"*90 + "\n")
-            
-            for data in self.timing_data:
-                f.write(f"{data['time_sec']:8.3f} {data['rpm']:6.0f} {data['advance_angle']:8.1f} "
-                       f"{data['trigger_to_spark_us']:13.1f} {data['dwell_duration_us']:8.1f} "
-                       f"{data['scheduling_mode']:>5}\n")
-            
-            # Mode analysis
-            same_lobe_data = [d for d in self.timing_data if d['scheduling_mode'] == 'SAME']
-            prev_lobe_data = [d for d in self.timing_data if d['scheduling_mode'] == 'PREV']
-            
-            f.write(f"\n" + "="*70 + "\n")
-            f.write("SCHEDULING MODE ANALYSIS\n")
-            f.write("="*70 + "\n")
-            f.write(f"Same-lobe events: {len(same_lobe_data)}\n")
-            f.write(f"Previous-lobe events: {len(prev_lobe_data)}\n")
-            
-            if prev_lobe_data:
-                prev_rpms = [d['rpm'] for d in prev_lobe_data]
-                f.write(f"Previous-lobe RPM range: {min(prev_rpms):.0f} - {max(prev_rpms):.0f}\n")
-            
-            # RPM binned analysis
-            rpm_groups = {}
-            for data in self.timing_data:
-                rpm_bin = int(data['rpm'] / 500) * 500
-                if rpm_bin not in rpm_groups:
-                    rpm_groups[rpm_bin] = []
-                rpm_groups[rpm_bin].append(data)
-            
-            f.write(f"\n" + "="*85 + "\n")
-            f.write("TIMING CURVE SUMMARY (500 RPM bins)\n")
-            f.write("="*85 + "\n")
-            f.write(f"{'RPM Range':>12} {'Count':>6} {'Avg RPM':>8} {'Avg Advance':>12} {'Avg Dwell':>10} {'Mode':>6}\n")
-            f.write(f"{'':>12} {'':>6} {'':>8} {'(°BTDC)':>12} {'(μs)':>10} {'':>6}\n")
-            f.write("-"*85 + "\n")
-            
-            for rpm_bin in sorted(rpm_groups.keys()):
-                if rpm_bin == 0:
-                    continue
-                    
-                events = rpm_groups[rpm_bin]
-                avg_rpm = statistics.mean([e['rpm'] for e in events])
-                avg_advance = statistics.mean([e['advance_angle'] for e in events])
-                avg_dwell = statistics.mean([e['dwell_duration_us'] for e in events])
-                
-                # Determine predominant mode
-                same_count = sum(1 for e in events if e['scheduling_mode'] == 'SAME')
-                prev_count = len(events) - same_count
-                mode = "SAME" if same_count > prev_count else "PREV"
-                
-                f.write(f"{rpm_bin:>7}-{rpm_bin+499:<4} {len(events):6d} {avg_rpm:8.0f} "
-                       f"{avg_advance:12.1f} {avg_dwell:10.1f} {mode:>6}\n")
-            
-            # Compare with programmed curves
-            self._write_curve_comparison(f, rpm_groups)
+    # Parse VCD file and extract all signal changes
+    with open(vcd_file, 'r') as f:
+        lines = f.readlines()
     
-    def _write_curve_comparison(self, f, rpm_groups):
-        """Write curve comparison analysis"""
-        # From rotexign.ino
-        rpm_points = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000]
-        safe_curve = [0, 6, 12, 15, 15, 14, 13, 12]
-        perf_curve = [0, 6, 12, 20, 20, 19, 18, 17]
-        
-        def interpolate(rpm, points, values):
-            if rpm <= points[0]: return values[0]
-            if rpm >= points[-1]: return values[-1]
-            
-            for i in range(len(points)-1):
-                if points[i] <= rpm <= points[i+1]:
-                    ratio = (rpm - points[i]) / (points[i+1] - points[i])
-                    return values[i] + ratio * (values[i+1] - values[i])
-            return values[-1]
-        
-        f.write(f"\n" + "="*100 + "\n")
-        f.write("COMPARISON: ACTUAL vs PROGRAMMED CURVES\n")
-        f.write("="*100 + "\n")
-        f.write(f"{'RPM':>6} {'Actual':>8} {'Safe':>8} {'Perf':>8} {'Error':>8} {'Curve':>8} {'Mode':>6} {'Status':>10}\n")
-        f.write(f"{'':>6} {'(°BTDC)':>8} {'(°BTDC)':>8} {'(°BTDC)':>8} {'(Act-Safe)':>8} {'Used':>8} {'':>6} {'':>10}\n")
-        f.write("-"*100 + "\n")
-        
-        all_errors = []
-        for rpm_bin in sorted(rpm_groups.keys()):
-            if rpm_bin == 0:
-                continue
-                
-            events = rpm_groups[rpm_bin]
-            avg_rpm = statistics.mean([e['rpm'] for e in events])
-            actual_advance = statistics.mean([e['advance_angle'] for e in events])
-            
-            safe_advance = interpolate(avg_rpm, rpm_points, safe_curve)
-            perf_advance = interpolate(avg_rpm, rpm_points, perf_curve)
-            
-            error_safe = actual_advance - safe_advance
-            error_perf = actual_advance - perf_advance
-            all_errors.append(abs(error_safe))
-            
-            # Determine which curve is closer
-            curve_used = "SAFE" if abs(error_safe) < abs(error_perf) else "PERF"
-            
-            # Determine mode
-            same_count = sum(1 for e in events if e['scheduling_mode'] == 'SAME')
-            prev_count = len(events) - same_count
-            mode = "SAME" if same_count > prev_count else "PREV"
-            
-            # Status assessment
-            if abs(error_safe) < 1.0:
-                status = "EXCELLENT"
-            elif abs(error_safe) < 2.0:
-                status = "GOOD"
-            elif abs(error_safe) < 5.0:
-                status = "FAIR"
-            else:
-                status = "POOR"
-            
-            f.write(f"{avg_rpm:6.0f} {actual_advance:8.1f} {safe_advance:8.1f} "
-                   f"{perf_advance:8.1f} {error_safe:+8.1f} {curve_used:>8} "
-                   f"{mode:>6} {status:>10}\n")
-        
-        # Summary
-        if all_errors:
-            f.write(f"\n" + "="*50 + "\n")
-            f.write("ACCURACY SUMMARY\n")
-            f.write("="*50 + "\n")
-            f.write(f"Average error: {statistics.mean(all_errors):5.2f} degrees\n")
-            f.write(f"Maximum error: {max(all_errors):5.2f} degrees\n")
-            f.write(f"RMS error: {(sum(e**2 for e in all_errors)/len(all_errors))**0.5:5.2f} degrees\n")
+    signal_changes = []
+    current_time = 0
     
-    def create_focused_plots(self):
-        """Create focused timing plots at key RPM points"""
-        # First, extract CSV data for plotting
-        csv_file = self.vcd_filename.replace('.vcd', '-signals.csv')
-        self._extract_vcd_to_csv(csv_file)
+    for line in lines:
+        line = line.strip()
         
-        # Load CSV data
-        data = self._load_csv_data(csv_file)
-        
-        # Create plots at specific RPM points
-        plot_configs = [
-            (11.0, 3, 800, "Low RPM (~800) - Ignition Timing"),
-            (30.0, 3, 2000, "Medium RPM (~2000) - Ignition Timing"), 
-            (70.0, 4, 5500, "High RPM (~5500) - Ignition Timing"),
-            (75.0, 4, 6500, "Very High RPM (~6500) - Previous-Lobe Mode")
-        ]
-        
-        created_files = []
-        for time_center, periods, expected_rpm, title in plot_configs:
-            window = self._find_period_window(data, time_center, periods)
-            
-            if window:
-                actual_rpm = self._estimate_rpm(window)
-                print(f"Creating plot for {actual_rpm} RPM...")
-                
-                full_title = title.replace(f"~{expected_rpm}", str(actual_rpm))
-                output_file = f"timing_{expected_rpm}rpm.svg"
-                
-                svg_file = self._create_clean_svg(window, output_file, full_title)
-                if svg_file:
-                    created_files.append(svg_file)
-        
-        return created_files
+        if line.startswith('#'):
+            current_time = int(line[1:])
+        # VCD signal mapping based on logic analyzer connections:
+        # D2 (trigger input) - HIGH→LOW falling edge triggers
+        # D3 (spark output) - LOW→HIGH (dwell start), HIGH→LOW (spark fire)
+        elif line == '0#':  # D2 (trigger input) goes low - TRIGGER EDGE (HIGH→LOW)
+            signal_changes.append((current_time, 'trigger_fall'))
+        elif line == '1#':  # D2 (trigger input) goes high (end of trigger pulse)
+            signal_changes.append((current_time, 'trigger_rise'))
+        elif line == '0$':  # D3 (spark output) goes low - SPARK FIRES (HIGH→LOW)
+            signal_changes.append((current_time, 'spark_fall'))
+        elif line == '1$':  # D3 (spark output) goes high - DWELL STARTS (LOW→HIGH)
+            signal_changes.append((current_time, 'dwell_start'))
+        # Legacy support for old mapping
+        elif line == '0!':  # D0 trigger goes low - TRIGGER EDGE (HIGH→LOW)
+            signal_changes.append((current_time, 'trigger_fall'))
+        elif line == '1!':  # D0 trigger goes high (end of trigger pulse)
+            signal_changes.append((current_time, 'trigger_rise'))
+        elif line == '0"':  # D1 spark output goes low - SPARK FIRES (HIGH→LOW)
+            signal_changes.append((current_time, 'spark_fall'))
+        elif line == '1"':  # D1 spark output goes high - DWELL STARTS (LOW→HIGH)
+            signal_changes.append((current_time, 'dwell_start'))
     
-    def _extract_vcd_to_csv(self, csv_file):
-        """Extract VCD data to CSV format for plotting"""
-        with open(self.vcd_filename, 'r') as f:
-            lines = f.readlines()
-        
-        # Find data section
-        data_start = 0
-        for i, line in enumerate(lines):
-            if line.strip() == '$enddefinitions $end':
-                data_start = i + 1
-                break
-        
-        # Parse signal changes
-        current_time = 0
-        signals = {'D0': 1, 'D1': 0, 'D2': 0}  # Initial states
-        data_points = []
-        
-        for line in lines[data_start:]:
-            line = line.strip()
-            if not line:
-                continue
-                
-            if line.startswith('#'):
-                current_time = int(line[1:])
-            elif line in ['0!', '1!']:  # D0 changes
-                signals['D0'] = int(line[0])
-                data_points.append((current_time / 1_000_000_000.0, signals['D0'], signals['D1'], signals['D2']))
-            elif line in ['0"', '1"']:  # D1 changes
-                signals['D1'] = int(line[0])
-                data_points.append((current_time / 1_000_000_000.0, signals['D0'], signals['D1'], signals['D2']))
-            elif line in ['0#', '1#']:  # D2 changes
-                signals['D2'] = int(line[0])
-                data_points.append((current_time / 1_000_000_000.0, signals['D0'], signals['D1'], signals['D2']))
-        
-        # Write CSV
-        with open(csv_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['time_seconds', 'D0', 'D1', 'D2'])
-            for point in data_points:
-                writer.writerow(point)
+    # Sort all changes by time
+    signal_changes.sort()
     
-    def _load_csv_data(self, csv_file):
-        """Load CSV data for plotting"""
-        data = {'time_seconds': [], 'D0': [], 'D1': []}
-        
-        with open(csv_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                data['time_seconds'].append(float(row['time_seconds']))
-                data['D0'].append(int(row['D0']))
-                data['D1'].append(int(row['D1']))
-        
-        return data
+    print(f"Found {len(signal_changes)} signal changes")
     
-    def _find_period_window(self, data, target_time, target_periods=3):
-        """Find a window containing target_periods trigger cycles"""
-        # Find trigger falling edges near target time
-        trigger_edges = []
-        for i in range(1, len(data['D0'])):
-            if data['D0'][i-1] == 1 and data['D0'][i] == 0:
-                trigger_edges.append(i)
-        
-        # Find edge closest to target_time
-        closest_idx = 0
-        min_diff = float('inf')
-        for idx in trigger_edges:
-            diff = abs(data['time_seconds'][idx] - target_time)
-            if diff < min_diff:
-                min_diff = diff
-                closest_idx = trigger_edges.index(idx)
-        
-        # Get window with target_periods cycles
-        if closest_idx + target_periods < len(trigger_edges):
-            start_idx = trigger_edges[closest_idx]
-            end_idx = trigger_edges[closest_idx + target_periods]
-            
-            # Add padding
-            start_idx = max(0, start_idx - 20)
-            end_idx = min(len(data['time_seconds']) - 1, end_idx + 20)
-            
-            return {
-                'time_seconds': data['time_seconds'][start_idx:end_idx],
-                'D0': data['D0'][start_idx:end_idx],
-                'D1': data['D1'][start_idx:end_idx]
-            }
-        
-        return None
+    # Extract timing measurements
+    timing_events = []
     
-    def _estimate_rpm(self, window_data):
-        """Calculate RPM from trigger period"""
-        trigger_times = []
-        for i in range(1, len(window_data['D0'])):
-            if window_data['D0'][i-1] == 1 and window_data['D0'][i] == 0:
-                trigger_times.append(window_data['time_seconds'][i])
-        
-        if len(trigger_times) >= 2:
-            periods = [trigger_times[i+1] - trigger_times[i] for i in range(len(trigger_times)-1)]
-            avg_period = sum(periods) / len(periods)
-            rpm = 30.0 / avg_period  # 2 pulses per rev
-            return int(rpm)
-        return 0
-    
-    def _create_clean_svg(self, window_data, output_svg, title):
-        """Create clean SVG with trigger and spark signals"""
-        if not window_data or len(window_data['time_seconds']) == 0:
-            return None
-        
-        # SVG dimensions
-        width = 800
-        height = 300
-        margin_left = 80
-        margin_right = 50
-        margin_top = 50
-        margin_bottom = 50
-        plot_width = width - margin_left - margin_right
-        plot_height = height - margin_top - margin_bottom
-        
-        # Time scaling
-        time_min = min(window_data['time_seconds'])
-        time_max = max(window_data['time_seconds'])
-        time_range_ms = (time_max - time_min) * 1000
-        
-        rel_time = [(t - time_min) * 1000 for t in window_data['time_seconds']]
-        
-        def time_to_x(t_ms):
-            return margin_left + (t_ms / time_range_ms) * plot_width
-        
-        def signal_to_y(signal_val, is_trigger):
-            if is_trigger:
-                base_y = margin_top + plot_height * 0.25
-                return base_y - signal_val * plot_height * 0.2
-            else:
-                base_y = margin_top + plot_height * 0.75
-                return base_y - signal_val * plot_height * 0.2
-        
-        # Create SVG document
-        doc = Document()
-        svg = doc.createElement('svg')
-        svg.setAttribute('width', str(width))
-        svg.setAttribute('height', str(height))
-        svg.setAttribute('viewBox', f'0 0 {width} {height}')
-        svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
-        doc.appendChild(svg)
-        
-        # Add styles
-        style = doc.createElement('style')
-        style.appendChild(doc.createTextNode('''
-            .grid { stroke: #e8e8e8; stroke-width: 1; stroke-dasharray: 2,2; }
-            .trigger-line { stroke: #2E86C1; stroke-width: 2.5; fill: none; }
-            .spark-line { stroke: #E74C3C; stroke-width: 2.5; fill: none; }
-            .label { font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; }
-            .axis-label { font-family: Arial, sans-serif; font-size: 12px; }
-            .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; }
-            .timing-arrow { stroke: #7B68EE; stroke-width: 1.5; fill: none; stroke-dasharray: 5,2; }
-            .timing-label { font-family: Arial, sans-serif; font-size: 11px; fill: #7B68EE; font-weight: bold; }
-        '''))
-        svg.appendChild(style)
-        
-        # White background
-        bg = doc.createElement('rect')
-        bg.setAttribute('width', str(width))
-        bg.setAttribute('height', str(height))
-        bg.setAttribute('fill', 'white')
-        svg.appendChild(bg)
-        
-        # Grid lines
-        for i in range(5):
-            x = margin_left + i * (plot_width / 4)
-            line = doc.createElement('line')
-            line.setAttribute('x1', str(x))
-            line.setAttribute('y1', str(margin_top))
-            line.setAttribute('x2', str(x))
-            line.setAttribute('y2', str(height - margin_bottom))
-            line.setAttribute('class', 'grid')
-            svg.appendChild(line)
-        
-        # Horizontal separator
-        separator_y = margin_top + plot_height / 2
-        sep_line = doc.createElement('line')
-        sep_line.setAttribute('x1', str(margin_left))
-        sep_line.setAttribute('y1', str(separator_y))
-        sep_line.setAttribute('x2', str(width - margin_right))
-        sep_line.setAttribute('y2', str(separator_y))
-        sep_line.setAttribute('class', 'grid')
-        svg.appendChild(sep_line)
-        
-        # Plot signals
-        self._add_signal_path(doc, svg, rel_time, window_data['D0'], time_to_x, 
-                             lambda v: signal_to_y(v, True), 'trigger-line')
-        self._add_signal_path(doc, svg, rel_time, window_data['D1'], time_to_x,
-                             lambda v: signal_to_y(v, False), 'spark-line')
-        
-        # Add timing annotations
-        self._add_timing_annotations(doc, svg, window_data, rel_time, time_to_x, signal_to_y, separator_y)
-        
-        # Add labels and title
-        self._add_plot_labels(doc, svg, title, width, height, margin_left, margin_top, 
-                             plot_height, plot_width, time_range_ms)
-        
-        # Write SVG
-        with open(output_svg, 'w') as f:
-            doc.writexml(f, indent='  ', addindent='  ', newl='\n')
-        
-        return output_svg
-    
-    def _add_signal_path(self, doc, svg, time_data, signal_data, time_to_x, signal_to_y, class_name):
-        """Add signal path to SVG"""
-        path_data = []
-        for i, (t, val) in enumerate(zip(time_data, signal_data)):
-            x = time_to_x(t)
-            y = signal_to_y(val)
-            if i == 0:
-                path_data.append(f'M {x:.2f} {y:.2f}')
-            else:
-                prev_y = signal_to_y(signal_data[i-1])
-                if abs(prev_y - y) > 1:
-                    path_data.append(f'L {x:.2f} {prev_y:.2f}')
-                    path_data.append(f'L {x:.2f} {y:.2f}')
-                else:
-                    path_data.append(f'L {x:.2f} {y:.2f}')
-        
-        path_elem = doc.createElement('path')
-        path_elem.setAttribute('d', ' '.join(path_data))
-        path_elem.setAttribute('class', class_name)
-        svg.appendChild(path_elem)
-    
-    def _add_timing_annotations(self, doc, svg, window_data, rel_time, time_to_x, signal_to_y, separator_y):
-        """Add timing annotations to SVG"""
-        # Find trigger and spark edges
-        trigger_falls = []
-        spark_falls = []
-        
-        for i in range(1, len(window_data['D0'])):
-            if window_data['D0'][i-1] == 1 and window_data['D0'][i] == 0:
-                trigger_falls.append(rel_time[i])
-            if window_data['D1'][i-1] == 1 and window_data['D1'][i] == 0:
-                spark_falls.append(rel_time[i])
-        
-        # Calculate RPM from trigger period
-        rpm = 0
-        if len(trigger_falls) >= 2:
-            periods = [trigger_falls[i+1] - trigger_falls[i] for i in range(len(trigger_falls)-1)]
-            avg_period_ms = sum(periods) / len(periods)
-            rpm = 30000.0 / avg_period_ms  # Convert ms to RPM
-        
-        # Annotate first timing relationship
-        if len(trigger_falls) > 0 and len(spark_falls) > 0:
-            trigger_time = trigger_falls[0]
-            spark_time = None
-            for st in spark_falls:
-                if st > trigger_time:
-                    spark_time = st
+    for i, (time, event) in enumerate(signal_changes):
+        if event == 'trigger_fall':  # Measure from HIGH→LOW trigger edge (falling edge)
+            # Find the next spark falling edge after this trigger
+            next_spark = None
+            for j in range(i + 1, len(signal_changes)):
+                if signal_changes[j][1] == 'spark_fall':
+                    next_spark = signal_changes[j]
                     break
             
-            if spark_time and rpm > 0:
-                delay_ms = spark_time - trigger_time
-                
-                # Calculate advance angle
-                degrees_per_ms = 180.0 / avg_period_ms  # Half revolution per trigger period
-                trigger_to_spark_degrees = delay_ms * degrees_per_ms
-                advance_angle = self.TRIGGER_ANGLE_BTDC - trigger_to_spark_degrees
-                
-                # Determine timing quality and color
-                if advance_angle < 0:
-                    timing_color = '#E74C3C'  # Red - very poor (after TDC)
-                    quality = 'POOR'
-                elif advance_angle < 5:
-                    timing_color = '#F39C12'  # Orange - poor
-                    quality = 'POOR'
-                elif advance_angle < 10:
-                    timing_color = '#F1C40F'  # Yellow - fair
-                    quality = 'FAIR'
-                else:
-                    timing_color = '#27AE60'  # Green - good
-                    quality = 'GOOD'
-                
-                # Draw timing lines
-                for t_time in [trigger_time, spark_time]:
-                    x = time_to_x(t_time)
-                    line = doc.createElement('line')
-                    line.setAttribute('x1', str(x))
-                    line.setAttribute('y1', str(signal_to_y(0, True) + 15))
-                    line.setAttribute('x2', str(x))
-                    line.setAttribute('y2', str(signal_to_y(0, False) - 15))
-                    line.setAttribute('class', 'timing-arrow')
-                    line.setAttribute('stroke', timing_color)
-                    svg.appendChild(line)
-                
-                # Add timing delay label
-                mid_x = time_to_x((trigger_time + spark_time) / 2)
-                delay_text = doc.createElement('text')
-                delay_text.setAttribute('x', str(mid_x))
-                delay_text.setAttribute('y', str(separator_y - 20))
-                delay_text.setAttribute('text-anchor', 'middle')
-                delay_text.setAttribute('class', 'timing-label')
-                delay_text.setAttribute('fill', timing_color)
-                delay_text.appendChild(doc.createTextNode(f'{delay_ms:.1f} ms'))
-                svg.appendChild(delay_text)
-                
-                # Add advance angle label
-                advance_text = doc.createElement('text')
-                advance_text.setAttribute('x', str(mid_x))
-                advance_text.setAttribute('y', str(separator_y - 5))
-                advance_text.setAttribute('text-anchor', 'middle')
-                advance_text.setAttribute('class', 'timing-label')
-                advance_text.setAttribute('fill', timing_color)
-                advance_text.appendChild(doc.createTextNode(f'{advance_angle:+.1f}° BTDC ({quality})'))
-                svg.appendChild(advance_text)
-    
-    def _add_plot_labels(self, doc, svg, title, width, height, margin_left, margin_top, 
-                        plot_height, plot_width, time_range_ms):
-        """Add labels and title to SVG"""
-        # Signal labels
-        trigger_label = doc.createElement('text')
-        trigger_label.setAttribute('x', '15')
-        trigger_label.setAttribute('y', str(margin_top + plot_height * 0.25))
-        trigger_label.setAttribute('class', 'label')
-        trigger_label.setAttribute('fill', '#2E86C1')
-        trigger_label.appendChild(doc.createTextNode('TRIGGER'))
-        svg.appendChild(trigger_label)
-        
-        spark_label = doc.createElement('text')
-        spark_label.setAttribute('x', '15')
-        spark_label.setAttribute('y', str(margin_top + plot_height * 0.75))
-        spark_label.setAttribute('class', 'label')
-        spark_label.setAttribute('fill', '#E74C3C')
-        spark_label.appendChild(doc.createTextNode('SPARK'))
-        svg.appendChild(spark_label)
-        
-        # Title
-        title_elem = doc.createElement('text')
-        title_elem.setAttribute('x', str(width / 2))
-        title_elem.setAttribute('y', '25')
-        title_elem.setAttribute('text-anchor', 'middle')
-        title_elem.setAttribute('class', 'title')
-        title_elem.appendChild(doc.createTextNode(title))
-        svg.appendChild(title_elem)
-        
-        # X-axis labels
-        for i in range(5):
-            x = margin_left + i * (plot_width / 4)
-            t = i * (time_range_ms / 4)
+            if next_spark is None:
+                continue
             
-            text = doc.createElement('text')
-            text.setAttribute('x', str(x))
-            text.setAttribute('y', str(height - 40))
-            text.setAttribute('text-anchor', 'middle')
-            text.setAttribute('class', 'axis-label')
-            text.appendChild(doc.createTextNode(f'{t:.1f}'))
-            svg.appendChild(text)
-        
-        # X-axis title
-        x_label = doc.createElement('text')
-        x_label.setAttribute('x', str(width / 2))
-        x_label.setAttribute('y', str(height - 10))
-        x_label.setAttribute('text-anchor', 'middle')
-        x_label.setAttribute('class', 'axis-label')
-        x_label.appendChild(doc.createTextNode('Time (milliseconds)'))
-        svg.appendChild(x_label)
+            spark_time, _ = next_spark
+            delay_ns = spark_time - time
+            delay_us = delay_ns / 1000.0
+            
+            # Determine if this is previous-lobe timing
+            # Look for dwell_start before the trigger_fall
+            is_previous_lobe = False
+            output_state_at_trigger = False
+            
+            # Check if output was already HIGH when trigger fell (HIGH→LOW)
+            for j in range(i - 1, -1, -1):
+                prev_time, prev_event = signal_changes[j]
+                if prev_event == 'dwell_start':
+                    # Found dwell start before trigger - check if spark happened between
+                    spark_between = False
+                    for k in range(j, i):
+                        if signal_changes[k][1] == 'spark_fall':
+                            spark_between = True
+                            break
+                    if not spark_between:
+                        is_previous_lobe = True
+                        output_state_at_trigger = True
+                    break
+                elif prev_event == 'spark_fall':
+                    # Output was LOW at trigger
+                    break
+            
+            # Calculate RPM from trigger period  
+            prev_trigger_time = None
+            for j in range(i - 1, -1, -1):
+                if signal_changes[j][1] == 'trigger_fall':  # Previous HIGH→LOW trigger edge
+                    prev_trigger_time = signal_changes[j][0]
+                    break
+            
+            if prev_trigger_time is None:
+                continue
+                
+            period_ns = time - prev_trigger_time
+            period_us = period_ns / 1000.0
+            rpm = (60_000_000.0 / period_us) / 2  # 2 triggers per revolution
+            
+            # Convert delay to degrees
+            degrees_per_us = 180.0 / period_us  # 180° per trigger period
+            delay_degrees = delay_us * degrees_per_us
+            advance_degrees = 47.0 - delay_degrees  # 47° BTDC trigger
+            
+            timing_events.append({
+                'time_sec': time / 1e9,
+                'rpm': rpm,
+                'delay_us': delay_us,
+                'delay_degrees': delay_degrees,
+                'advance_degrees': advance_degrees,
+                'is_previous_lobe': is_previous_lobe,
+                'output_high_at_trigger': output_state_at_trigger
+            })
+    
+    print(f"\nFound {len(timing_events)} timing measurements")
+    
+    # Show first few results
+    print("\nFirst 10 measurements:")
+    print("Time(s)   RPM   Delay(μs)  Delay(°)  Advance(°)  Mode")
+    print("-" * 60)
+    for i, t in enumerate(timing_events[:10]):
+        mode = "PREV" if t['is_previous_lobe'] else "SAME"
+        print(f"{t['time_sec']:6.2f} {t['rpm']:5.0f}  {t['delay_us']:8.1f}  {t['delay_degrees']:7.1f}  {t['advance_degrees']:8.1f}  {mode}")
+    
+    # RPM summary
+    bins = {}
+    for t in timing_events:
+        rpm_bin = int(t['rpm'] / 500) * 500
+        if rpm_bin not in bins:
+            bins[rpm_bin] = {'advances': [], 'prev_count': 0, 'total': 0}
+        bins[rpm_bin]['advances'].append(t['advance_degrees'])
+        if t['is_previous_lobe']:
+            bins[rpm_bin]['prev_count'] += 1
+        bins[rpm_bin]['total'] += 1
+    
+    print(f"\nRPM Summary ({len(timing_events)} total measurements):")
+    print("RPM Range    Count  Avg Advance  Prev%  Expected")
+    print("-" * 50)
+    
+    expected = {0: 0, 500: 3, 1000: 6, 1500: 9, 2000: 12, 2500: 13, 3000: 15, 
+                3500: 15, 4000: 15, 4500: 14, 5000: 14, 5500: 13, 6000: 13, 6500: 12, 7000: 12}
+    
+    for rpm_bin in sorted(bins.keys()):
+        if rpm_bin > 0 and bins[rpm_bin]['total'] > 5:
+            data = bins[rpm_bin]
+            avg_advance = sum(data['advances']) / len(data['advances'])
+            prev_percent = (data['prev_count'] / data['total']) * 100
+            exp = expected.get(rpm_bin, 13)
+            status = "OK" if abs(avg_advance - exp) < 3 else "FAIL"
+            print(f"{rpm_bin:4d}-{rpm_bin+499:4d}  {data['total']:6d}  {avg_advance:8.1f}°  {prev_percent:4.0f}%  {exp:6.1f}° {status}")
+    
+    # Write detailed results
+    output_file = vcd_file.replace('.vcd', '-analysis.txt')
+    with open(output_file, 'w') as f:
+        f.write(f"Timing Analysis: {vcd_file}\n")
+        f.write(f"Total measurements: {len(timing_events)}\n\n")
+        f.write("Time(s)    RPM   Delay(μs)  Delay(°)  Advance(°)  Mode\n")
+        f.write("-" * 60 + "\n")
+        for t in timing_events:
+            mode = "PREV" if t['is_previous_lobe'] else "SAME"
+            f.write(f"{t['time_sec']:6.2f}  {t['rpm']:5.0f}  {t['delay_us']:8.1f}  {t['delay_degrees']:7.1f}  {t['advance_degrees']:8.1f}  {mode}\n")
+    
+    print(f"\nDetailed results written to: {output_file}")
+    
+    # Create timing plots
+    create_timing_plots(timing_events, vcd_file)
+    return timing_events
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python3 timing_analyzer.py <vcd_file>")
-        print("Example: python3 timing_analyzer.py wokwi-logic.vcd")
-        sys.exit(1)
+def create_timing_plots(timing_events, vcd_file):
+    """Create SVG plots for different RPM ranges"""
+    print("\nCreating timing plots...")
     
-    vcd_file = sys.argv[1]
-    analyzer = TimingAnalyzer(vcd_file)
+    # Group by RPM
+    rpm_groups = {}
+    for t in timing_events:
+        rpm_key = int(t['rpm'] / 100) * 100
+        if rpm_key not in rpm_groups:
+            rpm_groups[rpm_key] = []
+        rpm_groups[rpm_key].append(t)
     
-    print("=== VCD TIMING ANALYSIS ===")
+    # Select timing curve points for plots
+    timing_curve_points = [200, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]
+    plot_rpms = []
     
-    # Step 1: Analyze VCD data
-    analyzer.analyze_vcd()
+    plot_data = []  # Store (target_rpm, actual_rpm, data) tuples
     
-    # Step 2: Generate analysis report
-    analysis_file = vcd_file.replace('.vcd', '-analysis.txt')
-    print(f"\nGenerating analysis report: {analysis_file}")
-    analyzer.generate_analysis_report(analysis_file)
+    for target_rpm in timing_curve_points:
+        # Find the closest RPM bin to each timing curve point
+        best = min([rpm for rpm in rpm_groups.keys() if len(rpm_groups[rpm]) > 10], 
+                  key=lambda x: abs(x - target_rpm), default=None)
+        if best:
+            plot_data.append((target_rpm, best, rpm_groups[best]))
     
-    # Step 3: Create focused timing plots
-    print("\nCreating focused timing plots...")
-    created_plots = analyzer.create_focused_plots()
+    for target_rpm, actual_rpm, data in plot_data:
+        create_svg_plot(data, actual_rpm, target_rpm)
     
-    # Summary
-    print(f"\n=== ANALYSIS COMPLETE ===")
-    print(f"Analysis report: {analysis_file}")
-    print(f"Created {len(created_plots)} timing plots:")
-    for plot in created_plots:
-        print(f"  - {plot}")
+    print(f"Created {len(plot_data)} SVG plots for timing curve points:")
+    for target_rpm, actual_rpm, data in plot_data:
+        print(f"  - timing_curve_{target_rpm}rpm.svg (actual: {actual_rpm} RPM)")
     
-    print(f"\nTo include plots in README.md:")
-    for plot in created_plots:
-        print(f"![Timing Plot]({plot})")
+    # Sample measured angles at timing curve points
+    sample_timing_curve_points(rpm_groups)
+
+def create_svg_plot(rpm_data, rpm, target_rpm=None):
+    """Create SVG plot showing actual waveforms for specific RPM range"""
+    
+    # Find a representative time window from rpm_data
+    sample_time = rpm_data[len(rpm_data)//2]['time_sec'] * 1e9  # Convert to ns
+    
+    # Read VCD file again to get waveform data around this time
+    with open("wokwi-logic.vcd", 'r') as f:
+        lines = f.readlines()
+    
+    # Extract signal changes around sample time
+    signal_changes = []
+    current_time = 0
+    
+    for line in lines:
+        line = line.strip()
+        if line.startswith('#'):
+            current_time = int(line[1:])
+        elif line in ['0#', '1#', '0$', '1$', '0!', '1!', '0"', '1"']:
+            signal_changes.append((current_time, line))
+    
+    # Find trigger falling edges near sample time
+    trigger_falls = []
+    for t, e in signal_changes:
+        if e in ['0#', '0!'] and abs(t - sample_time) < 200e6:  # Within 200ms (D2 or legacy D0)
+            trigger_falls.append(t)
+    
+    if len(trigger_falls) < 3:
+        return  # Not enough triggers for plot
+    
+    # Sort and find 3 consecutive triggers with middle one closest to sample
+    trigger_falls.sort()
+    best_idx = -1
+    best_dist = float('inf')
+    
+    for i in range(len(trigger_falls) - 2):
+        middle_trigger = trigger_falls[i + 1]
+        dist = abs(middle_trigger - sample_time)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = i
+    
+    if best_idx < 0:
+        return
+    
+    # Get the 3 trigger times
+    selected_triggers = trigger_falls[best_idx:best_idx + 3]
+    first_trigger = selected_triggers[0]
+    middle_trigger = selected_triggers[1]
+    last_trigger = selected_triggers[2]
+    
+    # Window includes some margin before first trigger and after last trigger
+    margin = (last_trigger - first_trigger) * 0.1  # 10% margin
+    window_start = first_trigger - margin
+    window_end = last_trigger + margin
+    window_events = [(t, e) for t, e in signal_changes if window_start <= t <= window_end]
+    
+    if len(window_events) < 10:  # Not enough data
+        return
+    
+    # Calculate averages for annotations
+    avg_advance = sum(r['advance_degrees'] for r in rpm_data) / len(rpm_data)
+    avg_delay = sum(r['delay_us'] for r in rpm_data) / len(rpm_data)
+    prev_count = sum(1 for r in rpm_data if r['is_previous_lobe'])
+    prev_percent = (prev_count / len(rpm_data)) * 100
+    
+    # Determine quality and color
+    expected = get_expected_advance(rpm)
+    error = abs(avg_advance - expected)
+    mode_desc = "Previous-Lobe Mode" if prev_percent > 50 else "Same-Lobe Mode"
+    
+    if error < 2:
+        color = '#2ECC71'  # Green
+        quality = 'GOOD'
+    elif error < 5:
+        color = '#F39C12'  # Orange
+        quality = 'FAIR'
+    else:
+        color = '#E74C3C'  # Red
+        quality = 'POOR'
+    
+    # Create waveform plot
+    width, height = 800, 300
+    plot_width = 640  # Drawing area width
+    plot_height = 200  # Drawing area height
+    
+    # Time range and scaling
+    time_start = window_events[0][0]
+    time_end = window_events[-1][0]
+    time_range = time_end - time_start
+    time_scale = plot_width / time_range if time_range > 0 else 1
+    
+    def time_to_x(t):
+        return 80 + (t - time_start) * time_scale
+    
+    # Build waveforms  
+    # Trigger: negative pulse (HIGH baseline with LOW pulses)
+    # Spark: positive pulse (LOW baseline with HIGH dwell pulses)
+    # SVG coordinates: y=80 is HIGH (top), y=120 is LOW (bottom) for trigger
+    # SVG coordinates: y=200 is LOW (bottom), y=160 is HIGH (top) for spark
+    trigger_state = True   # Start HIGH (normal state)
+    spark_state = False    # Start LOW (normal state)
+    trigger_path = "M 80 80"   # Start at y=80 (HIGH - top of trigger area)
+    spark_path = "M 80 200"   # Start at y=200 (LOW - bottom of spark area)
+    
+    trigger_fall_positions = []  # X positions of trigger falls
+    spark_fall_positions = []    # X positions of spark falls
+    middle_trigger_x = None       # X position of middle trigger
+    middle_spark_x = None         # X position of spark after middle trigger
+    
+    for t, event in window_events:
+        x = time_to_x(t)
+        
+        if event in ['1#', '1!']:  # Trigger rises (end of negative pulse - return to HIGH)
+            trigger_path += f" L {x} 120 L {x} 80"  # Rise from LOW to HIGH (y=120->y=80)
+            trigger_state = True
+        elif event in ['0#', '0!']:  # Trigger falls (start of negative pulse - HIGH to LOW)  
+            trigger_path += f" L {x} 80 L {x} 120"  # Fall from HIGH to LOW (y=80->y=120)
+            trigger_state = False
+            trigger_fall_positions.append(x)
+            # Check if this is the middle trigger
+            if abs(t - middle_trigger) < 1000:  # Within 1us
+                middle_trigger_x = x
+        elif event in ['1$', '1"']:  # Spark rises (dwell start) (D3 or legacy D1)
+            spark_path += f" L {x} 200 L {x} 160"
+            spark_state = True
+        elif event in ['0$', '0"']:  # Spark falls (spark fire) (D3 or legacy D1)
+            spark_path += f" L {x} 160 L {x} 200"
+            spark_state = False
+            spark_fall_positions.append(x)
+            # Check if this is the spark after middle trigger
+            if middle_trigger_x is not None and middle_spark_x is None and x > middle_trigger_x:
+                middle_spark_x = x
+    
+    # Extend paths to end
+    end_x = 80 + plot_width
+    trigger_path += f" L {end_x} {80 if trigger_state else 120}"  # HIGH=y80, LOW=y120
+    spark_path += f" L {end_x} {160 if spark_state else 200}"    # HIGH=y160, LOW=y200
+    
+    # Create SVG
+    svg = f'''<?xml version="1.0" ?>
+<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
+<style>
+    .grid {{ stroke: #e8e8e8; stroke-width: 1; stroke-dasharray: 2,2; }}
+    .trigger-line {{ stroke: #2E86C1; stroke-width: 2.5; fill: none; }}
+    .spark-line {{ stroke: #E74C3C; stroke-width: 2.5; fill: none; }}
+    .label {{ font-family: Arial, sans-serif; font-size: 12px; font-weight: bold; }}
+    .title {{ font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; }}
+    .timing-label {{ font-family: Arial, sans-serif; font-size: 11px; fill: {color}; font-weight: bold; }}
+    .axis-label {{ font-family: Arial, sans-serif; font-size: 10px; }}
+</style>
+<rect width="{width}" height="{height}" fill="white"/>
+
+<!-- Grid lines -->
+<line x1="80" y1="50" x2="80" y2="250" class="grid"/>
+<line x1="240" y1="50" x2="240" y2="250" class="grid"/>
+<line x1="400" y1="50" x2="400" y2="250" class="grid"/>
+<line x1="560" y1="50" x2="560" y2="250" class="grid"/>
+<line x1="720" y1="50" x2="720" y2="250" class="grid"/>
+<line x1="80" y1="150" x2="720" y2="150" class="grid"/>
+
+<!-- Waveforms -->
+<path d="{trigger_path}" class="trigger-line"/>
+<path d="{spark_path}" class="spark-line"/>
+
+<!-- Signal labels -->
+<text x="20" y="105" class="label" fill="#2E86C1">TRIGGER (neg)</text>
+<text x="20" y="185" class="label" fill="#E74C3C">SPARK</text>'''
+    
+    # Add timing arrows between middle trigger fall and its spark fall
+    if middle_trigger_x is not None and middle_spark_x is not None:
+        mid_x = (middle_trigger_x + middle_spark_x) / 2
+        
+        svg += f'''
+<!-- Timing measurement -->
+<line x1="{middle_trigger_x}" y1="130" x2="{middle_trigger_x}" y2="170" stroke="{color}" stroke-width="1.5" stroke-dasharray="3,2"/>
+<line x1="{middle_spark_x}" y1="130" x2="{middle_spark_x}" y2="170" stroke="{color}" stroke-width="1.5" stroke-dasharray="3,2"/>
+<text x="{mid_x}" y="145" text-anchor="middle" class="timing-label">{avg_delay/1000:.1f} ms</text>
+<text x="{mid_x}" y="158" text-anchor="middle" class="timing-label">{avg_advance:+.1f}° BTDC</text>'''
+    
+    # Add degree scale annotations
+    if len(trigger_falls) >= 2:
+        period_x = trigger_falls[1] - trigger_falls[0]
+        # Each trigger period = 180°
+        svg += f'''
+<text x="{trigger_falls[0] + period_x/4}" y="40" text-anchor="middle" class="axis-label">45°</text>
+<text x="{trigger_falls[0] + period_x/2}" y="40" text-anchor="middle" class="axis-label">90°</text>
+<text x="{trigger_falls[0] + 3*period_x/4}" y="40" text-anchor="middle" class="axis-label">135°</text>
+<text x="{trigger_falls[1]}" y="40" text-anchor="middle" class="axis-label">180°</text>'''
+    
+    # Create title showing target curve point if available
+    if target_rpm and target_rpm != rpm:
+        title = f"Curve Point {target_rpm} RPM (Actual: {rpm}) - {mode_desc}"
+    else:
+        title = f"RPM {rpm} - {mode_desc}"
+        
+    svg += f'''
+<!-- Title and results -->
+<text x="400" y="25" text-anchor="middle" class="title">{title}</text>
+<text x="400" y="275" text-anchor="middle" class="timing-label">Expected: {expected:.1f}° BTDC | Quality: {quality} | Prev-lobe: {prev_percent:.0f}%</text>
+
+<!-- Time axis -->
+<text x="80" y="265" class="axis-label">0 ms</text>
+<text x="400" y="265" class="axis-label">{(time_range/2)/1e6:.1f} ms</text>
+<text x="720" y="265" class="axis-label">{time_range/1e6:.1f} ms</text>
+
+</svg>'''
+    
+    # Use target RPM in filename if available, otherwise actual RPM
+    curve_point = target_rpm if target_rpm else rpm
+    filename = f"timing_curve_{curve_point}rpm.svg"
+    with open(filename, 'w') as f:
+        f.write(svg)
+
+def sample_timing_curve_points(rpm_groups):
+    """Sample measured timing at each timing curve point for comparison"""
+    timing_curve_points = [200, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000]
+    
+    print(f"\n=== TIMING CURVE POINT ANALYSIS ===")
+    print("Point   Expected  Measured  Error   Mode%   Status")
+    print("-" * 50)
+    
+    for target_rpm in timing_curve_points:
+        # Find closest RPM bin with sufficient data
+        best_rpm = None
+        best_distance = float('inf')
+        
+        for rpm_bin in rpm_groups.keys():
+            if len(rpm_groups[rpm_bin]) >= 10:  # Need at least 10 measurements
+                distance = abs(rpm_bin - target_rpm)
+                if distance < best_distance and distance <= 100:  # Within 100 RPM
+                    best_distance = distance
+                    best_rpm = rpm_bin
+        
+        if best_rpm is None:
+            print(f"{target_rpm:4d}    [NO DATA]")
+            continue
+            
+        # Calculate statistics for this point
+        data = rpm_groups[best_rpm]
+        measured_advances = [t['advance_degrees'] for t in data]
+        avg_measured = sum(measured_advances) / len(measured_advances)
+        prev_lobe_count = sum(1 for t in data if t['is_previous_lobe'])
+        prev_lobe_percent = (prev_lobe_count / len(data)) * 100
+        
+        # Get expected value
+        expected = get_expected_advance(target_rpm)
+        error = avg_measured - expected
+        
+        # Determine status
+        if abs(error) < 2:
+            status = "GOOD"
+        elif abs(error) < 5:
+            status = "FAIR" 
+        else:
+            status = "POOR"
+            
+        print(f"{target_rpm:4d}    {expected:6.1f}°  {avg_measured:7.1f}°  {error:+5.1f}°  {prev_lobe_percent:4.0f}%   {status}")
+
+def get_expected_advance(rpm):
+    """Get expected advance from Arduino timing curves (safe curve)"""
+    # Arduino TimingCurves::safe_advance
+    points = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000]
+    advances = [0, 6, 12, 15, 15, 14, 13, 12]
+    
+    # Check if beyond last point FIRST (Arduino logic)
+    if rpm >= points[-1]:
+        return advances[-1]
+    
+    for i in range(1, len(points)):
+        if rpm <= points[i]:
+            ratio = (rpm - points[i-1]) / (points[i] - points[i-1])
+            return advances[i-1] + (advances[i] - advances[i-1]) * ratio
+    return advances[-1]
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1:
+        analyze_vcd(sys.argv[1])
+    else:
+        analyze_vcd("wokwi-logic.vcd")
