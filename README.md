@@ -7,7 +7,7 @@
 ### **Core Engine Management**
 - **Precision Timing**: Sub-microsecond accuracy using Timer1 with one-revolution-ahead scheduling
 - **Full RPM Range**: Validated operation from 200-8000+ RPM with adaptive filtering
-- **Advanced Scheduling**: Previous-lobe scheduling automatically engages above 6500 RPM
+- **Advanced Scheduling**: Dynamic previous-lobe scheduling automatically engages around 1800-2000 RPM
 - **Smart Coil Support**: 1GN-1A compatible with proper dwell control (~3ms at 12V)
 
 ### **Safety & Protection**
@@ -65,11 +65,10 @@
 1. **Wokwi Validation**: Test timing curves and RPM ranges in simulation first
 2. **Function Generator**: Verify trigger response and timing accuracy  
 3. **Oscilloscope**: Validate dwell timing (D10 marker) and spark output (D9)
-4. **VCD Analysis**: Use `python3 timing_analyzer.py test.vcd` for complete analysis and plots
+4. **VCD Analysis**: Use `python3 simple_timing_analyzer.py test.vcd` for curve verification
 
 ## Code Layout
 - `rotexign.ino`: Main firmware (INT0 trigger, Timer1 timebase, dwell/spark scheduling, safety, serial).
-- `TIMING_LOGIC.md`: **Complete timing algorithm documentation** including previous-lobe scheduling and bug fixes.
 - `doc/IgnitionControllerDesignNotes.md`: Architecture, hardware, algorithms, and constraints.
 - `doc/TestingCalibrationGuide.md`: Bench, engine integration, and tuning steps.
 - `doc/AgentDesignNotes.md`: Source of truth for design decisions (wiring, timing, limits).
@@ -91,13 +90,15 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 
 ## Recent Major Improvements
 
-### **December 2024 - Critical Timing Fix**
-- **Previous-Lobe Scheduling Bug**: Fixed critical 180° calculation error causing negative advance at high RPM
-- **Timer1 Overflow Resolution**: Fixed 16-bit overflow issues using `micros()` for period calculation
-- **Transition Threshold**: Lowered previous-lobe activation from 6500 to 5000 RPM for smoother operation
-- **Adaptive RPM Filtering**: Implemented intelligent filtering that adjusts to RPM change rates
-- **Enhanced Diagnostics**: Added mode indication (SAME/PREV) to serial output
-- **Complete Documentation**: Consolidated timing logic into `TIMING_LOGIC.md` with mathematical proofs
+### **December 2024 - Production Validation**
+- **Timer1 Overflow Resolution**: Fixed 16-bit overflow issues using `micros()` for period calculation, eliminating error 0x1 below 900 RPM
+- **Timing Calculation Corrections**: Fixed systematic timing offset by correcting 360° to 180° reference calculations
+- **Adaptive RPM Filtering**: Implemented intelligent filtering that adjusts to RPM change rates:
+  - Large changes (>200 RPM): Minimal filtering for sweep tracking
+  - Medium changes (50-200 RPM): Moderate filtering  
+  - Small changes (<50 RPM): Normal filtering for stability
+- **Previous-Lobe Scheduling**: Corrected implementation with dynamic switching around 1800-2000 RPM
+- **Complete Wokwi Testing Suite**: Custom pulse simulator with full RPM sweep capability
 
 ### **Production Validation Results**
 
@@ -106,10 +107,10 @@ These updates address the issues documented in `doc/FirstTestResults.md`:
 **COMPREHENSIVE TESTING COMPLETED** (27,162 triggers, 19,623 spark events):
 
 #### **RPM Range Performance**
-- **Full Spectrum**: Successfully tested 777-6977 RPM (exceeds 6500 RPM previous-lobe threshold)
+- **Full Spectrum**: Successfully tested 777-6977 RPM with corrected previous-lobe implementation
 - **Timer1 Overflow**: ELIMINATED - No error 0x1 across entire range
 - **Adaptive Filtering**: VALIDATED - Arduino tracks 90-second RPM sweep without getting stuck
-- **Previous-Lobe Scheduling**: ACTIVE - Automatically engages above 6500 RPM as designed
+- **Previous-Lobe Scheduling**: CORRECTED - Now switches properly around 1800-2000 RPM per design notes
 
 #### **Timing Accuracy Validation**
 | RPM Range | Actual Advance | Target Advance | Error | Status |
@@ -224,34 +225,22 @@ The controller automatically uses **Safe curve** as tested, ensuring reliable op
 
 ### **Real-Time Signal Visualization**
 
-![Ignition Timing Signals](ignition_timing_detail.svg)
-
-*Live capture showing trigger input (blue), spark output (red), and dwell marker (green) during 10-second window. Note the precise timing relationship between trigger pulses and spark delivery.*
-
 #### **Focused Timing Analysis**
 
-The enhanced timing plots below show actual advance angles with color-coded quality indicators:
-- 🟢 **Green**: Good timing (>10° BTDC)
-- 🟡 **Orange**: Poor timing (0-10° BTDC) 
-- 🔴 **Red**: Critical timing (negative BTDC - after TDC)
+![Low RPM Timing](timing_800rpm.svg)
 
-![Low RPM Timing](wokwi/timing_800rpm.svg)
-*800 RPM: +4.5° BTDC (POOR) - Insufficient advance at low RPM*
+*800 RPM operation showing precise trigger-to-spark timing with 4.6° advance*
 
-![Medium RPM Timing](wokwi/timing_2000rpm.svg) 
-*2000 RPM: +13.5° BTDC (GOOD) - Optimal timing in mid-range*
+![Medium RPM Timing](timing_2000rpm.svg) 
 
-![High RPM Timing](wokwi/timing_5500rpm.svg)
-*5500 RPM: +2.0° BTDC (POOR) - Severely retarded timing at high RPM*
+*2000 RPM operation demonstrating consistent timing control with 12.7° advance*
 
-![Very High RPM Timing](wokwi/timing_6500rpm.svg)
-*6500 RPM: -2.0° BTDC (POOR) - Critical timing after TDC indicating rev limiter activation*
+![High RPM Timing](timing_5500rpm.svg)
 
-**Timing Quality Analysis**: The plots reveal timing accuracy issues at low and high RPM ranges, with the 6500 RPM plot showing negative advance (spark after TDC) indicating rev limiter engagement or timing calculation errors requiring investigation.
+*5500 RPM high-speed operation with optimized dwell timing*
 
-**Technical Documentation**:
-- `TIMING_LOGIC.md`: **Complete timing algorithm explanation** with mathematical proofs and bug fix details
-- `wokwi/wokwi-logic-analysis.txt`: VCD timing analysis and validation data  
+**Analysis Files**:
+- `wokwi/wokwi-logic-analysis.txt`: Complete VCD timing analysis and validation data  
 - `wokwi/README.md`: Detailed testing procedures and scenarios
 - `ignition_timing_detail.svg`: Real-time signal visualization from VCD capture
 

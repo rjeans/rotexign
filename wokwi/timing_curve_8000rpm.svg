@@ -1,0 +1,47 @@
+<?xml version="1.0" ?>
+<svg width="800" height="300" viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg">
+<style>
+    .grid { stroke: #e8e8e8; stroke-width: 1; stroke-dasharray: 2,2; }
+    .trigger-line { stroke: #2E86C1; stroke-width: 2.5; fill: none; }
+    .spark-line { stroke: #E74C3C; stroke-width: 2.5; fill: none; }
+    .label { font-family: Arial, sans-serif; font-size: 12px; font-weight: bold; }
+    .title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; }
+    .timing-label { font-family: Arial, sans-serif; font-size: 11px; fill: #F39C12; font-weight: bold; }
+    .axis-label { font-family: Arial, sans-serif; font-size: 10px; }
+</style>
+<rect width="800" height="300" fill="white"/>
+
+<!-- Grid lines -->
+<line x1="80" y1="50" x2="80" y2="250" class="grid"/>
+<line x1="240" y1="50" x2="240" y2="250" class="grid"/>
+<line x1="400" y1="50" x2="400" y2="250" class="grid"/>
+<line x1="560" y1="50" x2="560" y2="250" class="grid"/>
+<line x1="720" y1="50" x2="720" y2="250" class="grid"/>
+<line x1="80" y1="150" x2="720" y2="150" class="grid"/>
+
+<!-- Waveforms -->
+<path d="M 80 80 L 80.0 80 L 80.0 120 L 107.1197213872373 120 L 107.1197213872373 80 L 371.5370049128011 80 L 371.5370049128011 120 L 398.6567263000384 120 L 398.6567263000384 80 L 663.0740098256022 80 L 663.0740098256022 120 L 690.1937312128395 120 L 690.1937312128395 80 L 720 80" class="trigger-line"/>
+<path d="M 80 200 L 98.42018936133586 200 L 98.42018936133586 160 L 136.9259901743978 160 L 136.9259901743978 200 L 389.76654263278465 200 L 389.76654263278465 160 L 428.49689473893295 160 L 428.49689473893295 200 L 681.1128281049299 200 L 681.1128281049299 160 L 720.0 160 L 720.0 200 L 720 200" class="spark-line"/>
+
+<!-- Signal labels -->
+<text x="20" y="105" class="label" fill="#2E86C1">TRIGGER (neg)</text>
+<text x="20" y="185" class="label" fill="#E74C3C">SPARK</text>
+<!-- Timing measurement -->
+<line x1="371.5370049128011" y1="130" x2="371.5370049128011" y2="170" stroke="#F39C12" stroke-width="1.5" stroke-dasharray="3,2"/>
+<line x1="428.49689473893295" y1="130" x2="428.49689473893295" y2="170" stroke="#F39C12" stroke-width="1.5" stroke-dasharray="3,2"/>
+<text x="400.016949825867" y="145" text-anchor="middle" class="timing-label">0.9 ms</text>
+<text x="400.016949825867" y="158" text-anchor="middle" class="timing-label">+9.7° BTDC</text>
+<text x="37470475000.0" y="40" text-anchor="middle" class="axis-label">45°</text>
+<text x="37471550000.0" y="40" text-anchor="middle" class="axis-label">90°</text>
+<text x="37472625000.0" y="40" text-anchor="middle" class="axis-label">135°</text>
+<text x="37473700000" y="40" text-anchor="middle" class="axis-label">180°</text>
+<!-- Title and results -->
+<text x="400" y="25" text-anchor="middle" class="title">Curve Point 8000 RPM (Actual: 6900) - Same-Lobe Mode</text>
+<text x="400" y="275" text-anchor="middle" class="timing-label">Expected: 12.1° BTDC | Quality: FAIR | Prev-lobe: 0%</text>
+
+<!-- Time axis -->
+<text x="80" y="265" class="axis-label">0 ms</text>
+<text x="400" y="265" class="axis-label">4.7 ms</text>
+<text x="720" y="265" class="axis-label">9.4 ms</text>
+
+</svg>
