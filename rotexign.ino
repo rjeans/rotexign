@@ -36,7 +36,7 @@ namespace Pins {
 namespace Engine {
   const uint8_t PULSES_PER_REV = 2;     // Two flywheel lobes
   const float TRIGGER_ANGLE_BTDC = 47.0f; // Trigger occurs 47° BTDC
-  const float CRANKING_ADVANCE = 3.0f;    // Advance during cranking
+  
   
   // RPM thresholds
   const uint16_t MIN_RPM = 200;
@@ -94,6 +94,13 @@ struct SystemState {
   // Timer1 overflow tracking for periods > 32.768ms
   volatile uint16_t timer1_overflows = 0;
   volatile uint32_t last_trigger_timestamp = 0;  // Full 32-bit timestamp
+  
+  // Software timing for low RPM when Timer1 would wraparound
+  bool using_software_timing = false;
+  uint32_t software_dwell_start_us = 0;
+  uint32_t software_spark_target_us = 0;
+  bool software_spark_pending = false;
+  bool software_dwell_active = false;
   
   // Diagnostics
   volatile uint32_t trigger_count = 0;
@@ -341,6 +348,73 @@ namespace TimerControl {
 }
 
 // ============================================================================
+// SOFTWARE TIMING FOR LOW RPM (when Timer1 would wraparound)
+// ============================================================================
+namespace SoftwareTiming {
+  void cancel_pending_spark() {
+    if (sys.software_dwell_active) {
+      // Ensure coil is in safe idle state
+      CoilControl::safe_idle();
+    }
+    sys.software_spark_pending = false;
+    sys.software_dwell_active = false;
+    sys.using_software_timing = false;
+  }
+  
+  void schedule_spark(uint32_t dwell_delay_us, uint32_t spark_delay_us) {
+    uint32_t current_us = micros();
+    
+    // Calculate absolute target times (handle micros() wraparound)
+    sys.software_dwell_start_us = current_us + dwell_delay_us;
+    sys.software_spark_target_us = current_us + spark_delay_us;
+    
+    // Safety check: ensure dwell duration is reasonable
+    uint32_t dwell_duration_us = spark_delay_us - dwell_delay_us;
+    if (dwell_duration_us > (Coil::MAX_DWELL_MS * 1000)) {
+      // Dwell too long - start dwell later to limit duration
+      sys.software_dwell_start_us = sys.software_spark_target_us - (Coil::DWELL_MS * 1000);
+    }
+    
+    sys.software_spark_pending = true;
+    sys.software_dwell_active = false;
+    sys.using_software_timing = true;
+  }
+  
+  void process_pending_events() {
+    if (!sys.software_spark_pending) return;
+    
+    uint32_t current_us = micros();
+    
+    // Handle dwell start (with micros() wraparound consideration)
+    if (!sys.software_dwell_active) {
+      // Check if target time has been reached
+      // Using signed comparison to handle wraparound correctly
+      int32_t time_until_dwell = (int32_t)(sys.software_dwell_start_us - current_us);
+      bool dwell_time_reached = (time_until_dwell <= 0);
+      
+      if (dwell_time_reached) {
+        CoilControl::start_dwell();
+        sys.software_dwell_active = true;
+      }
+    }
+    
+    // Handle spark event (with micros() wraparound consideration)
+    if (sys.software_dwell_active) {
+      // Check if target time has been reached
+      // Using signed comparison to handle wraparound correctly
+      int32_t time_until_spark = (int32_t)(sys.software_spark_target_us - current_us);
+      bool spark_time_reached = (time_until_spark <= 0);
+      
+      if (spark_time_reached) {
+        CoilControl::fire_spark();
+        sys.spark_count++;
+        cancel_pending_spark();
+      }
+    }
+  }
+}
+
+// ============================================================================
 // INTERRUPT SERVICE ROUTINES
 // ============================================================================
 
@@ -367,8 +441,9 @@ ISR(INT0_vect) {
   // Calculate period using full 32-bit timestamps
   uint32_t delta_ticks = current_timestamp - sys.last_trigger_timestamp;
   
-  // Reject glitches (minimum 3ms = 6000 ticks between valid triggers for up to 10000 RPM) 
-  if (delta_ticks < 6000) {
+  // Reject glitches (minimum 1ms = 2000 ticks between valid triggers) 
+  // This allows up to 30,000 RPM theoretical maximum
+  if (delta_ticks < 2000) {
     sys.glitch_count++;
     return;
   }
@@ -424,6 +499,7 @@ namespace EngineManager {
         sys.relays_initialized = false;
         sys.trigger_count = 0;  // Reset trigger count for next start
         sys.timer1_overflows = 0;  // Reset overflow counter
+        SoftwareTiming::cancel_pending_spark();  // Cancel any software timing
         Serial.println(F("Engine stopped - protection re-engaged"));
       }
     } else {
@@ -543,8 +619,26 @@ namespace EngineManager {
       same_lobe_fits = (dwell_margin >= 0);
     }
     
-    // Decide timing mode - CRITICAL: Force previous-lobe if Timer1 would wrap
-    bool use_previous_lobe = timer1_would_wrap || !same_lobe_fits;
+    // HYBRID TIMING: If Timer1 would wrap, use software timing for same-lobe
+    if (timer1_would_wrap) {
+      // Timer1 cannot handle this delay - use software timing instead
+      TimerControl::cancel_scheduled_events();
+      
+      // Calculate software timing delays in microseconds
+      uint32_t delay_us = Utils::ticks_to_us(delay_ticks);
+      uint32_t dwell_us = Utils::ticks_to_us(dwell_ticks);
+      uint32_t dwell_delay_us = (delay_us > dwell_us) ? (delay_us - dwell_us) : 0;
+      
+      // Use software timing for same-lobe scheduling
+      SoftwareTiming::schedule_spark(dwell_delay_us, delay_us);
+      
+      // Track that we're using same-lobe via software for diagnostics  
+      sys.last_used_previous_lobe = false;
+      return;
+    }
+    
+    // Decide timing mode - use previous-lobe if same-lobe doesn't fit
+    bool use_previous_lobe = !same_lobe_fits;
     
     // Validate previous trigger if needed  
     if (use_previous_lobe && sys.have_previous_trigger) {
@@ -563,11 +657,6 @@ namespace EngineManager {
       use_previous_lobe = false;
     }
     
-    // CRITICAL SAFETY: If we're forced to use same-lobe due to no previous trigger,
-    // but Timer1 would wrap, skip this spark event entirely
-    if (!use_previous_lobe && timer1_would_wrap) {
-      return;  // Cannot schedule safely - skip this spark
-    }
     
     // Calculate dwell start time based on mode - use 32-bit arithmetic
     uint32_t dwell_start_32;
@@ -609,6 +698,9 @@ namespace EngineManager {
       return; // Skip this spark event
     }
 
+    // Cancel any pending software timing - we're using hardware Timer1
+    SoftwareTiming::cancel_pending_spark();
+    
     sys.scheduled_dwell_ticks = dwell_ticks;
     sys.last_used_previous_lobe = use_previous_lobe;  // Track mode for diagnostics
     TimerControl::schedule_spark_event(dwell_start, spark_time);
@@ -634,6 +726,7 @@ namespace SerialInterface {
     Serial.print(F("us, Engine: ")); Serial.print(sys.engine_running ? F("RUN") : F("STOP"));
     Serial.print(F(", RevLim: ")); Serial.print(sys.rev_limit_active ? F("ON") : F("OFF"));
     Serial.print(F(", Mode: ")); Serial.print(prev_mode ? F("PREV") : F("SAME"));
+    if (sys.using_software_timing) Serial.print(F("-SW"));
     Serial.print(F(", OvfProt: ")); Serial.print(sys.overflow_protection_events);
     Serial.print(F(", Errors: 0x")); Serial.println(sys.error_flags, HEX);
   }
@@ -794,6 +887,9 @@ void loop() {
   
   // Check for engine timeout
   EngineManager::check_timeout();
+  
+  // Process software timing events (for low RPM hybrid timing)
+  SoftwareTiming::process_pending_events();
   
   // Handle serial commands
   SerialInterface::handle_commands();
