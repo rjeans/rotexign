@@ -97,9 +97,10 @@ struct SystemState {
   
   // Software timing for Timer1 wraparound cases
   bool using_software_timing = false;
-  uint32_t software_dwell_start_us = 0;
-  bool software_dwell_pending = false;  // Stage 1: waiting for dwell start time
-  bool software_dwell_active = false;   // Stage 2: dwell started, spark pending
+  uint32_t software_dwell_scheduled_us = 0;  // When dwell is scheduled to start
+  uint32_t software_dwell_actual_us = 0;     // When dwell actually started
+  bool software_dwell_pending = false;       // Stage 1: waiting for dwell start time
+  bool software_dwell_active = false;        // Stage 2: dwell started, spark pending
   
   // Diagnostics
   volatile uint32_t trigger_count = 0;
@@ -350,7 +351,7 @@ namespace SoftwareTiming {
     uint32_t current_us = micros();
     
     // Calculate absolute dwell start time (handle micros() wraparound)
-    sys.software_dwell_start_us = current_us + dwell_delay_us;
+    sys.software_dwell_scheduled_us = current_us + dwell_delay_us;
     
     // Ensure clean state
     sys.software_dwell_pending = true;
@@ -367,22 +368,23 @@ namespace SoftwareTiming {
     if (sys.software_dwell_pending && !sys.software_dwell_active) {
       // Check if dwell start time has been reached
       // Using signed comparison to handle wraparound correctly
-      int32_t time_until_dwell = (int32_t)(sys.software_dwell_start_us - current_us);
+      int32_t time_until_dwell = (int32_t)(sys.software_dwell_scheduled_us - current_us);
       bool dwell_time_reached = (time_until_dwell <= 0);
       
       if (dwell_time_reached) {
-        // Stage 2: Start dwell and schedule spark for 3ms later
+        // Stage 2: Start dwell and record ACTUAL start time
         CoilControl::start_dwell();
         sys.software_dwell_pending = false;
         sys.software_dwell_active = true;
-        // No need to store spark time - just wait 3ms from now
+        // Record when dwell ACTUALLY started
+        sys.software_dwell_actual_us = current_us;
       }
     }
     
-    // Stage 2: Handle spark event (always 3ms after dwell start)
+    // Stage 2: Handle spark event (always 3ms after ACTUAL dwell start)
     if (sys.software_dwell_active) {
-      // Check if 3ms have passed since dwell started
-      int32_t time_since_dwell = (int32_t)(current_us - sys.software_dwell_start_us);
+      // Check if 3ms have passed since dwell ACTUALLY started
+      int32_t time_since_dwell = (int32_t)(current_us - sys.software_dwell_actual_us);
       bool spark_time_reached = (time_since_dwell >= (Coil::DWELL_MS * 1000));
       
       if (spark_time_reached) {
@@ -467,30 +469,13 @@ ISR(TIMER1_COMPB_vect) {
   // Stage 2: Dwell start event - begin charging coil and schedule spark
   CoilControl::start_dwell();
   
-  // Calculate spark time, handling Timer1 wraparound
-  uint32_t spark_time_32 = (uint32_t)OCR1B + Utils::ms_to_ticks(Coil::DWELL_MS);
+  // Calculate spark time (we know it fits since both events were pre-validated)
+  uint16_t spark_time = OCR1B + Utils::ms_to_ticks(Coil::DWELL_MS);
   
-  // Always disable Compare B first since it's done its job
-  TIMSK1 &= ~_BV(OCIE1B);
-  
-  if (spark_time_32 > 65535) {
-    // Spark time would wraparound Timer1 - switch to software timing
-    // Start timing from current time (dwell already started)
-    uint32_t current_us = micros();
-    sys.software_dwell_start_us = current_us;  // Dwell just started
-    sys.software_dwell_pending = false;
-    sys.software_dwell_active = true;
-    sys.using_software_timing = true;
-    
-    // Ensure Compare A is disabled and cleared
-    TIMSK1 &= ~_BV(OCIE1A);
-    TIFR1 = _BV(OCF1A);
-  } else {
-    // Spark time fits in Timer1 range - use hardware timing
-    OCR1A = (uint16_t)spark_time_32;
-    TIFR1 = _BV(OCF1A);  // Clear Compare A flag
-    TIMSK1 |= _BV(OCIE1A);  // Enable Compare A
-  }
+  // Setup Compare A for spark timing
+  OCR1A = spark_time;
+  TIFR1 = _BV(OCF1A);  // Clear Compare A flag
+  TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);  // Enable Compare A, disable Compare B
 }
 
 // ============================================================================
@@ -623,9 +608,12 @@ namespace EngineManager {
     // Calculate dwell start time (same logic for both modes)
     uint32_t dwell_start_32 = sys.last_trigger_capture + delay_ticks - dwell_ticks;
     
-    // Use two-stage scheduling: Stage 1 schedules dwell start
-    if (dwell_start_32 <= 65535) {
-      // Schedule dwell start using Timer1 hardware
+    // Check if BOTH dwell start AND spark will fit in current Timer1 cycle
+    uint32_t spark_time_32 = dwell_start_32 + dwell_ticks;
+    bool both_fit_in_timer1 = (dwell_start_32 <= 65535) && (spark_time_32 <= 65535);
+    
+    if (both_fit_in_timer1) {
+      // Both events fit in Timer1 range - use hardware timing
       OCR1B = (uint16_t)dwell_start_32;
       // Clear ALL compare flags and disable ALL compare interrupts first
       TIFR1 = _BV(OCF1A) | _BV(OCF1B);
