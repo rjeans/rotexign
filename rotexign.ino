@@ -95,12 +95,11 @@ struct SystemState {
   // Simple timing state
   bool last_was_previous_lobe = false;            // For diagnostics
   
-  // Software timing for low RPM when Timer1 would wraparound
+  // Software timing for Timer1 wraparound cases
   bool using_software_timing = false;
   uint32_t software_dwell_start_us = 0;
-  uint32_t software_spark_target_us = 0;
-  bool software_spark_pending = false;
-  bool software_dwell_active = false;
+  bool software_dwell_pending = false;  // Stage 1: waiting for dwell start time
+  bool software_dwell_active = false;   // Stage 2: dwell started, spark pending
   
   // Diagnostics
   volatile uint32_t trigger_count = 0;
@@ -337,64 +336,61 @@ namespace TimerControl {
 // SOFTWARE TIMING FOR LOW RPM (when Timer1 would wraparound)
 // ============================================================================
 namespace SoftwareTiming {
-  void cancel_pending_spark() {
+  void cancel_pending_events() {
     if (sys.software_dwell_active) {
       // Ensure coil is in safe idle state
       CoilControl::safe_idle();
     }
-    sys.software_spark_pending = false;
+    sys.software_dwell_pending = false;
     sys.software_dwell_active = false;
     sys.using_software_timing = false;
   }
   
-  void schedule_spark(uint32_t dwell_delay_us, uint32_t spark_delay_us) {
+  void schedule_dwell_start(uint32_t dwell_delay_us) {
     uint32_t current_us = micros();
     
-    // Calculate absolute target times (handle micros() wraparound)
+    // Calculate absolute dwell start time (handle micros() wraparound)
     sys.software_dwell_start_us = current_us + dwell_delay_us;
-    sys.software_spark_target_us = current_us + spark_delay_us;
     
-    // Safety check: ensure dwell duration is reasonable
-    uint32_t dwell_duration_us = spark_delay_us - dwell_delay_us;
-    if (dwell_duration_us > (Coil::MAX_DWELL_MS * 1000)) {
-      // Dwell too long - start dwell later to limit duration
-      sys.software_dwell_start_us = sys.software_spark_target_us - (Coil::DWELL_MS * 1000);
-    }
-    
-    sys.software_spark_pending = true;
+    // Ensure clean state
+    sys.software_dwell_pending = true;
     sys.software_dwell_active = false;
     sys.using_software_timing = true;
   }
   
   void process_pending_events() {
-    if (!sys.software_spark_pending) return;
+    if (!sys.using_software_timing) return;
     
     uint32_t current_us = micros();
     
-    // Handle dwell start (with micros() wraparound consideration)
-    if (!sys.software_dwell_active) {
-      // Check if target time has been reached
+    // Stage 1: Handle dwell start
+    if (sys.software_dwell_pending && !sys.software_dwell_active) {
+      // Check if dwell start time has been reached
       // Using signed comparison to handle wraparound correctly
       int32_t time_until_dwell = (int32_t)(sys.software_dwell_start_us - current_us);
       bool dwell_time_reached = (time_until_dwell <= 0);
       
       if (dwell_time_reached) {
+        // Stage 2: Start dwell and schedule spark for 3ms later
         CoilControl::start_dwell();
+        sys.software_dwell_pending = false;
         sys.software_dwell_active = true;
+        // No need to store spark time - just wait 3ms from now
       }
     }
     
-    // Handle spark event (with micros() wraparound consideration)
+    // Stage 2: Handle spark event (always 3ms after dwell start)
     if (sys.software_dwell_active) {
-      // Check if target time has been reached
-      // Using signed comparison to handle wraparound correctly
-      int32_t time_until_spark = (int32_t)(sys.software_spark_target_us - current_us);
-      bool spark_time_reached = (time_until_spark <= 0);
+      // Check if 3ms have passed since dwell started
+      int32_t time_since_dwell = (int32_t)(current_us - sys.software_dwell_start_us);
+      bool spark_time_reached = (time_since_dwell >= (Coil::DWELL_MS * 1000));
       
       if (spark_time_reached) {
         CoilControl::fire_spark();
         sys.spark_count++;
-        cancel_pending_spark();
+        
+        // Clean up software timing state
+        cancel_pending_events();
       }
     }
   }
@@ -458,18 +454,43 @@ ISR(INT0_vect) {
 ISR(TIMER1_COMPA_vect) {
   // Spark event: end dwell
   CoilControl::fire_spark();
-  // Disable both compare interrupts, keep overflow interrupt
-  TIMSK1 = _BV(TOIE1);
+  
+  // Clean up: disable all compare interrupts and clear flags
+  TIMSK1 &= ~(_BV(OCIE1A) | _BV(OCIE1B));  // Disable both compare interrupts
+  TIFR1 = _BV(OCF1A) | _BV(OCF1B);  // Clear both compare flags
+  
   sys.spark_count++;
   // Spark fired successfully
 }
 
 ISR(TIMER1_COMPB_vect) {
-  // Dwell start event: begin charging coil
+  // Stage 2: Dwell start event - begin charging coil and schedule spark
   CoilControl::start_dwell();
-  // Disable Compare B interrupt after use to prevent retriggering
-  // Keep Compare A enabled for the spark event
+  
+  // Calculate spark time, handling Timer1 wraparound
+  uint32_t spark_time_32 = (uint32_t)OCR1B + Utils::ms_to_ticks(Coil::DWELL_MS);
+  
+  // Always disable Compare B first since it's done its job
   TIMSK1 &= ~_BV(OCIE1B);
+  
+  if (spark_time_32 > 65535) {
+    // Spark time would wraparound Timer1 - switch to software timing
+    // Start timing from current time (dwell already started)
+    uint32_t current_us = micros();
+    sys.software_dwell_start_us = current_us;  // Dwell just started
+    sys.software_dwell_pending = false;
+    sys.software_dwell_active = true;
+    sys.using_software_timing = true;
+    
+    // Ensure Compare A is disabled and cleared
+    TIMSK1 &= ~_BV(OCIE1A);
+    TIFR1 = _BV(OCF1A);
+  } else {
+    // Spark time fits in Timer1 range - use hardware timing
+    OCR1A = (uint16_t)spark_time_32;
+    TIFR1 = _BV(OCF1A);  // Clear Compare A flag
+    TIMSK1 |= _BV(OCIE1A);  // Enable Compare A
+  }
 }
 
 // ============================================================================
@@ -493,7 +514,7 @@ namespace EngineManager {
         sys.relays_initialized = false;
         sys.trigger_count = 0;  // Reset trigger count for next start
         sys.timer1_overflows = 0;  // Reset overflow counter
-        SoftwareTiming::cancel_pending_spark();  // Cancel any software timing
+        SoftwareTiming::cancel_pending_events();  // Cancel any software timing
       }
     } else {
       sys.error_flags &= ~SystemState::ERROR_NO_SIGNAL;
@@ -595,30 +616,30 @@ namespace EngineManager {
     bool use_same_lobe = (delay_ticks >= (dwell_ticks + SAFETY_MARGIN_TICKS));
     
     if (!use_same_lobe) {
-      // PREVIOUS-LOBE: Schedule spark to fire in NEXT period
-      // Same timing calculation, just add one period to get to next period
+      // PREVIOUS-LOBE: Add one period to delay spark into next period
       delay_ticks += period;
     }
     
-    // Use the same scheduling mechanism for both modes
-    uint32_t spark_time_32 = sys.last_trigger_capture + delay_ticks;
-    uint32_t dwell_start_32 = spark_time_32 - dwell_ticks;
+    // Calculate dwell start time (same logic for both modes)
+    uint32_t dwell_start_32 = sys.last_trigger_capture + delay_ticks - dwell_ticks;
     
-    // Use Timer1 hardware only if both times fit within 16-bit range WITHOUT wrapping
-    if (spark_time_32 <= 65535 && dwell_start_32 <= 65535) {
-      // Both times fit in 16-bit range - use hardware timing
+    // Use two-stage scheduling: Stage 1 schedules dwell start
+    if (dwell_start_32 <= 65535) {
+      // Schedule dwell start using Timer1 hardware
       OCR1B = (uint16_t)dwell_start_32;
-      OCR1A = (uint16_t)spark_time_32;
+      // Clear ALL compare flags and disable ALL compare interrupts first
       TIFR1 = _BV(OCF1A) | _BV(OCF1B);
-      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A) | _BV(OCIE1B);
+      TIMSK1 = _BV(TOIE1) | _BV(OCIE1B);  // Only Compare B enabled
       sys.scheduled_dwell_ticks = dwell_ticks;
       sys.last_used_previous_lobe = !use_same_lobe;
     } else {
-      // Any wraparound - use software timing for accuracy
-      uint32_t delay_us = Utils::ticks_to_us(delay_ticks);
-      uint32_t dwell_us = Utils::ticks_to_us(dwell_ticks);
-      uint32_t dwell_delay_us = (delay_us > dwell_us) ? (delay_us - dwell_us) : 0;
-      SoftwareTiming::schedule_spark(dwell_delay_us, delay_us);
+      // Dwell start too far - use software timing (two-stage approach)
+      // Clear ALL compare flags and disable ALL compare interrupts
+      TIFR1 = _BV(OCF1A) | _BV(OCF1B);
+      TIMSK1 = _BV(TOIE1);  // Only overflow interrupt
+      
+      uint32_t dwell_delay_us = Utils::ticks_to_us(delay_ticks - dwell_ticks);
+      SoftwareTiming::schedule_dwell_start(dwell_delay_us);
       sys.scheduled_dwell_ticks = dwell_ticks;
       sys.last_used_previous_lobe = !use_same_lobe;
     }
@@ -649,19 +670,7 @@ namespace SerialInterface {
     Serial.print(F(", Errors: 0x")); Serial.println(sys.error_flags, HEX);
   }
   
-  void print_diagnostics() {
-    Serial.println(F("=== DIAGNOSTICS ==="));
-    Serial.print(F("Triggers: ")); Serial.println(sys.trigger_count);
-    Serial.print(F("Sparks: ")); Serial.println(sys.spark_count);
-    Serial.print(F("Glitches: ")); Serial.println(sys.glitch_count);
-    Serial.print(F("Rev Limits: ")); Serial.println(sys.rev_limit_events);
-    Serial.print(F("Missed: ")); Serial.println(sys.missed_triggers);
-    Serial.print(F("Overflow Events: ")); Serial.println(sys.overflow_protection_events);
-    Serial.print(F("Uptime: ")); Serial.print(millis() / 1000); Serial.println(F("s"));
-    Serial.print(F("Curve: ")); Serial.println(sys.use_safe_curve ? F("SAFE") : F("PERF"));
-    Serial.print(F("Timing Mode: ")); 
-    Serial.println(sys.last_used_previous_lobe ? F("PREVIOUS-LOBE") : F("SAME-LOBE"));
-  }
+
   
 }
 
