@@ -101,6 +101,19 @@ def find_corresponding_dwell(signal_changes: List[Tuple[int, str]], spark_idx: i
                 return (spark_time - check_time) / 1000.0
     return None
 
+def find_trigger_pulse_width(signal_changes, trigger_fall_idx):
+    """Find the trigger pulse width by looking for the next trigger_rise."""
+    if trigger_fall_idx >= len(signal_changes) - 1:
+        return None
+    
+    trigger_fall_time = signal_changes[trigger_fall_idx][0]
+    
+    for j in range(trigger_fall_idx + 1, min(len(signal_changes), trigger_fall_idx + 10)):
+        check_time, check_event = signal_changes[j]
+        if check_event == 'trigger_rise':
+            return (check_time - trigger_fall_time) / 1000.0  # Return in microseconds
+    return None
+
 def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
     """
     Analyze VCD timing from first principles.
@@ -159,6 +172,7 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
 
         spark_idx = next((idx for idx, (sig_time, sig_event) in enumerate(signal_changes) if sig_time == spark_time and sig_event == 'spark_fall'), None)
         actual_dwell_us = find_corresponding_dwell(signal_changes, spark_idx, spark_time) if spark_idx is not None else REQUIRED_DWELL_US
+        trigger_pulse_width_us = find_trigger_pulse_width(signal_changes, i)
 
         timing_events.append({
             'time_sec': time / 1e9,
@@ -167,6 +181,7 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
             'delay_degrees': delay_degrees,
             'advance_degrees': advance_degrees,
             'dwell_us': actual_dwell_us,
+            'trigger_pulse_width_us': trigger_pulse_width_us,
             'is_previous_lobe': is_previous_lobe
         })
 
@@ -232,7 +247,7 @@ def generate_csv_output(timing_events, missing_spark_events):
         # Header
         writer.writerow([
             'time_sec', 'rpm', 'delay_us', 'delay_degrees', 'advance_degrees',
-            'dwell_us', 'is_previous_lobe', 'safe_advance', 'perf_advance'
+            'dwell_us', 'trigger_pulse_width_us', 'is_previous_lobe', 'safe_advance', 'perf_advance'
         ])
         
         # Data rows
@@ -244,6 +259,7 @@ def generate_csv_output(timing_events, missing_spark_events):
                 f"{event['delay_degrees']:.2f}",
                 f"{event['advance_degrees']:.2f}",
                 f"{event['dwell_us']:.1f}",
+                f"{event['trigger_pulse_width_us']:.1f}" if event['trigger_pulse_width_us'] is not None else "N/A",
                 event['is_previous_lobe'],
                 f"{safe_interp[i]:.2f}" if i < len(safe_interp) else "0.00",
                 f"{perf_interp[i]:.2f}" if i < len(perf_interp) else "0.00"
@@ -267,8 +283,19 @@ def create_timing_vs_rpm_plot(timing_events):
         print("No timing events to plot")
         return
     
-    rpms = np.array([event['rpm'] for event in timing_events])
-    advances = np.array([event['advance_degrees'] for event in timing_events])
+    # Filter out outliers for better visualization
+    filtered_events = []
+    for event in timing_events:
+        rpm = event['rpm']
+        advance = event['advance_degrees']
+        # Keep reasonable data: RPM 500-8000, advance -10° to 30°
+        if 500 <= rpm <= 8000 and -10 <= advance <= 30:
+            filtered_events.append(event)
+    
+    print(f"Filtered {len(timing_events) - len(filtered_events)} outlier points for plotting")
+    
+    rpms = np.array([event['rpm'] for event in filtered_events])
+    advances = np.array([event['advance_degrees'] for event in filtered_events])
     
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
@@ -316,45 +343,81 @@ def create_timing_vs_rpm_plot(timing_events):
     ax1.set_xlim(0, 8000)
     ax1.set_ylim(-5, 25)
     
-    # Lower plot: Timing Error vs Expected
-    expected_advance = np.interp(rpms, rpm_range, perf_curve)
-    timing_errors = advances - expected_advance
+    # Lower plot: Duty Cycle and Dwell Time vs RPM
+    dwells = np.array([event['dwell_us'] for event in filtered_events])
     
-    ax2.scatter(rpms, timing_errors, alpha=0.3, s=20, c='lightcoral', label='Individual errors', zorder=1)
-    ax2.axhline(y=0, color='green', linestyle='-', linewidth=2, label='Perfect timing')
-    ax2.axhline(y=2, color='orange', linestyle='--', alpha=0.7, label='±2° tolerance')
-    ax2.axhline(y=-2, color='orange', linestyle='--', alpha=0.7)
+    # Calculate duty cycle: dwell_time / period_time * 100
+    periods_us = 60_000_000 / (rpms * 2)  # Period between triggers in microseconds
+    duty_cycles = (dwells / periods_us) * 100
     
-    # Calculate error statistics by RPM bins
-    error_means = []
-    error_stds = []
+    # Create twin axis for dwell time
+    ax2_twin = ax2.twinx()
+    
+    # Plot duty cycle (left axis)
+    ax2.scatter(rpms, duty_cycles, alpha=0.3, s=20, c='lightgreen', label='Individual duty cycle', zorder=1)
+    
+    # Calculate duty cycle statistics by RPM bins
+    duty_means = []
+    duty_stds = []
+    dwell_means = []
+    dwell_stds = []
     
     for i in range(len(rpm_bins)-1):
         mask = (rpms >= rpm_bins[i]) & (rpms < rpm_bins[i+1])
         if np.sum(mask) > 0:
-            error_means.append(np.mean(timing_errors[mask]))
-            error_stds.append(np.std(timing_errors[mask]))
+            duty_means.append(np.mean(duty_cycles[mask]))
+            duty_stds.append(np.std(duty_cycles[mask]))
+            dwell_means.append(np.mean(dwells[mask]))
+            dwell_stds.append(np.std(dwells[mask]))
         else:
-            error_means.append(np.nan)
-            error_stds.append(np.nan)
+            duty_means.append(np.nan)
+            duty_stds.append(np.nan)
+            dwell_means.append(np.nan)
+            dwell_stds.append(np.nan)
     
     # Remove NaN values for plotting
-    valid_error_mask = ~np.isnan(error_means)
-    valid_error_centers = bin_centers[valid_error_mask]
-    valid_error_means = np.array(error_means)[valid_error_mask]
-    valid_error_stds = np.array(error_stds)[valid_error_mask]
+    valid_duty_mask = ~np.isnan(duty_means)
+    valid_duty_centers = bin_centers[valid_duty_mask]
+    valid_duty_means = np.array(duty_means)[valid_duty_mask]
+    valid_duty_stds = np.array(duty_stds)[valid_duty_mask]
+    valid_dwell_means = np.array(dwell_means)[valid_duty_mask]
+    valid_dwell_stds = np.array(dwell_stds)[valid_duty_mask]
     
-    ax2.errorbar(valid_error_centers, valid_error_means, yerr=valid_error_stds,
-                fmt='o-', color='red', capsize=3, capthick=1, linewidth=2,
-                label='Mean error ± std dev', zorder=3)
+    # Plot duty cycle trend line (left axis)
+    ax2.errorbar(valid_duty_centers, valid_duty_means, yerr=valid_duty_stds,
+                fmt='o-', color='green', capsize=3, capthick=1, linewidth=2,
+                label='Mean duty cycle ± std dev', zorder=3)
     
+    # Plot dwell time scatter (right axis)
+    ax2_twin.scatter(rpms, dwells/1000, alpha=0.3, s=20, c='lightcoral', label='Individual dwell time', zorder=1)
+    
+    # Plot dwell time trend line (right axis)
+    ax2_twin.errorbar(valid_duty_centers, valid_dwell_means/1000, yerr=valid_dwell_stds/1000,
+                     fmt='s-', color='red', capsize=3, capthick=1, linewidth=2,
+                     label='Mean dwell time ± std dev', zorder=3)
+    
+    # Add reference lines
+    ax2.axhline(y=40, color='orange', linestyle='--', alpha=0.7, label='40% max duty cycle')
+    ax2_twin.axhline(y=3, color='blue', linestyle='--', alpha=0.7, label='Target 3ms dwell')
+    
+    # Configure axes
     ax2.set_xlabel('RPM')
-    ax2.set_ylabel('Timing Error (degrees)')
-    ax2.set_title('Timing Error vs Expected')
+    ax2.set_ylabel('Duty Cycle (%)', color='green')
+    ax2_twin.set_ylabel('Dwell Time (ms)', color='red')
+    ax2.set_title('Duty Cycle and Dwell Time vs RPM')
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
+    
+    # Configure colors
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax2_twin.tick_params(axis='y', labelcolor='red')
+    
+    # Legends
+    ax2.legend(loc='upper left')
+    ax2_twin.legend(loc='upper right')
+    
     ax2.set_xlim(0, 8000)
-    ax2.set_ylim(-10, 10)
+    ax2.set_ylim(0, 50)  # 0-50% duty cycle
+    ax2_twin.set_ylim(0, 5)  # 0-5ms dwell time
     
     plt.tight_layout()
     plt.savefig('timing_vs_rpm.png', dpi=300, bbox_inches='tight')
@@ -386,33 +449,35 @@ def create_waveforms_plot(timing_events):
         period_us = 60_000_000 / (actual_rpm * 2)  # Period between triggers
         delay_us = event['delay_us']
         dwell_us = event['dwell_us'] if event['dwell_us'] else 3000
+        trigger_pulse_width_us = event['trigger_pulse_width_us'] if event['trigger_pulse_width_us'] else 500
         
         # Create time axis (show ~2.5 periods)
         time_span_us = period_us * 2.5
         time_us = np.linspace(0, time_span_us, 1000)
         
-        # Generate trigger signal (falling edge at trigger times)
+        # Generate trigger signal (normally HIGH, brief LOW pulse at trigger times)
         trigger_signal = np.ones_like(time_us) * 3
         for trigger_time in [0, period_us, period_us * 2]:
             if trigger_time < time_span_us:
-                # Add trigger pulse (short low pulse)
-                pulse_mask = (time_us >= trigger_time) & (time_us < trigger_time + 50)
+                # Add trigger falling edge (measured pulse width from VCD data)
+                pulse_start = trigger_time
+                pulse_end = trigger_time + trigger_pulse_width_us
+                pulse_mask = (time_us >= pulse_start) & (time_us <= pulse_end)
                 trigger_signal[pulse_mask] = 0
         
-        # Generate spark signal
+        # Generate spark signal (normally LOW, HIGH during dwell, brief LOW spike at spark)
         spark_signal = np.zeros_like(time_us)
         for trigger_time in [0, period_us, period_us * 2]:
             spark_time = trigger_time + delay_us
             dwell_start_time = spark_time - dwell_us
             
-            if spark_time < time_span_us:
-                # Add dwell period (high) and spark (low)
+            if spark_time < time_span_us and dwell_start_time >= 0:
+                # Add dwell period (HIGH = coil charging)
                 dwell_mask = (time_us >= dwell_start_time) & (time_us < spark_time)
                 spark_signal[dwell_mask] = 2
                 
-                # Add spark pulse (short high pulse after dwell)
-                spark_pulse_mask = (time_us >= spark_time) & (time_us < spark_time + 100)
-                spark_signal[spark_pulse_mask] = 0
+                # Spark event is the falling edge at spark_time (end of dwell)
+                # The signal naturally drops to 0 after dwell ends
         
         # Plot signals
         ax = axes[i]
