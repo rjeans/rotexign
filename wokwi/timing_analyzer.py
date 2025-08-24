@@ -7,6 +7,8 @@ Generates timing curves, waveforms, and analysis plots with scatter points
 import sys
 import csv
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict
 
@@ -258,7 +260,7 @@ def generate_csv_output(timing_events, missing_spark_events):
                 f"{event['delay_us']:.1f}",
                 f"{event['delay_degrees']:.2f}",
                 f"{event['advance_degrees']:.2f}",
-                f"{event['dwell_us']:.1f}",
+                f"{event['dwell_us']:.1f}" if event['dwell_us'] is not None else "N/A",
                 f"{event['trigger_pulse_width_us']:.1f}" if event['trigger_pulse_width_us'] is not None else "N/A",
                 event['is_previous_lobe'],
                 f"{safe_interp[i]:.2f}" if i < len(safe_interp) else "0.00",
@@ -344,17 +346,20 @@ def create_timing_vs_rpm_plot(timing_events):
     ax1.set_ylim(-5, 25)
     
     # Lower plot: Duty Cycle and Dwell Time vs RPM
-    dwells = np.array([event['dwell_us'] for event in filtered_events])
+    # Filter out events with None dwell_us values
+    valid_events = [event for event in filtered_events if event['dwell_us'] is not None]
+    dwells = np.array([event['dwell_us'] for event in valid_events])
+    valid_rpms = np.array([event['rpm'] for event in valid_events])
     
     # Calculate duty cycle: dwell_time / period_time * 100
-    periods_us = 60_000_000 / (rpms * 2)  # Period between triggers in microseconds
+    periods_us = 60_000_000 / (valid_rpms * 2)  # Period between triggers in microseconds
     duty_cycles = (dwells / periods_us) * 100
     
     # Create twin axis for dwell time
     ax2_twin = ax2.twinx()
     
     # Plot duty cycle (left axis)
-    ax2.scatter(rpms, duty_cycles, alpha=0.3, s=20, c='lightgreen', label='Individual duty cycle', zorder=1)
+    ax2.scatter(valid_rpms, duty_cycles, alpha=0.3, s=20, c='lightgreen', label='Individual duty cycle', zorder=1)
     
     # Calculate duty cycle statistics by RPM bins
     duty_means = []
@@ -363,7 +368,7 @@ def create_timing_vs_rpm_plot(timing_events):
     dwell_stds = []
     
     for i in range(len(rpm_bins)-1):
-        mask = (rpms >= rpm_bins[i]) & (rpms < rpm_bins[i+1])
+        mask = (valid_rpms >= rpm_bins[i]) & (valid_rpms < rpm_bins[i+1])
         if np.sum(mask) > 0:
             duty_means.append(np.mean(duty_cycles[mask]))
             duty_stds.append(np.std(duty_cycles[mask]))
@@ -389,7 +394,7 @@ def create_timing_vs_rpm_plot(timing_events):
                 label='Mean duty cycle ± std dev', zorder=3)
     
     # Plot dwell time scatter (right axis)
-    ax2_twin.scatter(rpms, dwells/1000, alpha=0.3, s=20, c='lightcoral', label='Individual dwell time', zorder=1)
+    ax2_twin.scatter(valid_rpms, dwells/1000, alpha=0.3, s=20, c='lightcoral', label='Individual dwell time', zorder=1)
     
     # Plot dwell time trend line (right axis)
     ax2_twin.errorbar(valid_duty_centers, valid_dwell_means/1000, yerr=valid_dwell_stds/1000,

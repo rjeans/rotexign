@@ -1,13 +1,11 @@
 /*
- * Advanced Arduino Ignition Timing Controller
- * For High-Performance Jet Ski Applications (Rotax 787)
+ * Arduino Ignition Timing Controller
+ * For Rotax 787 Applications
  * 
  * Features:
- * - Sub-microsecond timing precision using Timer1 Input Capture
- * - One-revolution-ahead scheduling for high advance angles
+ * - Sub-microsecond timing precision using Timer1 
  * - Smart coil (1GN-1A) support with dwell control
- * - Comprehensive safety systems with rev limiting
- * - Serial tuning interface with real-time diagnostics
+ * - Safety systems with rev limiting
  * 
  * Hardware:
  * - Arduino Uno/Nano (ATmega328P)
@@ -26,7 +24,6 @@
 namespace Pins {
   const uint8_t TRIGGER_INPUT = 2;      // INT0: Magneto pickup (falling edge HIGH→LOW)
   const uint8_t SPARK_OUTPUT = 3;       // Coil control (HIGH=dwell, LOW=spark)
-  const uint8_t STATUS_LED = 13;        // Status indicator
   const uint8_t OPTO_SHORT_RELAY = 4;   // Removes optocoupler short after boot
 }
 
@@ -95,10 +92,8 @@ struct SystemState {
   volatile uint16_t timer1_overflows = 0;
   volatile uint32_t last_trigger_timestamp = 0;  // Full 32-bit timestamp
   
-  // Previous-lobe timing state (simplified)
-  volatile bool prev_lobe_dwell_active = false;   // Dwell running for next trigger's spark
-  volatile float prev_lobe_advance = 0.0f;        // Advance angle for pending spark
-  volatile uint32_t prev_lobe_start_ms = 0;       // Timeout protection
+  // Simple timing state
+  bool last_was_previous_lobe = false;            // For diagnostics
   
   // Software timing for low RPM when Timer1 would wraparound
   bool using_software_timing = false;
@@ -350,7 +345,6 @@ namespace SoftwareTiming {
     sys.software_spark_pending = false;
     sys.software_dwell_active = false;
     sys.using_software_timing = false;
-    sys.prev_lobe_dwell_active = false;
   }
   
   void schedule_spark(uint32_t dwell_delay_us, uint32_t spark_delay_us) {
@@ -446,30 +440,6 @@ ISR(INT0_vect) {
     return;
   }
   
-  // PREVIOUS-LOBE: If dwell is active from previous trigger, fire the spark now
-  if (sys.prev_lobe_dwell_active) {
-    // Calculate spark timing relative to THIS trigger using stored advance angle
-    float delta_angle = Engine::TRIGGER_ANGLE_BTDC - sys.prev_lobe_advance;
-    while (delta_angle < 0) delta_angle += 360.0f;
-    while (delta_angle >= 360.0f) delta_angle -= 360.0f;
-    
-    uint32_t delay_ticks = (uint32_t)(delta_ticks * (delta_angle / 180.0f));
-    uint32_t spark_time_32 = capture_time + delay_ticks;
-    
-    // Schedule spark if Timer1 won't wrap
-    if (spark_time_32 <= 65535) {
-      OCR1A = (uint16_t)spark_time_32;
-      TIFR1 = _BV(OCF1A);
-      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);
-      
-      // Record actual dwell time achieved (exactly 3ms as calculated)
-      sys.scheduled_dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
-    }
-    
-    sys.prev_lobe_dwell_active = false;
-    sys.last_used_previous_lobe = true;
-  }
-  
   // Store previous trigger data
   sys.prev_trigger_capture = sys.last_trigger_capture;
   sys.prev_period_ticks = sys.trigger_period_ticks;
@@ -491,8 +461,7 @@ ISR(TIMER1_COMPA_vect) {
   // Disable both compare interrupts, keep overflow interrupt
   TIMSK1 = _BV(TOIE1);
   sys.spark_count++;
-  // Clear previous-lobe state after spark fires
-  sys.prev_lobe_dwell_active = false;
+  // Spark fired successfully
 }
 
 ISR(TIMER1_COMPB_vect) {
@@ -525,8 +494,6 @@ namespace EngineManager {
         sys.trigger_count = 0;  // Reset trigger count for next start
         sys.timer1_overflows = 0;  // Reset overflow counter
         SoftwareTiming::cancel_pending_spark();  // Cancel any software timing
-        sys.prev_lobe_dwell_active = false;  // Clear previous-lobe state
-        Serial.println(F("Engine stopped - protection re-engaged"));
       }
     } else {
       sys.error_flags &= ~SystemState::ERROR_NO_SIGNAL;
@@ -614,177 +581,47 @@ namespace EngineManager {
     // Get advance angle from curve
     float advance = get_advance_angle(sys.filtered_rpm);
     
-    // Check if current spark needs previous-lobe timing (not enough time for 3ms dwell)
-    bool needs_previous_lobe = will_need_previous_lobe(sys.trigger_period_ticks, advance);
-    
-    if (needs_previous_lobe && !sys.prev_lobe_dwell_active) {
-      // Previous-lobe: Start dwell after a reasonable delay to get ~3ms total
-      // Simple approach: start dwell at current_trigger + (period - 3ms)
-      // This gives approximately 3ms dwell when spark fires after next trigger
-      
-      uint32_t period = sys.trigger_period_ticks;
-      uint32_t dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
-      uint32_t safety_margin = 1200; // ~0.6ms safety margin
-      
-      uint32_t dwell_start_delay;
-      if (period > dwell_ticks + safety_margin) {
-        dwell_start_delay = period - dwell_ticks;
-      } else {
-        dwell_start_delay = safety_margin; // Fallback to small delay
-      }
-      
-      uint32_t dwell_start_time = sys.last_trigger_capture + dwell_start_delay;
-      
-      // Schedule dwell start if Timer1 won't wrap
-      if (dwell_start_time <= 65535) {
-        OCR1B = (uint16_t)dwell_start_time;
-        TIFR1 = _BV(OCF1B);
-        TIMSK1 |= _BV(OCIE1B);
-        sys.prev_lobe_dwell_active = true;
-        sys.prev_lobe_advance = advance;
-        sys.prev_lobe_start_ms = millis();
-      }
-      // Don't return - still need to handle current trigger if not previous-lobe
-    }
+    // Calculate timing for this period
     float delta_angle = Engine::TRIGGER_ANGLE_BTDC - advance;
-    
-    // Normalize angle
     while (delta_angle < 0) delta_angle += 360.0f;
     while (delta_angle >= 360.0f) delta_angle -= 360.0f;
-
-    // Skip same-lobe scheduling if we just started previous-lobe dwell
-    if (needs_previous_lobe) {
-      return;  // Previous-lobe dwell started, wait for next trigger to fire spark
-    }
     
-    // Calculate timing - CRITICAL FIX: Always relative to current trigger
     uint32_t period = sys.trigger_period_ticks;
     uint32_t delay_ticks = (uint32_t)(period * (delta_angle / 180.0f));
+    uint32_t dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);  // Always 3ms
     
-    // CRITICAL: Check if Timer1 compare register would wraparound
-    uint32_t trigger_32 = sys.last_trigger_capture;
-    uint32_t spark_time_32 = trigger_32 + delay_ticks;
+    // Simple decision: Can we fit 3ms dwell in this period?
+    const uint16_t SAFETY_MARGIN_TICKS = 600; // ~0.3ms
+    bool use_same_lobe = (delay_ticks >= (dwell_ticks + SAFETY_MARGIN_TICKS));
     
-    // If spark time > 65535, OCR1A wraps and timing fails
-    bool timer1_would_wrap = (spark_time_32 > 65535);
-    
-    uint16_t spark_time = (uint16_t)spark_time_32;
-
-    // Same-lobe dwell calculation (with duty cycle limits)
-    uint32_t target_dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
-    uint32_t ticks_per_rev = period * Engine::PULSES_PER_REV;
-    uint32_t max_dwell_ticks = (ticks_per_rev * Coil::MAX_DUTY_PERCENT) / 100UL;
-    uint32_t dwell_ticks = (target_dwell_ticks < max_dwell_ticks) ? target_dwell_ticks : max_dwell_ticks;
-
-    const uint16_t SAFETY_MARGIN_TICKS = 600; // ~0.30 ms
-    
-    // Check if same-lobe dwell fits - use 32-bit arithmetic to avoid wraparound issues
-    uint32_t earliest_dwell_start_same_32 = trigger_32 + SAFETY_MARGIN_TICKS;
-    uint16_t earliest_dwell_start_same = (uint16_t)earliest_dwell_start_same_32;
-    
-    // FIXED: Use 32-bit arithmetic for dwell timing to prevent wraparound issues
-    bool same_lobe_fits;
-    uint32_t required_dwell_start_32;
-    uint16_t required_dwell_start;
-    
-    if (dwell_ticks > delay_ticks) {
-      // Not enough time - dwell extends before spark time
-      same_lobe_fits = false;
-      required_dwell_start_32 = 0; // Will be overridden in previous-lobe mode
-      required_dwell_start = 0;
-    } else {
-      required_dwell_start_32 = spark_time_32 - dwell_ticks;
-      required_dwell_start = (uint16_t)required_dwell_start_32;
-      // Check if dwell start time is achievable (handle wraparound in comparison)
-      int16_t dwell_margin = (int16_t)(required_dwell_start - earliest_dwell_start_same);
-      same_lobe_fits = (dwell_margin >= 0);
+    if (!use_same_lobe) {
+      // PREVIOUS-LOBE: Schedule spark to fire in NEXT period
+      // Same timing calculation, just add one period to get to next period
+      delay_ticks += period;
     }
     
-    // HYBRID TIMING: If Timer1 would wrap, use software timing for same-lobe
-    if (timer1_would_wrap) {
-      // Timer1 cannot handle this delay - use software timing instead
-      TimerControl::cancel_scheduled_events();
-      
-      // Calculate software timing delays in microseconds
+    // Use the same scheduling mechanism for both modes
+    uint32_t spark_time_32 = sys.last_trigger_capture + delay_ticks;
+    uint32_t dwell_start_32 = spark_time_32 - dwell_ticks;
+    
+    // Use Timer1 hardware only if both times fit within 16-bit range WITHOUT wrapping
+    if (spark_time_32 <= 65535 && dwell_start_32 <= 65535) {
+      // Both times fit in 16-bit range - use hardware timing
+      OCR1B = (uint16_t)dwell_start_32;
+      OCR1A = (uint16_t)spark_time_32;
+      TIFR1 = _BV(OCF1A) | _BV(OCF1B);
+      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A) | _BV(OCIE1B);
+      sys.scheduled_dwell_ticks = dwell_ticks;
+      sys.last_used_previous_lobe = !use_same_lobe;
+    } else {
+      // Any wraparound - use software timing for accuracy
       uint32_t delay_us = Utils::ticks_to_us(delay_ticks);
       uint32_t dwell_us = Utils::ticks_to_us(dwell_ticks);
       uint32_t dwell_delay_us = (delay_us > dwell_us) ? (delay_us - dwell_us) : 0;
-      
-      // Use software timing for same-lobe scheduling
       SoftwareTiming::schedule_spark(dwell_delay_us, delay_us);
-      
-      // Track that we're using same-lobe via software for diagnostics  
-      sys.last_used_previous_lobe = false;
-      return;
+      sys.scheduled_dwell_ticks = dwell_ticks;
+      sys.last_used_previous_lobe = !use_same_lobe;
     }
-    
-    // Decide timing mode - use previous-lobe if same-lobe doesn't fit
-    bool use_previous_lobe = !same_lobe_fits;
-    
-    // Validate previous trigger if needed  
-    if (use_previous_lobe && sys.have_previous_trigger) {
-      // Compare against the stored 32-bit period instead of Timer1 captures
-      // Use the previous period for validation since that's what we're checking
-      uint32_t prev_period = sys.prev_period_ticks;
-      uint32_t current_period = sys.trigger_period_ticks;
-      
-      // Check if periods are reasonably similar (within 25%)
-      uint32_t min_period = (current_period * 3) / 4;
-      uint32_t max_period = (current_period * 5) / 4;
-      if (prev_period < min_period || prev_period > max_period) {
-        use_previous_lobe = false;
-      }
-    } else if (use_previous_lobe) {
-      use_previous_lobe = false;
-    }
-    
-    
-    // Calculate dwell start time based on mode - use 32-bit arithmetic
-    uint32_t dwell_start_32;
-    if (use_previous_lobe) {
-      // Previous-lobe mode: can start dwell as early as previous trigger
-      uint32_t earliest_dwell_start_prev_32 = (uint32_t)sys.prev_trigger_capture + SAFETY_MARGIN_TICKS;
-      
-      // In previous-lobe mode, we have more time available
-      // Start dwell as early as safely possible, or at ideal time if later
-      if (dwell_ticks <= delay_ticks) {
-        // Normal case - ideal dwell start time is achievable
-        dwell_start_32 = (required_dwell_start_32 > earliest_dwell_start_prev_32) ? 
-                        required_dwell_start_32 : earliest_dwell_start_prev_32;
-      } else {
-        // High RPM case - ideal dwell would start before spark_time
-        // Start as early as safely possible from previous trigger
-        dwell_start_32 = earliest_dwell_start_prev_32;
-      }
-    } else {
-      // Same-lobe mode: may need to trim dwell if it doesn't fit
-      if (same_lobe_fits) {
-        dwell_start_32 = required_dwell_start_32;
-      } else {
-        // Trim dwell to fit in available window
-        uint32_t available_ticks = spark_time_32 - earliest_dwell_start_same_32;
-        uint32_t min_dwell_ticks = Utils::ms_to_ticks(1); // Minimum 1ms dwell
-        if (available_ticks < min_dwell_ticks) available_ticks = min_dwell_ticks;
-        dwell_ticks = available_ticks;
-        dwell_start_32 = spark_time_32 - dwell_ticks;
-      }
-    }
-    
-    // Convert to 16-bit for Timer1 interface
-    uint16_t dwell_start = (uint16_t)dwell_start_32;
-
-    // Overflow protection - check for unreasonable values
-    if (delay_ticks > 100000UL || dwell_ticks > 20000UL) {
-      sys.overflow_protection_events++;
-      return; // Skip this spark event
-    }
-
-    // Cancel any pending software timing - we're using hardware Timer1
-    SoftwareTiming::cancel_pending_spark();
-    
-    sys.scheduled_dwell_ticks = dwell_ticks;
-    sys.last_used_previous_lobe = use_previous_lobe;  // Track mode for diagnostics
-    TimerControl::schedule_spark_event(dwell_start, spark_time);
   }
 }
 
@@ -807,12 +644,7 @@ namespace SerialInterface {
     Serial.print(F("us, Engine: ")); Serial.print(sys.engine_running ? F("RUN") : F("STOP"));
     Serial.print(F(", RevLim: ")); Serial.print(sys.rev_limit_active ? F("ON") : F("OFF"));
     Serial.print(F(", Mode: ")); 
-    if (sys.prev_lobe_dwell_active) {
-      Serial.print(F("PREV"));
-    } else {
-      Serial.print(prev_mode ? F("PREV") : F("SAME"));
-    }
-    if (sys.using_software_timing) Serial.print(F("-SW"));
+    Serial.print(sys.last_used_previous_lobe ? F("PREV") : F("SAME"));
     Serial.print(F(", OvfProt: ")); Serial.print(sys.overflow_protection_events);
     Serial.print(F(", Errors: 0x")); Serial.println(sys.error_flags, HEX);
   }
@@ -827,95 +659,12 @@ namespace SerialInterface {
     Serial.print(F("Overflow Events: ")); Serial.println(sys.overflow_protection_events);
     Serial.print(F("Uptime: ")); Serial.print(millis() / 1000); Serial.println(F("s"));
     Serial.print(F("Curve: ")); Serial.println(sys.use_safe_curve ? F("SAFE") : F("PERF"));
-    Serial.print(F("Last Mode: ")); 
-    Serial.println(sys.last_used_previous_lobe ? F("PREV-LOBE") : F("SAME-LOBE"));
+    Serial.print(F("Timing Mode: ")); 
+    Serial.println(sys.last_used_previous_lobe ? F("PREVIOUS-LOBE") : F("SAME-LOBE"));
   }
   
-  void process_command(char* cmd) {
-    // Convert to uppercase
-    for (char* p = cmd; *p; ++p) {
-      if (*p >= 'a' && *p <= 'z') *p = *p - 'a' + 'A';
-    }
-    
-    if (strcmp(cmd, "STATUS") == 0) {
-      print_status();
-    } else if (strcmp(cmd, "DIAG") == 0) {
-      print_diagnostics();
-    } else if (strcmp(cmd, "RESET") == 0) {
-      sys.glitch_count = 0;
-      sys.rev_limit_events = 0;
-      sys.error_flags = 0;
-      Serial.println(F("Counters reset"));
-    } else if (strcmp(cmd, "SAFE") == 0) {
-      sys.use_safe_curve = true;
-      Serial.println(F("Using SAFE curve"));
-    } else if (strcmp(cmd, "PERF") == 0) {
-      sys.use_safe_curve = false;
-      Serial.println(F("Using PERF curve"));
-    } else {
-      Serial.print(F("Unknown: ")); Serial.println(cmd);
-    }
-  }
-  
-  void handle_commands() {
-    static char buffer[48];
-    static uint8_t index = 0;
-    
-    while (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\r') continue;
-      
-      if (c == '\n') {
-        buffer[index] = '\0';
-        if (index > 0) process_command(buffer);
-        index = 0;
-      } else if (index < sizeof(buffer) - 1) {
-        buffer[index++] = c;
-      } else {
-        index = 0;  // Buffer overflow
-      }
-    }
-  }
 }
 
-// ============================================================================
-// STATUS LED
-// ============================================================================
-namespace StatusLED {
-  enum Mode { OFF, SLOW_BLINK, FAST_BLINK, SOLID };
-  
-  void update() {
-    static uint32_t last_toggle = 0;
-    static bool led_state = false;
-    uint32_t now = millis();
-    
-    Mode mode;
-    if (sys.error_flags != 0) {
-      mode = FAST_BLINK;
-    } else if (sys.engine_running) {
-      mode = SOLID;
-    } else {
-      mode = SLOW_BLINK;
-    }
-    
-    uint16_t blink_period = (mode == FAST_BLINK) ? 100 : 500;
-    
-    switch (mode) {
-      case SOLID:
-        digitalWrite(Pins::STATUS_LED, HIGH);
-        break;
-      case OFF:
-        digitalWrite(Pins::STATUS_LED, LOW);
-        break;
-      default:
-        if (now - last_toggle > blink_period) {
-          led_state = !led_state;
-          digitalWrite(Pins::STATUS_LED, led_state);
-          last_toggle = now;
-        }
-    }
-  }
-}
 
 // ============================================================================
 // MAIN SETUP
@@ -928,13 +677,11 @@ void setup() {
   
   // Configure pins
   pinMode(Pins::TRIGGER_INPUT, INPUT_PULLUP);
-  pinMode(Pins::STATUS_LED, OUTPUT);
   pinMode(Pins::SPARK_OUTPUT, OUTPUT);
   pinMode(Pins::OPTO_SHORT_RELAY, OUTPUT);
   
   // Safe initial state
   CoilControl::safe_idle();
-  digitalWrite(Pins::STATUS_LED, LOW);
   
   // Initialize protection relay - KEEP PROTECTION ACTIVE AT STARTUP
   digitalWrite(Pins::OPTO_SHORT_RELAY, LOW);  // D4 LOW = Keep opto shorted (disabled)
@@ -947,15 +694,6 @@ void setup() {
   
   // Startup message
   Serial.println(F("Rotax 787 Ignition Controller"));
-  Serial.println(F("Commands: STATUS, DIAG, RESET, SAFE, PERF"));
-  
-  // LED startup sequence
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(Pins::STATUS_LED, HIGH);
-    delay(100);
-    digitalWrite(Pins::STATUS_LED, LOW);
-    delay(100);
-  }
 }
 
 // ============================================================================
@@ -969,26 +707,15 @@ void loop() {
     // We have stable triggers - safe to release protection
     digitalWrite(Pins::OPTO_SHORT_RELAY, HIGH); // D4 HIGH = Remove opto short (enable opto)
     sys.relays_initialized = true;
-    Serial.println(F("Protection relay released - system armed"));
   }
   
   // Check for engine timeout
   EngineManager::check_timeout();
   
-  // Safety: Check for previous-lobe dwell timeout
-  if (sys.prev_lobe_dwell_active && 
-      (millis() - sys.prev_lobe_start_ms) > Coil::MAX_DWELL_MS) {
-    // Previous-lobe dwell has been active too long - abort
-    CoilControl::safe_idle();
-    sys.prev_lobe_dwell_active = false;
-    sys.overflow_protection_events++;
-  }
+  // No complex state management needed with simplified approach
   
   // Process software timing events (for low RPM hybrid timing)
   SoftwareTiming::process_pending_events();
-  
-  // Handle serial commands
-  SerialInterface::handle_commands();
   
   // Periodic status output
   if (millis() - sys.last_diagnostic_millis > 5000) {
@@ -997,9 +724,6 @@ void loop() {
     }
     sys.last_diagnostic_millis = millis();
   }
-  
-  // Update status LED
-  StatusLED::update();
   
   // Process new trigger events
   if (sys.new_trigger_available) {
