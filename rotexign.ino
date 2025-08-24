@@ -311,12 +311,8 @@ namespace TimerControl {
       // Previous-lobe mode: dwell start time has passed, start immediately
       CoilControl::start_dwell();
       
-      // Calculate adjusted spark time to maintain full dwell duration
-      uint32_t target_dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
-      uint16_t adjusted_spark_time = current_time + (uint16_t)target_dwell_ticks;
-      
-      // Use adjusted spark time to maintain proper dwell duration
-      OCR1A = adjusted_spark_time;
+      // Only schedule spark event with Compare A
+      OCR1A = spark_time;
       TIFR1 = _BV(OCF1A);  // Clear pending compare A flag
       TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);  // Enable only Compare A
     } else {
