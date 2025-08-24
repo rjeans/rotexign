@@ -449,32 +449,6 @@ def create_waveforms_plot(timing_events):
     
     print("Generated timing_waveforms.png")
 
-def create_missing_sparks_plot(missing_spark_events):
-    """Create missing sparks by RPM plot."""
-    if not missing_spark_events:
-        print("No missing spark events to plot")
-        return
-    
-    rpms = [event['rpm'] for event in missing_spark_events]
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Create histogram of missing sparks by RPM
-    rpm_bins = np.arange(0, 8000, 200)
-    counts, bins, patches = ax.hist(rpms, bins=rpm_bins, alpha=0.7, color='red', 
-                                   edgecolor='black', linewidth=0.5)
-    
-    ax.set_xlabel('RPM')
-    ax.set_ylabel('Missing Spark Events')
-    ax.set_title('Missing Sparks by RPM')
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(0, 8000)
-    
-    plt.tight_layout()
-    plt.savefig('missing_sparks_by_rpm.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print("Generated missing_sparks_by_rpm.png")
 
 if __name__ == "__main__":
     vcd_file = sys.argv[1] if len(sys.argv) > 1 else "wokwi-logic.vcd"
@@ -487,13 +461,11 @@ if __name__ == "__main__":
     # Generate plots
     create_timing_vs_rpm_plot(timing_events)
     create_waveforms_plot(timing_events)
-    create_missing_sparks_plot(missing_spark_events)
     
     print("\nAnalysis complete! Generated:")
     print("- CSV files with timing data")
     print("- timing_vs_rpm.png (with scatter points)")
     print("- timing_waveforms.png")
-    print("- missing_sparks_by_rpm.png")
     
     # Summary statistics
     if timing_events:
