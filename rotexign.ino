@@ -278,7 +278,7 @@ namespace TimerControl {
     noInterrupts();
     
     // Check if we have pending spark event that hasn't fired yet
-    if (TIMSK1 & _BV(OCIE1A)) {
+    if (TIMSK1 & (_BV(OCIE1A) | _BV(OCIE1B))) {
       // Previous spark event still pending - skip this one to avoid corruption
       interrupts();
       return;
@@ -286,7 +286,6 @@ namespace TimerControl {
     
     uint16_t current_time = TCNT1;
     const uint16_t MIN_MARGIN = 32;  // 16µs minimum scheduling margin
-    const uint16_t MAX_DWELL_TICKS = 8000;  // 4ms absolute maximum dwell for safety
     
     // Calculate time until spark (handles wraparound correctly)
     uint16_t spark_delta = spark_time - current_time;
@@ -304,43 +303,29 @@ namespace TimerControl {
       return;
     }
     
-    // Calculate when dwell should start relative to now
+    // Check if dwell start time has already passed
     uint16_t dwell_delta = dwell_start - current_time;
-    bool start_dwell_now = false;
+    bool dwell_in_past = (dwell_delta > 32768) || (dwell_delta < MIN_MARGIN);
     
-    // Determine if we should start dwell immediately
-    if (dwell_delta > 32768 || dwell_delta < MIN_MARGIN) {
-      // Dwell start time is in past or imminent - must start now
-      start_dwell_now = true;
-    }
-    
-    // CRITICAL SAFETY CHECK: If starting dwell now, verify duration is safe
-    if (start_dwell_now) {
-      // Check actual dwell duration (from now until spark)
-      if (spark_delta > MAX_DWELL_TICKS) {
-        // Actual dwell would exceed maximum safe duration
-        interrupts();
-        return;
-      }
-      
-      // Additional safety: verify dwell isn't more than 2x nominal
-      if (spark_delta > Utils::ms_to_ticks(Coil::DWELL_MS * 2)) {
-        // Actual dwell would be more than 2x nominal - too dangerous
-        interrupts();
-        return;
-      }
-    }
-    
-    // All checks passed - safe to proceed
-    
-    // Schedule the spark interrupt
-    OCR1A = spark_time;
-    TIFR1 = _BV(OCF1A);  // Clear any pending interrupt
-    TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);  // Enable compare + keep overflow
-    
-    // Start dwell if appropriate
-    if (start_dwell_now) {
+    if (dwell_in_past) {
+      // Previous-lobe mode: dwell start time has passed, start immediately
       CoilControl::start_dwell();
+      
+      // Only schedule spark event with Compare A
+      OCR1A = spark_time;
+      TIFR1 = _BV(OCF1A);  // Clear pending compare A flag
+      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);  // Enable only Compare A
+    } else {
+      // Same-lobe mode: both dwell and spark are in future
+      // Schedule both events with dual compare matches
+      OCR1B = dwell_start;  // Compare B for dwell start
+      OCR1A = spark_time;   // Compare A for spark
+      
+      // Clear any pending compare interrupt flags
+      TIFR1 = _BV(OCF1A) | _BV(OCF1B);
+      
+      // Enable both compare interrupts
+      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A) | _BV(OCIE1B);
     }
     
     interrupts();
@@ -472,11 +457,18 @@ ISR(INT0_vect) {
 ISR(TIMER1_COMPA_vect) {
   // Spark event: end dwell
   CoilControl::fire_spark();
-  TIMSK1 = _BV(TOIE1);  // Disable compare, keep overflow interrupt
+  // Disable both compare interrupts, keep overflow interrupt
+  TIMSK1 = _BV(TOIE1);
   sys.spark_count++;
 }
 
-// Dwell start interrupt removed - not required since no dwell marker
+ISR(TIMER1_COMPB_vect) {
+  // Dwell start event: begin charging coil
+  CoilControl::start_dwell();
+  // Disable Compare B interrupt after use to prevent retriggering
+  // Keep Compare A enabled for the spark event
+  TIMSK1 &= ~_BV(OCIE1B);
+}
 
 // ============================================================================
 // ENGINE MANAGEMENT
