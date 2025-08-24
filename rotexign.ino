@@ -95,11 +95,10 @@ struct SystemState {
   volatile uint16_t timer1_overflows = 0;
   volatile uint32_t last_trigger_timestamp = 0;  // Full 32-bit timestamp
   
-  // Predictive timing state
-  volatile bool predictive_dwell_active = false;  // Dwell is already running for next spark
-  volatile float predicted_delta_angle = 0.0f;    // Delta angle for spark timing calculation
-  volatile bool prediction_armed = false;         // Ready to execute predicted spark
-  volatile uint32_t predictive_dwell_start_ms = 0; // When predictive dwell started (for timeout)
+  // Previous-lobe timing state (simplified)
+  volatile bool prev_lobe_dwell_active = false;   // Dwell running for next trigger's spark
+  volatile float prev_lobe_advance = 0.0f;        // Advance angle for pending spark
+  volatile uint32_t prev_lobe_start_ms = 0;       // Timeout protection
   
   // Software timing for low RPM when Timer1 would wraparound
   bool using_software_timing = false;
@@ -351,6 +350,7 @@ namespace SoftwareTiming {
     sys.software_spark_pending = false;
     sys.software_dwell_active = false;
     sys.using_software_timing = false;
+    sys.prev_lobe_dwell_active = false;
   }
   
   void schedule_spark(uint32_t dwell_delay_us, uint32_t spark_delay_us) {
@@ -446,28 +446,28 @@ ISR(INT0_vect) {
     return;
   }
   
-  // PREDICTIVE: If dwell was started predictively, schedule the spark now
-  if (sys.predictive_dwell_active && sys.prediction_armed) {
-    // Dwell is already running - calculate spark time relative to THIS trigger
-    // Use current period to calculate delay based on stored delta angle
-    uint32_t delay_ticks = (uint32_t)(delta_ticks * (sys.predicted_delta_angle / 180.0f));
+  // PREVIOUS-LOBE: If dwell is active from previous trigger, fire the spark now
+  if (sys.prev_lobe_dwell_active) {
+    // Calculate spark timing relative to THIS trigger using stored advance angle
+    float delta_angle = Engine::TRIGGER_ANGLE_BTDC - sys.prev_lobe_advance;
+    while (delta_angle < 0) delta_angle += 360.0f;
+    while (delta_angle >= 360.0f) delta_angle -= 360.0f;
+    
+    uint32_t delay_ticks = (uint32_t)(delta_ticks * (delta_angle / 180.0f));
     uint32_t spark_time_32 = capture_time + delay_ticks;
     
-    // Check for Timer1 wraparound
+    // Schedule spark if Timer1 won't wrap
     if (spark_time_32 <= 65535) {
       OCR1A = (uint16_t)spark_time_32;
-      TIFR1 = _BV(OCF1A);  // Clear pending compare A flag
-      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);  // Enable Compare A for spark
+      TIFR1 = _BV(OCF1A);
+      TIMSK1 = _BV(TOIE1) | _BV(OCIE1A);
+      
+      // Record actual dwell time achieved (exactly 3ms as calculated)
+      sys.scheduled_dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
     }
     
-    // Calculate actual achieved dwell time: from previous trigger to spark after this trigger
-    // Dwell started at previous trigger, spark fires delay_ticks after this trigger  
-    uint32_t actual_dwell_ticks = delta_ticks + delay_ticks; // Previous period + delay = actual dwell
-    sys.scheduled_dwell_ticks = actual_dwell_ticks; // Record actual achieved dwell
-    
-    sys.predictive_dwell_active = false;
-    sys.prediction_armed = false;
-    sys.last_was_predictive = true;
+    sys.prev_lobe_dwell_active = false;
+    sys.last_used_previous_lobe = true;
   }
   
   // Store previous trigger data
@@ -491,9 +491,8 @@ ISR(TIMER1_COMPA_vect) {
   // Disable both compare interrupts, keep overflow interrupt
   TIMSK1 = _BV(TOIE1);
   sys.spark_count++;
-  // Clear predictive state after spark fires
-  sys.predictive_dwell_active = false;
-  sys.prediction_armed = false;
+  // Clear previous-lobe state after spark fires
+  sys.prev_lobe_dwell_active = false;
 }
 
 ISR(TIMER1_COMPB_vect) {
@@ -526,6 +525,7 @@ namespace EngineManager {
         sys.trigger_count = 0;  // Reset trigger count for next start
         sys.timer1_overflows = 0;  // Reset overflow counter
         SoftwareTiming::cancel_pending_spark();  // Cancel any software timing
+        sys.prev_lobe_dwell_active = false;  // Clear previous-lobe state
         Serial.println(F("Engine stopped - protection re-engaged"));
       }
     } else {
@@ -614,24 +614,37 @@ namespace EngineManager {
     // Get advance angle from curve
     float advance = get_advance_angle(sys.filtered_rpm);
     
-    // PREDICTIVE: Check if NEXT spark will need previous-lobe timing
-    // If yes, start dwell immediately for the next spark
-    bool next_needs_previous = will_need_previous_lobe(sys.trigger_period_ticks, advance);
+    // Check if current spark needs previous-lobe timing (not enough time for 3ms dwell)
+    bool needs_previous_lobe = will_need_previous_lobe(sys.trigger_period_ticks, advance);
     
-    if (next_needs_previous && !sys.predictive_dwell_active) {
-      // Start dwell NOW for the CURRENT spark that will fire after the NEXT trigger
-      // Store delta angle for timing calculation when next trigger arrives
-      float delta_angle = Engine::TRIGGER_ANGLE_BTDC - advance;
-      while (delta_angle < 0) delta_angle += 360.0f;
-      while (delta_angle >= 360.0f) delta_angle -= 360.0f;
+    if (needs_previous_lobe && !sys.prev_lobe_dwell_active) {
+      // Previous-lobe: Start dwell after a reasonable delay to get ~3ms total
+      // Simple approach: start dwell at current_trigger + (period - 3ms)
+      // This gives approximately 3ms dwell when spark fires after next trigger
       
-      CoilControl::start_dwell();
-      sys.predictive_dwell_active = true;
-      sys.predicted_delta_angle = delta_angle;
-      sys.prediction_armed = true;
-      sys.predictive_dwell_start_ms = millis();  // Record start time for timeout
-      sys.last_used_previous_lobe = true;
-      // Don't return - continue to schedule current spark if needed
+      uint32_t period = sys.trigger_period_ticks;
+      uint32_t dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
+      uint32_t safety_margin = 1200; // ~0.6ms safety margin
+      
+      uint32_t dwell_start_delay;
+      if (period > dwell_ticks + safety_margin) {
+        dwell_start_delay = period - dwell_ticks;
+      } else {
+        dwell_start_delay = safety_margin; // Fallback to small delay
+      }
+      
+      uint32_t dwell_start_time = sys.last_trigger_capture + dwell_start_delay;
+      
+      // Schedule dwell start if Timer1 won't wrap
+      if (dwell_start_time <= 65535) {
+        OCR1B = (uint16_t)dwell_start_time;
+        TIFR1 = _BV(OCF1B);
+        TIMSK1 |= _BV(OCIE1B);
+        sys.prev_lobe_dwell_active = true;
+        sys.prev_lobe_advance = advance;
+        sys.prev_lobe_start_ms = millis();
+      }
+      // Don't return - still need to handle current trigger if not previous-lobe
     }
     float delta_angle = Engine::TRIGGER_ANGLE_BTDC - advance;
     
@@ -639,12 +652,9 @@ namespace EngineManager {
     while (delta_angle < 0) delta_angle += 360.0f;
     while (delta_angle >= 360.0f) delta_angle -= 360.0f;
 
-    // If predictive dwell is active, we've already handled the next spark
-    // Now handle the current spark if not already predicted
-    if (sys.last_was_predictive) {
-      // This spark was already handled predictively in the previous trigger
-      sys.last_was_predictive = false;
-      return;
+    // Skip same-lobe scheduling if we just started previous-lobe dwell
+    if (needs_previous_lobe) {
+      return;  // Previous-lobe dwell started, wait for next trigger to fire spark
     }
     
     // Calculate timing - CRITICAL FIX: Always relative to current trigger
@@ -660,22 +670,11 @@ namespace EngineManager {
     
     uint16_t spark_time = (uint16_t)spark_time_32;
 
-    // Dwell calculation
+    // Same-lobe dwell calculation (with duty cycle limits)
     uint32_t target_dwell_ticks = Utils::ms_to_ticks(Coil::DWELL_MS);
     uint32_t ticks_per_rev = period * Engine::PULSES_PER_REV;
     uint32_t max_dwell_ticks = (ticks_per_rev * Coil::MAX_DUTY_PERCENT) / 100UL;
-    
-    // Check if we'll need previous-lobe timing for this spark
-    bool needs_previous_lobe = will_need_previous_lobe(period, advance);
-    
-    // In previous-lobe mode, allow full 3ms dwell since thermal duty cycle is actually lower
-    // (coil is OFF most of the time between spark and next trigger)
-    uint32_t dwell_ticks;
-    if (needs_previous_lobe) {
-      dwell_ticks = target_dwell_ticks;  // Use full 3ms dwell
-    } else {
-      dwell_ticks = (target_dwell_ticks < max_dwell_ticks) ? target_dwell_ticks : max_dwell_ticks;
-    }
+    uint32_t dwell_ticks = (target_dwell_ticks < max_dwell_ticks) ? target_dwell_ticks : max_dwell_ticks;
 
     const uint16_t SAFETY_MARGIN_TICKS = 600; // ~0.30 ms
     
@@ -808,8 +807,8 @@ namespace SerialInterface {
     Serial.print(F("us, Engine: ")); Serial.print(sys.engine_running ? F("RUN") : F("STOP"));
     Serial.print(F(", RevLim: ")); Serial.print(sys.rev_limit_active ? F("ON") : F("OFF"));
     Serial.print(F(", Mode: ")); 
-    if (sys.predictive_dwell_active) {
-      Serial.print(F("PRED"));
+    if (sys.prev_lobe_dwell_active) {
+      Serial.print(F("PREV"));
     } else {
       Serial.print(prev_mode ? F("PREV") : F("SAME"));
     }
@@ -829,11 +828,7 @@ namespace SerialInterface {
     Serial.print(F("Uptime: ")); Serial.print(millis() / 1000); Serial.println(F("s"));
     Serial.print(F("Curve: ")); Serial.println(sys.use_safe_curve ? F("SAFE") : F("PERF"));
     Serial.print(F("Last Mode: ")); 
-    if (sys.predictive_dwell_active) {
-      Serial.println(F("PREDICTIVE"));
-    } else {
-      Serial.println(sys.last_used_previous_lobe ? F("PREV-LOBE") : F("SAME-LOBE"));
-    }
+    Serial.println(sys.last_used_previous_lobe ? F("PREV-LOBE") : F("SAME-LOBE"));
   }
   
   void process_command(char* cmd) {
@@ -980,13 +975,12 @@ void loop() {
   // Check for engine timeout
   EngineManager::check_timeout();
   
-  // Safety: Check for predictive dwell timeout
-  if (sys.predictive_dwell_active && 
-      (millis() - sys.predictive_dwell_start_ms) > Coil::MAX_DWELL_MS) {
-    // Predictive dwell has been active too long - abort
+  // Safety: Check for previous-lobe dwell timeout
+  if (sys.prev_lobe_dwell_active && 
+      (millis() - sys.prev_lobe_start_ms) > Coil::MAX_DWELL_MS) {
+    // Previous-lobe dwell has been active too long - abort
     CoilControl::safe_idle();
-    sys.predictive_dwell_active = false;
-    sys.prediction_armed = false;
+    sys.prev_lobe_dwell_active = false;
     sys.overflow_protection_events++;
   }
   

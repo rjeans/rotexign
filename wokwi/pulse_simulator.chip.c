@@ -19,7 +19,7 @@ static bool last_ignition_pin = false;  // Previous ignition pin state for edge 
 // Auto-sweep mode variables
 static bool auto_sweep_active = false;  // Auto-sweep mode active
 static float auto_sweep_time = 0;       // Time at current RPM step
-static const float AUTO_SWEEP_DURATION = 10.0f;  // 5 seconds at each RPM
+static const float AUTO_SWEEP_DURATION = 2.0f;  // 5 seconds at each RPM
 static const float AUTO_SWEEP_STEP = 200.0f;    // 200 RPM increment
 
  // RPM range: idle (800 RPM) to max (8000 RPM)
