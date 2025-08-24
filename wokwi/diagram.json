@@ -75,7 +75,7 @@
       "id": "btn4",
       "top": -166.6,
       "left": -393.6,
-      "attrs": { "color": "green", "xray": "1" ,"label": "Auto Sweep"}
+      "attrs": { "color": "green", "xray": "1", "label": "Auto Sweep", "bounce": "0" }
     },
     { "type": "wokwi-vcc", "id": "vcc2", "top": -268.04, "left": -307.2, "attrs": {} },
     { "type": "wokwi-gnd", "id": "gnd3", "top": -19.2, "left": -307.8, "attrs": {} },
