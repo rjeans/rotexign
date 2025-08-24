@@ -193,11 +193,11 @@ void chip_timer_event(void *user_data) {
   // Ignition is ON - generate trigger pulses
   // Rotax 787: 2 pulses per revolution, so period = 30/RPM seconds per pulse
   float total_period = 30.0f / rpm;  // seconds per pulse (half revolution)
-  float pulse_width = 0.0004f;   // Fixed 0.4ms pulse width (realistic flywheel sensor)
+  float pulse_width = 0.001f;   // Fixed 1.0ms pulse width (measured from real system)
   
   time_running += (float)interval / 1000000.0f;
 
-  // State machine: trigger every total_period, fixed 0.4ms pulse width
+  // State machine: trigger every total_period, fixed 1.0ms pulse width
   if (time_running >= total_period && state == 1) {
     // Start of pulse: go to GND (LOW) - this is the trigger edge
     state = 0;
