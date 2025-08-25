@@ -1,22 +1,47 @@
-FQBN       ?= arduino:avr:uno
-PORT       ?=
-BUILD_DIR  ?= build
-SKETCH     ?= rotax_ignition_controller.ino
+# ===== Makefile: LLVM + wasi-libc (robust, direct wasm-ld linking) =====
 
-.PHONY: build upload clean help
+# --- Project layout ---
+SKETCH        := rotexign
+SKETCH_DIR    := firmware/$(SKETCH)
+BUILD_DIR     := build
 
-help:
-	@echo "Targets:"
-	@echo "  make build FQBN=arduino:avr:uno            # compile"
-	@echo "  make upload FQBN=arduino:avr:uno PORT=/dev/tty.usbserial-XXXX"
-	@echo "  make clean                                  # remove build artifacts"
+SRC_DIR       := src
+CHIP_NAME     := pulse-simulator.chip
+CHIP_SRC      := $(SRC_DIR)/$(CHIP_NAME).c
+CHIP_JSON_SRC := $(SRC_DIR)/$(CHIP_NAME).json
 
-build:
-	arduino-cli compile --fqbn "$(FQBN)" --build-path "$(BUILD_DIR)" .
 
-upload: build
-	@if [ -z "$(PORT)" ]; then echo "PORT not set. Example: PORT=/dev/tty.usbserial-XXXX"; exit 2; fi
-	arduino-cli upload -p "$(PORT)" --fqbn "$(FQBN)" .
+TARGET_WASM   := $(BUILD_DIR)/$(CHIP_NAME).wasm
+TARGET_JSON   := $(BUILD_DIR)/$(CHIP_NAME).json
+TARGET_HEX    := $(BUILD_DIR)/$(SKETCH).ino.hex
+TARGET_ELF    := $(BUILD_DIR)/$(SKETCH).ino.elf
+
+# --- Arduino ---
+FQBN          := arduino:avr:uno
+
+
+
+# --- Phonies ---
+.PHONY: all clean env check
+
+all:  $(TARGET_JSON) $(TARGET_HEX) #$(TARGET_WASM)
+
+# -------- Firmware (Arduino CLI) --------
+$(TARGET_HEX): | $(BUILD_DIR)
+	arduino-cli compile --fqbn "$(FQBN)" --output-dir "$(BUILD_DIR)" --warnings default "$(SKETCH_DIR)"
+	@test -f "$(TARGET_ELF)" || true
+
+
+
+# Copy chip descriptor JSON
+$(TARGET_JSON): $(CHIP_JSON_SRC) | $(BUILD_DIR)
+	cp "$<" "$@"
+
+# Ensure build dir exists
+$(BUILD_DIR):
+	mkdir -p "$@"
+
+
 
 clean:
 	rm -rf "$(BUILD_DIR)"
