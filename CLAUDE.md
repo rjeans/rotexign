@@ -54,8 +54,11 @@ calculate_and_schedule_spark() {
 # Compile
 arduino-cli compile --fqbn arduino:avr:uno rotexign.ino
 
-# Analyze timing (in wokwi directory)
-source venv/bin/activate && python3 timing_analyzer.py
+# Analyze timing (in analysis directory - ALWAYS use venv)
+cd analysis && source venv/bin/activate && python3 timing_analyzer.py wokwi-logic.vcd
+
+# Generate timing calculations
+cd analysis && source venv/bin/activate && python3 calculate_timing_values.py
 
 # Check previous-lobe data
 grep "True" wokwi-logic-analysis.csv | head -20
