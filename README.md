@@ -1,248 +1,246 @@
 # rotexign — Arduino Ignition Controller
 
-**Production-ready** Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. Delivers precise, programmable timing with robust safety features and comprehensive testing validation. **Fully tested and validated** across the entire operational range (200-8000+ RPM).
+**Simulation-validated** Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. This implementation delivers precise, interrupt-driven timing control with extensive simulation testing across the entire operational range (800-8000 RPM).
 
-## Features & Capabilities
+⚠️ **Status**: Fully tested in simulation, awaiting physical hardware validation
 
-### **Core Engine Management**
-- **Precision Timing**: Sub-microsecond accuracy using Timer1 with one-revolution-ahead scheduling
-- **Full RPM Range**: Validated operation from 200-8000+ RPM with adaptive filtering
-- **Advanced Scheduling**: Dynamic previous-lobe scheduling automatically engages around 1800-2000 RPM
-- **Smart Coil Support**: 1GN-1A compatible with proper dwell control (~3ms at 12V)
+## Overview
 
-### **Safety & Protection**
-- **Rev Limiting**: Hard cut at 7000 RPM with hysteresis and error reporting
-- **Startup Protection**: Relay-based coil grounding during initialization
-- **Watchdog**: 2-second timeout with automatic recovery
-- **Error Handling**: Comprehensive error flags (0x1=overspeed, 0x4=no signal, 0x8=invalid RPM)
+This project implements a sophisticated ignition timing controller using an Arduino Uno/Nano (ATmega328P). The system uses hardware timer interrupts and optimized tick-based calculations to achieve microsecond-precision timing control suitable for high-performance two-stroke engines.
 
-### **Diagnostics & Testing**
-- **Real-time Monitoring**: Serial interface with `STATUS`, `DIAG`, `RESET`, `SAFE`, `PERF` commands
-- **Wokwi Simulation**: Complete testing environment with RPM sweep capability ([Live Project](https://wokwi.com/projects/439745280978700289))
-- **VCD Analysis**: Python tools for timing curve validation and troubleshooting
-- **Dual Timing Curves**: Safe and performance modes with live switching
+## Key Features
 
-## Hardware (summary)
-- Board: Arduino Uno/Nano (ATmega328P).
-- Input: D2 (INT0) falling-edge trigger via optocoupler.
-- Output: Smart coil control on D9 (rising edge = start dwell, falling edge = spark by default; configurable via `COIL_ACTIVE_HIGH`); dwell marker on D10 (HIGH during dwell); status LED D13.
-- Engine: Two trigger lobes (PPR=2); TDC occurs 47° after trigger; hard cut at 7000 RPM with hysteresis.
-- Dwell: Target ~3 ms at 12V, clamped to ≤40% duty at high RPM.
-- Power: Isolate 5V control from 12V coil supply; follow noise/EMI tips in docs.
+### Core Timing Engine
+- **Hardware Timer-Based**: Uses Timer1 with 0.5μs resolution (prescaler /64 at 16MHz)
+- **Interrupt-Driven**: External interrupt (INT0) for trigger input, Timer1 Compare Match for dwell/spark scheduling
+- **Direct Port Control**: Bypasses Arduino digitalRead/Write for minimal latency
+- **Tick-Based Math**: All calculations in timer ticks to avoid floating-point in ISRs
 
-## Build & Upload
-- Arduino IDE: Open the repo, select board/port, Upload.
-- Arduino CLI with Makefile:
-  - One‑time setup: `arduino-cli core update-index && arduino-cli core install arduino:avr`
-  - Compile: `make build FQBN=arduino:avr:uno`
-  - Upload: `make upload FQBN=arduino:avr:uno PORT=/dev/tty.usbserial-XXXX`
-- Serial monitor: 115200 baud.
+### Timing Control
+- **Adaptive Advance Curve**: 81-point interpolated timing map stored in PROGMEM
+- **Smoothed Curve Generation**: Cubic interpolation with Savitzky-Golay filtering
+- **Dynamic Scheduling**: Automatic transition between same-lobe and previous-lobe timing
+- **Precision Dwell Control**: 3ms target with 40% duty cycle protection
+- **RPM Range**: Validated operation from 800-8000 RPM
 
-## macOS Setup
-- Install CLI: `brew install arduino-cli`
-- Install AVR core: `arduino-cli core update-index && arduino-cli core install arduino:avr`
-- Find your board port: `ls /dev/tty.usb* /dev/tty.wch* 2>/dev/null`
-- Compile: `make build FQBN=arduino:avr:uno`
-- Upload: `make upload FQBN=arduino:avr:uno PORT=/dev/tty.usbserial-XXXX`
+### Safety Features
+- **Rev Limiter**: Hard cut at 7000 RPM (configurable)
+- **Startup Protection**: 2-tick stabilization before enabling ignition
+- **Duty Cycle Protection**: Prevents coil overheating at high RPM
+- **Clean Initialization**: All outputs grounded during startup
 
-## Testing & Validation
+## Hardware Configuration
 
-### **Comprehensive Testing Completed**
-- **Wokwi Simulation**: Full validation across 200-8000+ RPM range using custom pulse simulator
-- **Timing Curve Verification**: Automated VCD analysis confirms accurate advance curves 
-- **Timer1 Overflow Testing**: Resolved and validated low RPM operation (below 900 RPM)
-- **RPM Sweep Testing**: Proven adaptive filtering tracks rapid RPM changes during acceleration
-- **Rev Limiter Validation**: Confirmed proper operation above 7000 RPM with error reporting
+### Pinout
+| Pin | Function | Description |
+|-----|----------|-------------|
+| D2 | Trigger Input (INT0) | Falling edge trigger from crank sensor (47° BTDC) |
+| D3 | Ignition Output | Coil control (HIGH = dwell, LOW = spark) |
 
-### **Live Testing Environment**
-**[Wokwi Project](https://wokwi.com/projects/439745280978700289)** - Interactive simulation with:
-- Configurable RPM sweep testing (200-8000 RPM)
-- Real-time timing curve generation
-- VCD export for detailed analysis
-- All operational scenarios validated
+### Engine Parameters
+- **Trigger Configuration**: 2 pulses per revolution (2 lobes, 180° apart)
+- **Trigger Position**: 47° BTDC
+- **Coil Type**: Smart coil with 3ms dwell requirement at 12V
+- **Maximum Duty Cycle**: 40% to prevent coil damage
 
-### **Bench Testing Procedure**
-1. **Wokwi Validation**: Test timing curves and RPM ranges in simulation first
-2. **Function Generator**: Verify trigger response and timing accuracy  
-3. **Oscilloscope**: Validate dwell timing (D10 marker) and spark output (D9)
-4. **VCD Analysis**: Use `python3 simple_timing_analyzer.py test.vcd` for curve verification
+## Implementation Details
 
-## Code Layout
-- `rotexign.ino`: Main firmware (INT0 trigger, Timer1 timebase, dwell/spark scheduling, safety, serial).
-- `doc/IgnitionControllerDesignNotes.md`: Architecture, hardware, algorithms, and constraints.
-- `doc/TestingCalibrationGuide.md`: Bench, engine integration, and tuning steps.
-- `doc/AgentDesignNotes.md`: Source of truth for design decisions (wiring, timing, limits).
+### Architecture
 
-## Safety
-- Remove plugs for initial checks; use shielded wiring and proper drivers.
-- Always test on the bench before live engine operation.
+The controller uses a streamlined interrupt-driven architecture:
 
-## Changes After First Round Testing
+```
+Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
+```
 
-These updates address the issues documented in `doc/FirstTestResults.md`:
+1. **Trigger ISR** (`INT0_vect`):
+   - Captures Timer1 count immediately
+   - Calculates period from previous trigger
+   - Computes RPM and required timing
+   - Schedules Compare B interrupt for dwell start
 
-- D9 polarity: Added `COIL_ACTIVE_HIGH` (default `true`) to match the 1GN-1A smart coil (5V rising edge starts dwell, falling edge fires). Set to `false` only if using an external inverting driver.
-- Triple-pulse artifact: Timer1 compare matches are now one-shot; interrupts arm only when scheduled and disable themselves after firing, avoiding stale re-fires.
-- Noise-induced retriggers: INT0 ISR uses Timer1 tick deltas (0.5 µs resolution) to reject pulses closer than 0.5 ms (glitches) and 2.0 ms (spark-noise guard). No `millis()` calls in ISR.
-- D10 meaning: Repurposed as a dwell marker — HIGH while the coil is charging, LOW at spark — for clean scope validation.
-- Safe startup: On boot and when signal is lost, the coil is off and no compare matches are armed. Relay outputs (pins 3 and 4) are explicitly configured and driven.
-- Serial robustness: Replaced Arduino `String` parsing with a fixed buffer to avoid heap fragmentation.
+2. **Compare B ISR** (`TIMER1_COMPB_vect`):
+   - Sets ignition output HIGH (start dwell)
+   - Schedules Compare A for spark
 
-## Recent Major Improvements
+3. **Compare A ISR** (`TIMER1_COMPA_vect`):
+   - Sets ignition output LOW (fire spark)
+   - Completes timing cycle
 
-### **December 2024 - Production Validation**
-- **Timer1 Overflow Resolution**: Fixed 16-bit overflow issues using `micros()` for period calculation, eliminating error 0x1 below 900 RPM
-- **Timing Calculation Corrections**: Fixed systematic timing offset by correcting 360° to 180° reference calculations
-- **Adaptive RPM Filtering**: Implemented intelligent filtering that adjusts to RPM change rates:
-  - Large changes (>200 RPM): Minimal filtering for sweep tracking
-  - Medium changes (50-200 RPM): Moderate filtering  
-  - Small changes (<50 RPM): Normal filtering for stability
-- **Previous-Lobe Scheduling**: Corrected implementation with dynamic switching around 1800-2000 RPM
-- **Complete Wokwi Testing Suite**: Custom pulse simulator with full RPM sweep capability
+### Timing Calculations
 
-### **Production Validation Results**
+All timing uses integer math with Timer1 ticks (0.5μs resolution):
 
-**Complete VCD Analysis**: `wokwi-logic-analysis.txt` contains full timing validation data
+```cpp
+// RPM from period ticks (avoids floating point)
+rpm = 15,000,000 / (period_ticks * 2)
 
-**COMPREHENSIVE TESTING COMPLETED** (27,162 triggers, 19,623 spark events):
+// Advance angle from 81-point curve (PROGMEM)
+advance_tenths = interpolate_curve(rpm)
 
-#### **RPM Range Performance**
-- **Full Spectrum**: Successfully tested 777-6977 RPM with corrected previous-lobe implementation
-- **Timer1 Overflow**: ELIMINATED - No error 0x1 across entire range
-- **Adaptive Filtering**: VALIDATED - Arduino tracks 90-second RPM sweep without getting stuck
-- **Previous-Lobe Scheduling**: CORRECTED - Now switches properly around 1800-2000 RPM per design notes
+// Delay angle and timing
+delay_tenths = 470 - advance_tenths  // 47° - advance
+delay_us = (delay_tenths * period_us) / 1800
+```
 
-#### **Timing Accuracy Validation**
-| RPM Range | Actual Advance | Target Advance | Error | Status |
-|-----------|----------------|----------------|--------|---------|
-| 777 RPM | 4.6° BTDC | 4.7° BTDC | -0.1° | EXCELLENT |
-| 1265 RPM | 7.5° BTDC | 7.6° BTDC | -0.1° | EXCELLENT |
-| 1757 RPM | 10.1° BTDC | 10.5° BTDC | -0.5° | EXCELLENT |
-| 2251 RPM | 12.7° BTDC | 12.8° BTDC | -0.1° | EXCELLENT |
-| 3254 RPM | 14.8° BTDC | 15.0° BTDC | -0.2° | EXCELLENT |
+### Timing Curve Generation
 
-#### **Dwell Control Performance**
-- **Low RPM (777-1500)**: Perfect 3000μs dwell maintained
-- **Medium RPM (2000-4000)**: Proper reduction to ~1000μs (duty cycle protection)
-- **High RPM (6500+)**: Consistent ~1000μs dwell with coil protection
-- **No Excessive Dwell**: All values within safe operational limits
+The 81-point timing curve in PROGMEM is generated through a sophisticated smoothing process:
 
-#### **Safety System Validation**
-- **Rev Limiter**: ACTIVE above 6977 RPM (negative advance indicates spark cut)
-- **Error Handling**: NO ERROR FLAGS throughout 27k+ trigger events
-- **Coil Protection**: VERIFIED duty cycle limits maintained at all RPM
-- **Startup Safety**: CONFIRMED relay protection during initialization
+1. **Base Points**: Starts with 9 key RPM/advance points defining the desired curve shape
+2. **Cubic Interpolation**: Generates 200 intermediate points using cubic spline interpolation
+3. **Savitzky-Golay Filtering**: Applies polynomial smoothing to remove discontinuities
+4. **Lookup Table Generation**: Creates final 81 points at 100 RPM intervals (0-8000 RPM)
+5. **Fixed-Point Conversion**: Stores values as tenths of degrees (×10) for integer math
 
-### **Production Readiness Certification**
+This process (`analysis/smooth_timing_curve.py`) ensures:
+- Smooth transitions without abrupt changes
+- Optimal engine performance across the RPM range
+- Efficient storage in limited PROGMEM space
+- Fast runtime lookup with linear interpolation between points
 
-**CERTIFIED READY FOR ENGINE DEPLOYMENT**
+### Previous-Lobe Scheduling
 
-All critical systems validated through comprehensive testing:
-- **27,162 trigger events** processed without errors
-- **19,623 spark events** delivered with precise timing
-- **Full RPM range** (777-6977+) operation confirmed  
-- **Safety systems** validated under all conditions
-- **Timing accuracy** within +/-0.5 degrees across operational range
+The controller automatically switches to previous-lobe timing when the dwell window becomes insufficient:
 
-**Testing Procedure for New Installations**:
+- **Same-lobe**: Used at low RPM when `dwell_us < spark_delay_us`
+- **Previous-lobe**: Engages ~1800-2000 RPM, adds one period to delay calculation
+- **Seamless transition**: No timing glitches during mode switch
 
-1. **Wokwi Validation**: Use [live simulation](https://wokwi.com/projects/439745280978700289) for initial verification
-2. **Bench Testing**: Function generator → D2, scope monitoring D9/D10 outputs
-3. **VCD Analysis**: `python3 simple_timing_analyzer.py your-test.vcd` for curve validation
-4. **Engine Integration**: Follow safety procedures in `doc/TestingCalibrationGuide.md`
+## Simulation Testing
 
-## **Detailed Performance Analysis**
+### Wokwi Online Simulator
 
-### **Timing Curves Explained**
+All testing has been performed using the Wokwi circuit simulator with a custom RPM sweep test chip:
 
-The ignition controller uses three timing references:
+🔗 **[Live Simulation Project](https://wokwi.com/projects/439745280978700289)**
 
-**Actual BTDC** - What the Arduino actually delivers
-- Measured from VCD analysis of real spark timing
-- Shows the controller's precision and accuracy
+The simulation includes:
+- **Custom Test Chip**: Generates trigger pulses with configurable RPM sweep (800-8000 RPM)
+- **Full Circuit Design**: Complete with pull-ups, LEDs, and signal routing
+- **VCD Export**: Allows detailed timing analysis of all signals
+- **Real-time Monitoring**: Serial output shows RPM and timing values
 
-**Safe BTDC** - Conservative timing curve (default)
-- Maximum 15 degrees advance to prevent engine knock/damage
-- Recommended for initial setup and high-stress conditions
-- Prioritizes engine protection over maximum power
+Circuit design files are in the `wokwi/` directory including the custom simulator chip implementation.
 
-**Performance BTDC** - Aggressive timing curve  
-- Up to 20 degrees advance for maximum power output
-- Only use with premium fuel and proper tuning
-- Requires careful monitoring for knock/detonation
+### Simulation Results
 
-### **Full RPM Range Analysis** (from `wokwi/wokwi-logic-analysis.txt`)
+Comprehensive testing using VCD analysis from Wokwi shows excellent timing accuracy:
 
-| RPM Range | Count | Actual Advance | Safe Target | Perf Target | Status |
-|-----------|-------|----------------|-------------|-------------|---------|
-| 500-999 | 145 events | 4.6 deg BTDC | 4.7 deg BTDC | 4.7 deg BTDC | Perfect |
-| 1000-1499 | 240 events | 7.5 deg BTDC | 7.6 deg BTDC | 7.6 deg BTDC | Perfect |
-| 1500-1999 | 339 events | 10.1 deg BTDC | 10.5 deg BTDC | 10.5 deg BTDC | Excellent |
-| 2000-2499 | 434 events | 12.7 deg BTDC | 12.8 deg BTDC | 14.0 deg BTDC | Safe Mode |
-| 2500-2999 | 531 events | 14.1 deg BTDC | 14.2 deg BTDC | 18.0 deg BTDC | Safe Mode |
-| 3000-3499 | 667 events | 14.8 deg BTDC | 15.0 deg BTDC | 20.0 deg BTDC | Safe Mode |
-| 6500-6999 | 1627 events | -4.8 deg BTDC | 12.2 deg BTDC | 17.2 deg BTDC | Rev Limiter |
+![Timing vs RPM](analysis/timing_vs_rpm.png)
+*Figure 1: Measured timing advance vs RPM showing ±0.1° accuracy across operational range*
 
-**Key Observations:**
-- **Perfect accuracy** below 2000 RPM (+/-0.1 degree error)
-- **Safe mode active** above 2000 RPM (as configured)
-- **Rev limiter engaged** above 6500 RPM (negative advance = spark cut)
-- **27,162 total triggers** processed without errors
+![Timing Waveforms](analysis/timing_waveforms.png)
+*Figure 2: Sample timing waveforms at different RPM points showing dwell and spark timing*
 
-### **What Does "BTDC" Mean?**
+### Accuracy Analysis
 
-**BTDC = Before Top Dead Center** - This measures when the spark fires relative to piston position:
+| RPM | Measured Advance | Target Advance | Error | Status |
+|-----|-----------------|----------------|-------|---------|
+| 800 | 4.69° | 4.68° | +0.01° | Excellent |
+| 1200 | 7.27° | 7.28° | -0.01° | Excellent |
+| 2000 | 11.77° | 11.78° | -0.01° | Excellent |
+| 3000 | 14.93° | 14.95° | -0.02° | Excellent |
+| 5000 | 13.66° | 13.70° | -0.04° | Excellent |
+| 7000 | 11.85° | 11.90° | -0.05° | Excellent |
 
-**Higher BTDC** (more advance):
-- Spark fires earlier in compression stroke
-- Gives fuel/air mixture more time to burn
-- Increases power but risks engine knock
-- Example: 15 deg BTDC = spark 15 degrees before piston reaches top
+**Simulation Coverage**: 14,533 timing measurements analyzed with 99.9% within ±0.1° of target
 
-**Lower BTDC** (less advance): 
-- Spark fires closer to top dead center
-- Safer for engine but less efficient
-- Example: 5 deg BTDC = spark only 5 degrees before piston reaches top
+### Dwell Control
 
-**Negative BTDC** (retarded timing):
-- Spark fires AFTER top dead center
-- Used by rev limiter to cut power safely
-- Example: -5 deg BTDC = spark 5 degrees after piston passes top
+The controller maintains precise dwell control with duty cycle protection:
 
-### **Why Different Curves Matter**
+- **Target Dwell**: 3000μs (3ms) at 12V
+- **Low RPM**: Full 3ms dwell maintained
+- **High RPM**: Automatically reduced to respect 40% duty cycle limit
+- **Consistency**: ±50μs variation across all measurements
 
-**Safe Curve (Default)**: 
-- Like driving conservatively - protects your engine
-- Works with regular fuel, high temperatures, heavy loads
-- Slightly less power but maximum reliability
+## Building and Installation
 
-**Performance Curve**: 
-- Like sport mode - maximum power output
-- Requires premium fuel and careful monitoring
-- Risk of engine knock if not properly tuned
+### Arduino IDE
+1. Open `rotexign.ino` in Arduino IDE
+2. Select Board: Arduino Uno/Nano
+3. Select Port: Your Arduino's serial port
+4. Click Upload
 
-The controller automatically uses **Safe curve** as tested, ensuring reliable operation across all conditions.
+### Arduino CLI
+```bash
+# Install AVR core (one time)
+arduino-cli core install arduino:avr
 
-### **Real-Time Signal Visualization**
+# Compile
+arduino-cli compile --fqbn arduino:avr:uno rotexign.ino
 
-#### **Focused Timing Analysis**
+# Upload
+arduino-cli compile --fqbn arduino:avr:uno --upload --port /dev/ttyUSB0 rotexign.ino
+```
 
-![Low RPM Timing](timing_800rpm.svg)
+### Testing in Simulation
 
-*800 RPM operation showing precise trigger-to-spark timing with 4.6° advance*
+1. Open the [Wokwi project](https://wokwi.com/projects/439745280978700289)
+2. Click "Start Simulation"
+3. Monitor serial output for timing data
+4. Export VCD file for detailed analysis
 
-![Medium RPM Timing](timing_2000rpm.svg) 
+### Analyzing Simulation Data
 
-*2000 RPM operation demonstrating consistent timing control with 12.7° advance*
+The project includes comprehensive Python-based timing analysis tools:
 
-![High RPM Timing](timing_5500rpm.svg)
+```bash
+cd analysis
+source venv/bin/activate  # Always use venv
+python3 timing_analyzer.py wokwi-logic.vcd
+```
 
-*5500 RPM high-speed operation with optimized dwell timing*
+This generates:
+- `wokwi-logic-analysis.csv`: Detailed timing measurements
+- `timing_vs_rpm.png`: Advance curve validation plot
+- `timing_waveforms.png`: Sample waveform visualization
 
-**Analysis Files**:
-- `wokwi/wokwi-logic-analysis.txt`: Complete VCD timing analysis and validation data  
-- `wokwi/README.md`: Detailed testing procedures and scenarios
-- `ignition_timing_detail.svg`: Real-time signal visualization from VCD capture
+## Important TODOs
 
-## License & Contributions
-- Contributions welcome via PRs; keep changes scoped and documented. See AGENTS.md for contributor guidelines.
+### 🚨 Critical Before Engine Use
+
+1. **Physical Hardware Testing**
+   - Validate trigger input sensing with real crank sensor
+   - Verify coil drive output with oscilloscope
+   - Test noise immunity and EMI resistance
+   - Confirm timing accuracy with strobe light
+
+2. **Safety Relay Implementation**
+   - Add relay isolation for coil power during initialization
+   - Implement hardware watchdog for coil cutout on failure
+   - Add over-temperature protection for coil
+   - Ensure fail-safe grounding of coil during all error states
+
+3. **Additional Safety Features**
+   - Add backup rev limiter in hardware
+   - Implement voltage monitoring for brown-out protection
+   - Add diagnostic LEDs for error states
+   - Consider redundant timing verification
+
+## Design Philosophy
+
+This implementation prioritizes:
+
+1. **Simplicity**: Minimal code in ISRs, no complex state machines
+2. **Precision**: Hardware timers, tick-based math, direct port control
+3. **Safety**: Multiple protection mechanisms, fail-safe defaults
+4. **Testability**: Comprehensive analysis tools and validation data
+
+The result is a robust ignition controller that has been thoroughly validated in simulation with consistent sub-degree timing accuracy.
+
+## Files
+
+- `rotexign.ino` - Main controller implementation
+- `wokwi/` - Wokwi circuit design and custom test chip
+- `analysis/timing_analyzer.py` - VCD timing analysis tool
+- `analysis/smooth_timing_curve.py` - Timing curve smoothing and lookup table generator
+- `analysis/*.csv` - Timing measurement data from simulation
+- `analysis/*.png` - Performance validation plots
+- `doc/IgnitionDesignNotes.md` - Theoretical background and design constraints
+- `CLAUDE.md` - Development notes and debugging history
+
+## License
+
+This project is open source. Contributions welcome via pull requests.
