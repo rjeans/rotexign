@@ -19,7 +19,7 @@ struct EngineState {
   volatile uint16_t next_dwell_ticks = 0;
 };
 
-static volatile EngineState engine;
+static EngineState engine;
 
 struct SystemState {
   volatile uint32_t last_diagnostic_millis = 0;
@@ -44,6 +44,18 @@ namespace Utils {
   static inline uint16_t period_us_to_rpm(uint32_t period_us, uint8_t pulses_per_rev) {
     if (period_us == 0) return 0;
     return (uint16_t)(60000000UL / (period_us * pulses_per_rev));
+  }
+
+  // Direct RPM from period ticks (avoids microsecond conversion).
+  // Formula: RPM = (timer_ticks_per_sec * 60) / (period_ticks * pulses_per_rev)
+  // timer_ticks_per_sec = F_CPU / prescaler = 16,000,000 / 64 = 250,000
+  // Numerator = 250,000 * 60 = 15,000,000
+  constexpr uint32_t TIMER_TICKS_PER_SEC = (F_CPU / 64UL);
+  constexpr uint32_t RPM_NUMERATOR = TIMER_TICKS_PER_SEC * 60UL;
+
+  static inline uint16_t rpm_from_period_ticks(uint16_t period_ticks, uint8_t pulses_per_rev) {
+    if (!period_ticks) return 0;
+    return (uint16_t)(RPM_NUMERATOR / (uint32_t(period_ticks) * pulses_per_rev));
   }
 }
 
@@ -157,7 +169,7 @@ namespace Timing {
 
   // Get dwell time in microseconds from RPM
   uint16_t get_dwell_us_from_rpm(uint16_t rpm) {
-    uint16_t spark_delay_us = get_spark_delay_us_from_rpm(rpm);
+    // Removed unused spark_delay_us to save ISR path work when inlined.
     uint32_t period_us = 60000000UL / (rpm * PULSES_PER_REVOLUTION);
     uint32_t max_dwell_us = ((period_us + 50) / 100) * MAX_DUTY_CYCLE;
     uint16_t dwell_us = min(NOMINAL_DWELL_US, max_dwell_us);
@@ -168,9 +180,9 @@ namespace Timing {
 namespace SerialInterface {
   // Print diagnostic status to Serial
   void print_status() {
+    // Use new rpm_from_period_ticks to keep consistency
     uint16_t period_ticks = engine.period_ticks;
-    uint32_t period_us = Utils::ticks64_to_us(period_ticks); 
-    uint16_t rpm = Utils::period_us_to_rpm(period_us, Timing::PULSES_PER_REVOLUTION);
+    uint16_t rpm = Utils::rpm_from_period_ticks(period_ticks, Timing::PULSES_PER_REVOLUTION);
 
     Serial.print(F("RPM: ")); Serial.print(rpm);
     Serial.print(F(" Advance angle: ")); Serial.print(Timing::get_advance_angle_tenths(rpm));
@@ -182,6 +194,10 @@ namespace SerialInterface {
   }
 }
 
+// Direct port control for FIRE_PIN (digital pin 3 = PD3 on ATmega328P)
+#define FIRE_PORT  PORTD
+#define FIRE_DDR   DDRD
+#define FIRE_BIT   PD3
 constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
 constexpr uint16_t PRESCALE_BITS = _BV(CS11) | _BV(CS10); // /64 -> 4us/tick
 
@@ -201,22 +217,21 @@ static inline void schedule_A(uint16_t when) {
 
 // External interrupt: crank trigger
 ISR(INT0_vect) {
-  // Minimize volatile accesses and calculations in ISR
-  uint16_t tcnt = TCNT1;
+  uint16_t tcnt = TCNT1;                    // Snapshot as early as possible
   if (!engine.n_ticks++) {
     engine.last_interrupt_ticks = tcnt;
   } else {
-    sys.engine_running = true;
     engine.last_interrupt_ticks = engine.this_interrupt_ticks;
     engine.this_interrupt_ticks = tcnt;
     engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
 
-    // Only do minimal math here, avoid floating point and Serial
-    uint32_t period_us = Utils::ticks64_to_us(engine.period_ticks); 
-    uint16_t rpm = Utils::period_us_to_rpm(period_us, Timing::PULSES_PER_REVOLUTION);
+    sys.engine_running = true;
 
-    // Precompute dwell values outside ISR if possible, but keep here for now
-    uint16_t dwell_ticks = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
+    // Compute RPM directly from ticks (single 32-bit division)
+    uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
+
+    // Compute dwell metrics (unchanged logic)
+    uint16_t dwell_ticks       = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
     uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
 
     engine.next_dwell_ticks = dwell_ticks;
@@ -226,11 +241,10 @@ ISR(INT0_vect) {
 
 // Timer1 COMPB interrupt: start ignition pulse
 ISR(TIMER1_COMPB_vect) {
-  // Only do pin toggle and schedule next event
-  digitalWrite(FIRE_PIN, HIGH);          // Start the pulse
-  TIMSK1 &= ~_BV(OCIE1B);                // one-shot: disable B until next schedule
+  // Fast pin set
+  FIRE_PORT |= _BV(FIRE_BIT);
+  TIMSK1 &= ~_BV(OCIE1B);
 
-  // Schedule pulse OFF after fixed width
   const uint16_t width_ticks = engine.next_dwell_ticks;
   uint16_t t_off = (uint16_t)(OCR1B + width_ticks);
   schedule_A(t_off);
@@ -238,16 +252,18 @@ ISR(TIMER1_COMPB_vect) {
 
 // Timer1 COMPA interrupt: end ignition pulse
 ISR(TIMER1_COMPA_vect) {
-  digitalWrite(FIRE_PIN, LOW);           // End the pulse
-  TIMSK1 &= ~_BV(OCIE1A);                // one-shot: disable A
+  // Fast pin clear
+  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  TIMSK1 &= ~_BV(OCIE1A);
 }
 
 void setup() {
   Serial.begin(115200);
   Serial.println(F("Rotax 787 Ignition Controller"));
 
-  pinMode(FIRE_PIN, OUTPUT);
-  digitalWrite(FIRE_PIN, LOW);
+  // Replace pinMode/digitalWrite for FIRE_PIN with direct register setup
+  FIRE_DDR  |= _BV(FIRE_BIT);
+  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
 
   // INT0 on falling edge (D2)
   pinMode(2, INPUT_PULLUP);
