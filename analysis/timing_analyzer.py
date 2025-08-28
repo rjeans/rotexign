@@ -471,7 +471,10 @@ def create_timing_vs_rpm_plot(timing_events):
     ax1.scatter(rpms, advances, alpha=0.3, s=20, c='lightblue', label='Individual measurements', zorder=1)
     
     # Calculate measured curve (binned averages with error bars)
-    rpm_bins = np.arange(0, 8000, 100)
+    # Start binning from the minimum measured RPM (rounded down to nearest 50)
+    min_rpm = min(rpms) if rpms.size > 0 else 0
+    min_bin = (min_rpm // 50) * 50
+    rpm_bins = np.arange(min_bin, 8000, 100)
     bin_centers = rpm_bins[:-1] + 50
     bin_means = []
     bin_stds = []

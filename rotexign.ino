@@ -17,13 +17,14 @@ struct EngineState {
   volatile uint16_t period_ticks = 0;
   volatile uint16_t n_ticks = 0;
   volatile uint16_t next_dwell_ticks = 0;
+  volatile bool running = false;
 };
 
 static EngineState engine;
 
 struct SystemState {
   volatile uint32_t last_diagnostic_millis = 0;
-  volatile bool engine_running = false;
+
 };
 
 static volatile SystemState sys;
@@ -177,6 +178,7 @@ namespace Timing {
   }
 }
 
+
 namespace SerialInterface {
   // Print diagnostic status to Serial
   void print_status() {
@@ -191,8 +193,12 @@ namespace SerialInterface {
     Serial.print(F(" Dwell (us): ")); Serial.print(Timing::get_dwell_us_from_rpm(rpm));
     Serial.println();
 
+ 
+
   }
 }
+
+
 
 // Direct port control for FIRE_PIN (digital pin 3 = PD3 on ATmega328P)
 #define FIRE_PORT  PORTD
@@ -218,14 +224,13 @@ static inline void schedule_A(uint16_t when) {
 // External interrupt: crank trigger
 ISR(INT0_vect) {
   uint16_t tcnt = TCNT1;                    // Snapshot as early as possible
-  if (!engine.n_ticks++) {
-    engine.last_interrupt_ticks = tcnt;
-  } else {
+
+    engine.n_ticks++;
     engine.last_interrupt_ticks = engine.this_interrupt_ticks;
     engine.this_interrupt_ticks = tcnt;
     engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
 
-    sys.engine_running = true;
+   
 
     // Compute RPM directly from ticks (single 32-bit division)
     uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
@@ -234,9 +239,22 @@ ISR(INT0_vect) {
     uint16_t dwell_ticks       = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
     uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
 
+   
+
     engine.next_dwell_ticks = dwell_ticks;
+
+    if(engine.n_ticks>2) {
+      engine.running=true;
+    }
+
+    if (rpm>7000) {
+      engine.running=false;
+    }
+    
+    if (engine.running) {
     schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
-  }
+    }
+  
 }
 
 // Timer1 COMPB interrupt: start ignition pulse
@@ -283,7 +301,7 @@ void setup() {
 void loop() {
   // Print diagnostics every 5 seconds
   if (millis() - sys.last_diagnostic_millis > 5000) {
-    if (sys.engine_running) {
+    if (engine.running) {
       SerialInterface::print_status();
     }
     sys.last_diagnostic_millis = millis();
