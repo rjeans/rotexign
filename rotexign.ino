@@ -19,14 +19,14 @@ struct EngineState {
   volatile uint16_t next_dwell_ticks = 0;
 };
 
-static EngineState engine;
+static volatile EngineState engine;
 
 struct SystemState {
   volatile uint32_t last_diagnostic_millis = 0;
   volatile bool engine_running = false;
 };
 
-static SystemState sys;
+static volatile SystemState sys;
 
 namespace Utils {
   // Convert microseconds to Timer1 ticks at prescaler /64 (F_CPU = 16 MHz)
@@ -38,6 +38,12 @@ namespace Utils {
   // Convert Timer1 ticks at prescaler /64 back to microseconds (F_CPU = 16 MHz)
   static inline uint32_t ticks64_to_us(uint16_t ticks) {
     return (uint32_t)ticks * 4UL;
+  }
+
+  // Calculate RPM from period_us (avoid division in ISRs)
+  static inline uint16_t period_us_to_rpm(uint32_t period_us, uint8_t pulses_per_rev) {
+    if (period_us == 0) return 0;
+    return (uint16_t)(60000000UL / (period_us * pulses_per_rev));
   }
 }
 
@@ -84,12 +90,6 @@ namespace Timing {
 
     uint16_t rpm_low  = pgm_read_word(&timing_rpm_curve[i - 1][0]);
     uint16_t rpm_high = pgm_read_word(&timing_rpm_curve[i][0]);
-
-    if (rpm < rpm_low || rpm > rpm_high) {
-      Serial.print("RPM= "); Serial.print(rpm);
-      Serial.print(" i="); Serial.print(i);
-      Serial.println("");
-    }
 
     uint16_t adv_low_u  = pgm_read_word(&timing_rpm_curve[i - 1][1]);
     uint16_t adv_high_u = pgm_read_word(&timing_rpm_curve[i][1]);
@@ -170,7 +170,7 @@ namespace SerialInterface {
   void print_status() {
     uint16_t period_ticks = engine.period_ticks;
     uint32_t period_us = Utils::ticks64_to_us(period_ticks); 
-    uint16_t rpm = 60000000 / (period_us * Timing::PULSES_PER_REVOLUTION);
+    uint16_t rpm = Utils::period_us_to_rpm(period_us, Timing::PULSES_PER_REVOLUTION);
 
     Serial.print(F("RPM: ")); Serial.print(rpm);
     Serial.print(F(" Advance angle: ")); Serial.print(Timing::get_advance_angle_tenths(rpm));
@@ -201,22 +201,21 @@ static inline void schedule_A(uint16_t when) {
 
 // External interrupt: crank trigger
 ISR(INT0_vect) {
+  // Minimize volatile accesses and calculations in ISR
+  uint16_t tcnt = TCNT1;
   if (!engine.n_ticks++) {
-    engine.last_interrupt_ticks = TCNT1;
+    engine.last_interrupt_ticks = tcnt;
   } else {
     sys.engine_running = true;
     engine.last_interrupt_ticks = engine.this_interrupt_ticks;
-    engine.this_interrupt_ticks = TCNT1;
+    engine.this_interrupt_ticks = tcnt;
     engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
 
-    // Fast lookup using pre-calculated table - no expensive calculations in interrupt!
-    // Timing::TimingEntry timing = Timing::fast_timing_lookup(engine.period_ticks);
-    // engine.next_dwell_ticks = timing.dwell_ticks;
-    // schedule_B(engine.this_interrupt_ticks + timing.dwell_delay_ticks);
-
+    // Only do minimal math here, avoid floating point and Serial
     uint32_t period_us = Utils::ticks64_to_us(engine.period_ticks); 
-    uint16_t rpm = 60000000 / (period_us * Timing::PULSES_PER_REVOLUTION);
+    uint16_t rpm = Utils::period_us_to_rpm(period_us, Timing::PULSES_PER_REVOLUTION);
 
+    // Precompute dwell values outside ISR if possible, but keep here for now
     uint16_t dwell_ticks = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
     uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
 
@@ -227,6 +226,7 @@ ISR(INT0_vect) {
 
 // Timer1 COMPB interrupt: start ignition pulse
 ISR(TIMER1_COMPB_vect) {
+  // Only do pin toggle and schedule next event
   digitalWrite(FIRE_PIN, HIGH);          // Start the pulse
   TIMSK1 &= ~_BV(OCIE1B);                // one-shot: disable B until next schedule
 
