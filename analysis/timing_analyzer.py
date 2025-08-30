@@ -13,15 +13,16 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple, Dict
 
 # Signal mappings for VCD parsing
+# Updated to reflect inverted spark logic: LOW = dwell start, HIGH = spark
 SIGNAL_MAPPINGS = {
     '0#': 'trigger_fall',
     '1#': 'trigger_rise',
-    '0$': 'spark_fall',
-    '1$': 'dwell_start',
+    '0$': 'dwell_start',   # LOW = dwell start (coil charging)
+    '1$': 'spark_fire',    # HIGH = spark (coil fires)
     '0!': 'trigger_fall',  # Legacy
     '1!': 'trigger_rise',  # Legacy
-    '0"': 'spark_fall',    # Legacy
-    '1"': 'dwell_start'    # Legacy
+    '0"': 'dwell_start',   # Legacy - now dwell start
+    '1"': 'spark_fire'     # Legacy - now spark fire
 }
 
 def parse_vcd_file(vcd_file: str) -> List[Tuple[int, str]]:
@@ -96,7 +97,7 @@ def find_corresponding_dwell(signal_changes: List[Tuple[int, str]], spark_idx: i
             break
         if check_event == 'dwell_start':
             spark_between = any(
-                signal_changes[m][1] == 'spark_fall'
+                signal_changes[m][1] == 'spark_fire'
                 for m in range(k + 1, spark_idx)
             )
             if not spark_between:
@@ -242,7 +243,7 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
             # Don't stop at T1 - spark might be in next period for previous-lobe
             if (check_time - T0) > 200000000:  # 200ms max search
                 break
-            if check_event == 'spark_fall':
+            if check_event == 'spark_fire':
                 S0 = check_time
                 dwell_time = (S0 - D0) / 1000.0  # microseconds
                 break
@@ -653,19 +654,19 @@ def create_waveforms_plot(timing_events):
                 pulse_mask = (time_us >= pulse_start) & (time_us <= pulse_end)
                 trigger_signal[pulse_mask] = 0
         
-        # Generate spark signal (normally LOW, HIGH during dwell, brief LOW spike at spark)
-        spark_signal = np.zeros_like(time_us)
+        # Generate spark signal (normally HIGH, LOW during dwell, HIGH at spark)
+        spark_signal = np.ones_like(time_us) * 2  # Start HIGH (no dwell)
         for trigger_time in [0, period_us, period_us * 2]:
             spark_time = trigger_time + delay_us
             dwell_start_time = spark_time - dwell_us
             
             if spark_time < time_span_us and dwell_start_time >= 0:
-                # Add dwell period (HIGH = coil charging)
+                # Add dwell period (LOW = coil charging)
                 dwell_mask = (time_us >= dwell_start_time) & (time_us < spark_time)
-                spark_signal[dwell_mask] = 2
+                spark_signal[dwell_mask] = 0
                 
-                # Spark event is the falling edge at spark_time (end of dwell)
-                # The signal naturally drops to 0 after dwell ends
+                # Spark event is the rising edge at spark_time (end of dwell)
+                # The signal returns to HIGH after dwell ends
         
         # Plot signals
         ax = axes[i]

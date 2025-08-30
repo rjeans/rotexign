@@ -25,9 +25,15 @@ This project implements a sophisticated ignition timing controller using an Ardu
 
 ### Safety Features
 - **Rev Limiter**: Hard cut at 7000 RPM (configurable)
-- **Startup Protection**: 2-tick stabilization before enabling ignition
-- **Duty Cycle Protection**: Prevents coil overheating at high RPM
-- **Clean Initialization**: All outputs grounded during startup
+- **Startup Protection**: Requires 3+ triggers and 2 consecutive good periods before enabling
+- **Duty Cycle Protection**: Prevents coil overheating at high RPM (40% max)
+- **Clean Initialization**: Output starts HIGH (safe state - no dwell)
+- **Coil Relay Protection**: Relay enables just before first spark to protect coil from spurious pulses
+- **Noise Filtering**: Advanced trigger filtering rejects electrical noise and false triggers
+  - Period range validation (125-7500 RPM bounds)
+  - ±25% period consistency checking
+  - Exponential moving average smoothing
+  - Consecutive good period requirements
 
 ## Hardware Configuration
 
@@ -35,7 +41,8 @@ This project implements a sophisticated ignition timing controller using an Ardu
 | Pin | Function | Description |
 |-----|----------|-------------|
 | D2 | Trigger Input (INT0) | Falling edge trigger from crank sensor (47° BTDC) |
-| D3 | Ignition Output | Coil control (HIGH = dwell, LOW = spark) |
+| D3 | Ignition Output | Coil control (LOW = dwell/charging, HIGH = spark/fire) |
+| D4 | Coil Relay Enable | Safety relay control (HIGH = enable coil, LOW = disable) |
 
 ### Engine Parameters
 - **Trigger Configuration**: 2 pulses per revolution (2 lobes, 180° apart)
@@ -60,11 +67,12 @@ Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
    - Schedules Compare B interrupt for dwell start
 
 2. **Compare B ISR** (`TIMER1_COMPB_vect`):
-   - Sets ignition output HIGH (start dwell)
+   - Sets ignition output LOW (start dwell/coil charging)
+   - Enables coil relay on first spark (D4 HIGH)
    - Schedules Compare A for spark
 
 3. **Compare A ISR** (`TIMER1_COMPA_vect`):
-   - Sets ignition output LOW (fire spark)
+   - Sets ignition output HIGH (fire spark)
    - Completes timing cycle
 
 ### Timing Calculations
@@ -197,23 +205,39 @@ This generates:
 - `timing_vs_rpm.png`: Advance curve validation plot
 - `timing_waveforms.png`: Sample waveform visualization
 
+## Recent Updates (2025-08-30)
+
+### Inverted Spark Logic
+- **NEW**: Ignition output now uses inverted logic for improved safety
+  - LOW = Dwell start (coil charging)
+  - HIGH = Spark fire (coil discharge)
+  - Initialization and error states leave output HIGH (safe - no dwell)
+
+### Coil Relay Safety
+- **NEW**: Pin D4 controls coil relay for additional protection
+  - Relay enables automatically just before first spark
+  - Prevents spurious pulses during startup
+  - Disables on engine stop (>7000 RPM)
+
+### Advanced Noise Filtering
+- **NEW**: Comprehensive trigger input filtering
+  - Rejects pulses outside 125-7500 RPM range
+  - Tracks stable period with exponential moving average
+  - Requires consecutive good periods before starting
+  - ±25% period variation tolerance for normal acceleration
+
 ## Important TODOs
 
 ### 🚨 Critical Before Engine Use
 
 1. **Physical Hardware Testing**
    - Validate trigger input sensing with real crank sensor
-   - Verify coil drive output with oscilloscope
-   - Test noise immunity and EMI resistance
+   - Verify inverted coil drive output with oscilloscope
+   - Test noise immunity and EMI resistance with new filtering
    - Confirm timing accuracy with strobe light
+   - Test coil relay operation (D4) with actual relay hardware
 
-2. **Safety Relay Implementation**
-   - Add relay isolation for coil power during initialization
-   - Implement hardware watchdog for coil cutout on failure
-   - Add over-temperature protection for coil
-   - Ensure fail-safe grounding of coil during all error states
-
-3. **Additional Safety Features**
+2. **Additional Safety Features**
    - Add backup rev limiter in hardware
    - Implement voltage monitoring for brown-out protection
    - Add diagnostic LEDs for error states

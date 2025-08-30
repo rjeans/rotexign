@@ -18,6 +18,9 @@ struct EngineState {
   volatile uint16_t n_ticks = 0;
   volatile uint16_t next_dwell_ticks = 0;
   volatile bool running = false;
+  volatile bool coil_enabled = false;  // Track if coil relay has been enabled
+  volatile uint16_t stable_period_ticks = 0;  // Filtered stable period
+  volatile uint8_t  good_periods = 0;          // Count of consecutive good periods
 };
 
 static EngineState engine;
@@ -66,6 +69,11 @@ namespace Timing {
   const uint16_t DWELL_TO_TRIGGER_MARGIN_US = 20;
   const uint16_t TRIGGER_BTDC_TENTHS = 470;  // 47.0 degrees in tenths
   const uint8_t  PULSES_PER_REVOLUTION = 2;
+  
+  // Noise filtering constants
+  const uint16_t MIN_PERIOD_TICKS = 2000;    // ~8ms @ 4us/tick = ~7500 RPM max
+  const uint16_t MAX_PERIOD_TICKS = 60000;   // ~240ms @ 4us/tick = ~125 RPM min
+  const uint8_t  PERIOD_VARIANCE_PERCENT = 25; // Accept ±25% period variation
 
   // Timing advance curve: {RPM, advance in tenths of degrees}
   static const uint16_t timing_rpm_curve[][2] PROGMEM = {
@@ -205,6 +213,13 @@ namespace SerialInterface {
 #define FIRE_DDR   DDRD
 #define FIRE_BIT   PD3
 constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
+
+// Coil relay enable pin (digital pin 4 = PD4 on ATmega328P)
+#define COIL_PORT  PORTD
+#define COIL_DDR   DDRD
+#define COIL_BIT   PD4
+constexpr uint8_t COIL_ENABLE_PIN = 4;   // Output pin for coil relay enable
+
 constexpr uint16_t PRESCALE_BITS = _BV(CS11) | _BV(CS10); // /64 -> 4us/tick
 
 // Schedule a COMPB one-shot at absolute tick 'when'
@@ -225,42 +240,82 @@ static inline void schedule_A(uint16_t when) {
 ISR(INT0_vect) {
   uint16_t tcnt = TCNT1;                    // Snapshot as early as possible
 
-    engine.n_ticks++;
-    engine.last_interrupt_ticks = engine.this_interrupt_ticks;
-    engine.this_interrupt_ticks = tcnt;
-    engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
+  engine.n_ticks++;
+  engine.last_interrupt_ticks = engine.this_interrupt_ticks;
+  engine.this_interrupt_ticks = tcnt;
+  uint16_t raw_period = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
 
-   
+  // Noise filter: Reject pulses that are too fast or too slow
+  if (raw_period < Timing::MIN_PERIOD_TICKS || raw_period > Timing::MAX_PERIOD_TICKS) {
+    // Likely noise - ignore this trigger
+    engine.good_periods = 0;  // Reset good period counter
+    return;
+  }
 
-    // Compute RPM directly from ticks (single 32-bit division)
-    uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
-
-    // Compute dwell metrics (unchanged logic)
-    uint16_t dwell_ticks       = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
-    uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
-
-   
-
-    engine.next_dwell_ticks = dwell_ticks;
-
-    if(engine.n_ticks>2) {
-      engine.running=true;
-    }
-
-    if (rpm>7000) {
-      engine.running=false;
-    }
+  // Check period consistency (if we have a stable period established)
+  if (engine.stable_period_ticks > 0) {
+    // Calculate variance from stable period
+    uint16_t min_allowed = engine.stable_period_ticks - (engine.stable_period_ticks * Timing::PERIOD_VARIANCE_PERCENT / 100);
+    uint16_t max_allowed = engine.stable_period_ticks + (engine.stable_period_ticks * Timing::PERIOD_VARIANCE_PERCENT / 100);
     
-    if (engine.running) {
-    schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
+    if (raw_period < min_allowed || raw_period > max_allowed) {
+      // Period varies too much - could be noise or acceleration
+      engine.good_periods = 0;  // Reset counter but don't return yet
+      // We'll still update stable_period if we get enough consistent readings
+    } else {
+      engine.good_periods++;
+      // Use exponential moving average for smooth period updates
+      engine.stable_period_ticks = (engine.stable_period_ticks * 3 + raw_period) / 4;
     }
+  } else {
+    // No stable period yet - use this one if it passes basic checks
+    engine.stable_period_ticks = raw_period;
+    engine.good_periods = 1;
+  }
+
+  // Update period for calculations (use filtered stable period if available)
+  engine.period_ticks = (engine.good_periods >= 2) ? engine.stable_period_ticks : raw_period;
+
+  // Compute RPM directly from ticks (single 32-bit division)
+  uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
+
+  // Compute dwell metrics (unchanged logic)
+  uint16_t dwell_ticks       = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
+  uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
+
+  engine.next_dwell_ticks = dwell_ticks;
+
+  // Need at least 3 good triggers AND 2 consecutive good periods to start
+  if(engine.n_ticks > 3 && engine.good_periods >= 2) {
+    engine.running = true;
+  }
+
+  if (rpm > 7000) {
+    engine.running = false;
+    engine.good_periods = 0;
+    engine.stable_period_ticks = 0;
+    // Ensure FIRE_PIN is HIGH (safe state) when engine stops
+    FIRE_PORT |= _BV(FIRE_BIT);
+    // Disable coil relay when engine stops
+    COIL_PORT &= (uint8_t)~_BV(COIL_BIT);
+    engine.coil_enabled = false;
+  }
   
+  if (engine.running) {
+    schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
+  }
 }
 
-// Timer1 COMPB interrupt: start ignition pulse
+// Timer1 COMPB interrupt: start dwell (output goes LOW)
 ISR(TIMER1_COMPB_vect) {
-  // Fast pin set
-  FIRE_PORT |= _BV(FIRE_BIT);
+  // Enable coil relay on first spark if not already enabled
+  if (!engine.coil_enabled) {
+    COIL_PORT |= _BV(COIL_BIT);  // Set D4 high to enable coil relay
+    engine.coil_enabled = true;
+  }
+  
+  // Fast pin clear - LOW to start dwell
+  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
   TIMSK1 &= ~_BV(OCIE1B);
 
   const uint16_t width_ticks = engine.next_dwell_ticks;
@@ -268,10 +323,10 @@ ISR(TIMER1_COMPB_vect) {
   schedule_A(t_off);
 }
 
-// Timer1 COMPA interrupt: end ignition pulse
+// Timer1 COMPA interrupt: fire spark (output goes HIGH)
 ISR(TIMER1_COMPA_vect) {
-  // Fast pin clear
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  // Fast pin set - HIGH to fire spark
+  FIRE_PORT |= _BV(FIRE_BIT);
   TIMSK1 &= ~_BV(OCIE1A);
 }
 
@@ -281,7 +336,11 @@ void setup() {
 
   // Replace pinMode/digitalWrite for FIRE_PIN with direct register setup
   FIRE_DDR  |= _BV(FIRE_BIT);
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  FIRE_PORT |= _BV(FIRE_BIT);  // Initialize HIGH (safe state - no dwell)
+  
+  // Setup coil relay enable pin (D4) - initially LOW
+  COIL_DDR  |= _BV(COIL_BIT);
+  COIL_PORT &= (uint8_t)~_BV(COIL_BIT);
 
   // INT0 on falling edge (D2)
   pinMode(2, INPUT_PULLUP);
