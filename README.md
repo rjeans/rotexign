@@ -11,22 +11,24 @@ This project implements a sophisticated ignition timing controller using an Ardu
 ## Key Features
 
 ### Core Timing Engine
-- **Hardware Timer-Based**: Uses Timer1 with 0.5μs resolution (prescaler /64 at 16MHz)
+- **Hardware Timer-Based**: Uses Timer1 with 4μs resolution (prescaler /64 at 16MHz)
 - **Interrupt-Driven**: External interrupt (INT0) for trigger input, Timer1 Compare Match for dwell/spark scheduling
 - **Direct Port Control**: Bypasses Arduino digitalRead/Write for minimal latency
 - **Tick-Based Math**: All calculations in timer ticks to avoid floating-point in ISRs
 
 ### Timing Control
-- **Adaptive Advance Curve**: 81-point interpolated timing map stored in PROGMEM
+- **Adaptive Advance Curve**: 201-point interpolated timing map stored in PROGMEM
 - **Smoothed Curve Generation**: Cubic interpolation with Savitzky-Golay filtering
 - **Dynamic Scheduling**: Automatic transition between same-lobe and previous-lobe timing
 - **Precision Dwell Control**: 3ms target with 40% duty cycle protection
 - **RPM Range**: Validated operation from 800-8000 RPM
 
 ### Safety Features
-- **Rev Limiter**: Hard cut at 7000 RPM (configurable)
-- **Startup Protection**: 2-tick stabilization before enabling ignition
+- **Rev Limiter**: Hard cut at 7000 RPM with immediate interrupt cancellation
+- **Startup Protection**: 3-trigger stabilization before enabling ignition
 - **Duty Cycle Protection**: Prevents coil overheating at high RPM
+- **Input Pulse Filtering**: Hardware-level debounce (400μs minimum period) in interrupt handler
+- **Interrupt Cancellation**: Automatically disables dwell/spark interrupts when engine stops
 - **Clean Initialization**: All outputs grounded during startup
 - **Relay Protection**: D4 relay keeps coil grounded until D2 is stable HIGH for 1 second
 
@@ -57,9 +59,11 @@ Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
 
 1. **Trigger ISR** (`INT0_vect`):
    - Captures Timer1 count immediately
+   - Filters trigger pulses to reject noise/bounce (periods <400μs)
+   - Waits for 3-trigger stabilization before enabling ignition
    - Calculates period from previous trigger
    - Computes RPM and required timing
-   - Schedules Compare B interrupt for dwell start
+   - Schedules Compare B interrupt for dwell start or cancels interrupts if engine stops
 
 2. **Compare B ISR** (`TIMER1_COMPB_vect`):
    - Sets ignition output LOW (start dwell/coil charging)
@@ -71,7 +75,7 @@ Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
 
 ### Timing Calculations
 
-All timing uses integer math with Timer1 ticks (0.5μs resolution):
+All timing uses integer math with Timer1 ticks (4μs resolution):
 
 ```cpp
 // RPM from period ticks (avoids floating point)
@@ -87,12 +91,12 @@ delay_us = (delay_tenths * period_us) / 1800
 
 ### Timing Curve Generation
 
-The 81-point timing curve in PROGMEM is generated through a sophisticated smoothing process:
+The 201-point timing curve in PROGMEM is generated through a sophisticated smoothing process:
 
 1. **Base Points**: Starts with 9 key RPM/advance points defining the desired curve shape
 2. **Cubic Interpolation**: Generates 200 intermediate points using cubic spline interpolation
 3. **Savitzky-Golay Filtering**: Applies polynomial smoothing to remove discontinuities
-4. **Lookup Table Generation**: Creates final 81 points at 100 RPM intervals (0-8000 RPM)
+4. **Lookup Table Generation**: Creates final 201 points at 40 RPM intervals (0-8000 RPM)
 5. **Fixed-Point Conversion**: Stores values as tenths of degrees (×10) for integer math
 
 This process (`analysis/smooth_timing_curve.py`) ensures:

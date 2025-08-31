@@ -15,7 +15,7 @@ struct EngineState {
   volatile uint16_t last_interrupt_ticks = 0;
   volatile uint16_t this_interrupt_ticks = 0;
   volatile uint16_t period_ticks = 0;
-  volatile uint16_t n_ticks = 0;
+  volatile uint16_t n_starting_ticks = 0;
   volatile uint16_t next_dwell_ticks = 0;
   volatile bool running = false;
 };
@@ -198,7 +198,8 @@ namespace SerialInterface {
     uint16_t period_ticks = engine.period_ticks;
     uint16_t rpm = Utils::rpm_from_period_ticks(period_ticks, Timing::PULSES_PER_REVOLUTION);
 
-    Serial.print(F("RPM: ")); Serial.print(rpm);
+    Serial.print(F("Engine ")); Serial.print(engine.running ? F("running") : F("stopped"));
+    Serial.print(F(" RPM: ")); Serial.print(rpm);
     Serial.print(F(" Advance angle: ")); Serial.print(Timing::get_advance_angle_tenths(rpm));
     Serial.print(F(" Spark delay (us): ")); Serial.print(Timing::get_spark_delay_us_from_rpm(rpm));
     Serial.print(F(" Dwell delay (us): ")); Serial.print(Timing::get_dwell_delay_us_from_rpm(rpm));
@@ -238,15 +239,30 @@ static inline void schedule_A(uint16_t when) {
 ISR(INT0_vect) {
   uint16_t tcnt = TCNT1;  // Snapshot Timer1 as early as possible
 
+  // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
+  uint16_t period_ticks_candidate = (uint16_t)(tcnt - engine.this_interrupt_ticks);
+  
+  // Pulse filtering: reject very short periods (debounce/noise) using ticks directly
+  // MIN_TRIGGER_PERIOD_US = 400us = 100 ticks at 4us/tick
+  if (period_ticks_candidate < 100) {
+    return;  // Ignore this trigger - likely bounce or noise
+  }
+
   // Update engine timing state
-  engine.n_ticks++;
+ 
   engine.last_interrupt_ticks = engine.this_interrupt_ticks;
   engine.this_interrupt_ticks = tcnt;
-  engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
+  engine.period_ticks = period_ticks_candidate;
 
-  // Calculate RPM and update engine state
+  if (engine.n_starting_ticks<=2  ) { 
+    engine.n_starting_ticks++; 
+    return; 
+  }
+  
+
+  // Calculate RPM and update engine state (MAX_RPM check covers high RPM filtering)
   uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
-  engine.running = (engine.n_ticks > 2 && rpm <= Timing::MAX_RPM);
+  engine.running = ( rpm <= Timing::MAX_RPM);
 
   if (engine.running) {
     // Precompute dwell metrics
@@ -256,7 +272,11 @@ ISR(INT0_vect) {
 
     // Schedule dwell start
     schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
-  }
+  } else {
+    // Engine stopped - cancel any pending timer interrupts and ensure safe state
+    TIMSK1 &= ~(_BV(OCIE1A) | _BV(OCIE1B));  // Disable both compare interrupts
+    FIRE_PORT |= _BV(FIRE_BIT);              // Ensure D3 HIGH (safe state - no dwell)
+  } 
 }
 
 // Timer1 COMPB interrupt: start dwell (output goes LOW)
@@ -318,9 +338,9 @@ void loop() {
 
   // Print diagnostics every 5 seconds
   if (millis() - sys.last_diagnostic_millis > 5000) {
-    if (engine.running) {
+    
       SerialInterface::print_status();
-    }
+    
     sys.last_diagnostic_millis = millis();
   }
 }
