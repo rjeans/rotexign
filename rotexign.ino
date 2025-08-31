@@ -42,12 +42,6 @@ namespace Utils {
     return (uint32_t)ticks * 4UL;
   }
 
-  // Calculate RPM from period_us (avoid division in ISRs)
-  static inline uint16_t period_us_to_rpm(uint32_t period_us, uint8_t pulses_per_rev) {
-    if (period_us == 0) return 0;
-    return (uint16_t)(60000000UL / (period_us * pulses_per_rev));
-  }
-
   // Direct RPM from period ticks (avoids microsecond conversion).
   // Formula: RPM = (timer_ticks_per_sec * 60) / (period_ticks * pulses_per_rev)
   // timer_ticks_per_sec = F_CPU / prescaler = 16,000,000 / 64 = 250,000
@@ -64,28 +58,45 @@ namespace Utils {
 namespace Timing {
   const uint16_t MAX_DUTY_CYCLE = 40; 
   const uint16_t NOMINAL_DWELL_US = 3000;
+  const uint16_t MAX_RPM = 7000;
   const uint16_t DWELL_TO_TRIGGER_MARGIN_US = 20;
   const uint16_t TRIGGER_BTDC_TENTHS = 470;  // 47.0 degrees in tenths
   const uint8_t  PULSES_PER_REVOLUTION = 2;
 
-  // Timing advance curve: {RPM, advance in tenths of degrees}
+  // Timing advance curve: {RPM, advance in tenths of degrees} (201 points, 40 RPM resolution)
   static const uint16_t timing_rpm_curve[][2] PROGMEM = {
-    {0, 0}, {100, 5}, {200, 10}, {300, 16}, {400, 22}, {500, 28}, {600, 34}, {700, 40},
-    {800, 47}, {900, 53}, {1000, 60}, {1100, 67}, {1200, 73}, {1300, 80}, {1400, 86},
-    {1500, 92}, {1600, 98}, {1700, 104}, {1800, 110}, {1900, 115}, {2000, 120},
-    {2100, 125}, {2200, 129}, {2300, 133}, {2400, 136}, {2500, 139}, {2600, 142},
-    {2700, 145}, {2800, 147}, {2900, 149}, {3000, 150}, {3100, 151}, {3200, 152},
-    {3300, 152}, {3400, 153}, {3500, 153}, {3600, 152}, {3700, 152}, {3800, 151},
-    {3900, 151}, {4000, 150}, {4100, 149}, {4200, 148}, {4300, 147}, {4400, 146},
-    {4500, 145}, {4600, 144}, {4700, 143}, {4800, 142}, {4900, 141}, {5000, 140},
-    {5100, 139}, {5200, 138}, {5300, 137}, {5400, 136}, {5500, 135}, {5600, 134},
-    {5700, 133}, {5800, 132}, {5900, 131}, {6000, 130}, {6100, 129}, {6200, 128},
-    {6300, 127}, {6400, 126}, {6500, 125}, {6600, 124}, {6700, 123}, {6800, 122},
-    {6900, 121}, {7000, 120}, {7100, 119}, {7200, 118}, {7300, 117}, {7400, 116},
-    {7500, 115}, {7600, 114}, {7700, 113}, {7800, 112}, {7900, 111}, {8000, 110}
+    {0, 0}, {40, 2}, {80, 4}, {120, 6}, {160, 8}, {200, 10}, {240, 12}, {280, 15},
+    {320, 17}, {360, 19}, {400, 22}, {440, 24}, {480, 26}, {520, 29}, {560, 31}, {600, 34},
+    {640, 36}, {680, 39}, {720, 42}, {760, 44}, {800, 47}, {840, 49}, {880, 52}, {920, 55},
+    {960, 57}, {1000, 60}, {1040, 63}, {1080, 65}, {1120, 68}, {1160, 71}, {1200, 73},
+    {1240, 76}, {1280, 78}, {1320, 81}, {1360, 84}, {1400, 86}, {1440, 89}, {1480, 91},
+    {1520, 94}, {1560, 96}, {1600, 98}, {1640, 101}, {1680, 103}, {1720, 105}, {1760, 108},
+    {1800, 110}, {1840, 112}, {1880, 114}, {1920, 116}, {1960, 118}, {2000, 120}, {2040, 122},
+    {2080, 124}, {2120, 125}, {2160, 127}, {2200, 129}, {2240, 130}, {2280, 132}, {2320, 133},
+    {2360, 135}, {2400, 136}, {2440, 138}, {2480, 139}, {2520, 140}, {2560, 141}, {2600, 142},
+    {2640, 143}, {2680, 144}, {2720, 145}, {2760, 146}, {2800, 147}, {2840, 148}, {2880, 148},
+    {2920, 149}, {2960, 149}, {3000, 150}, {3040, 150}, {3080, 151}, {3120, 151}, {3160, 152},
+    {3200, 152}, {3240, 152}, {3280, 152}, {3320, 152}, {3360, 153}, {3400, 153}, {3440, 153},
+    {3480, 153}, {3520, 153}, {3560, 152}, {3600, 152}, {3640, 152}, {3680, 152}, {3720, 152},
+    {3760, 152}, {3800, 151}, {3840, 151}, {3880, 151}, {3920, 151}, {3960, 150}, {4000, 150},
+    {4040, 150}, {4080, 149}, {4120, 149}, {4160, 149}, {4200, 148}, {4240, 148}, {4280, 148},
+    {4320, 147}, {4360, 147}, {4400, 146}, {4440, 146}, {4480, 146}, {4520, 145}, {4560, 145},
+    {4600, 144}, {4640, 144}, {4680, 143}, {4720, 143}, {4760, 143}, {4800, 142}, {4840, 142},
+    {4880, 141}, {4920, 141}, {4960, 140}, {5000, 140}, {5040, 140}, {5080, 139}, {5120, 139},
+    {5160, 138}, {5200, 138}, {5240, 138}, {5280, 137}, {5320, 137}, {5360, 136}, {5400, 136},
+    {5440, 136}, {5480, 135}, {5520, 135}, {5560, 134}, {5600, 134}, {5640, 134}, {5680, 133},
+    {5720, 133}, {5760, 132}, {5800, 132}, {5840, 132}, {5880, 131}, {5920, 131}, {5960, 130},
+    {6000, 130}, {6040, 130}, {6080, 129}, {6120, 129}, {6160, 128}, {6200, 128}, {6240, 128},
+    {6280, 127}, {6320, 127}, {6360, 126}, {6400, 126}, {6440, 126}, {6480, 125}, {6520, 125},
+    {6560, 124}, {6600, 124}, {6640, 124}, {6680, 123}, {6720, 123}, {6760, 122}, {6800, 122},
+    {6840, 122}, {6880, 121}, {6920, 121}, {6960, 120}, {7000, 120}, {7040, 120}, {7080, 119},
+    {7120, 119}, {7160, 118}, {7200, 118}, {7240, 118}, {7280, 117}, {7320, 117}, {7360, 116},
+    {7400, 116}, {7440, 116}, {7480, 115}, {7520, 115}, {7560, 114}, {7600, 114}, {7640, 114},
+    {7680, 113}, {7720, 113}, {7760, 112}, {7800, 112}, {7840, 112}, {7880, 111}, {7920, 111},
+    {7960, 110}, {8000, 110}
   };
 
-  #define TIMING_RPM_POINTS 81
+  #define TIMING_RPM_POINTS 201
   #define MAX_TIMING_RPM 8000
 
   // Get timing advance angle from RPM using linear interpolation (returns tenths of degrees)
@@ -225,33 +236,27 @@ static inline void schedule_A(uint16_t when) {
 
 // External interrupt: crank trigger
 ISR(INT0_vect) {
-  uint16_t tcnt = TCNT1;                    // Snapshot as early as possible
+  uint16_t tcnt = TCNT1;  // Snapshot Timer1 as early as possible
 
-    engine.n_ticks++;
-    engine.last_interrupt_ticks = engine.this_interrupt_ticks;
-    engine.this_interrupt_ticks = tcnt;
-    engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
+  // Update engine timing state
+  engine.n_ticks++;
+  engine.last_interrupt_ticks = engine.this_interrupt_ticks;
+  engine.this_interrupt_ticks = tcnt;
+  engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
 
-    // Compute RPM directly from ticks (single 32-bit division)
-    uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
+  // Calculate RPM and update engine state
+  uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
+  engine.running = (engine.n_ticks > 2 && rpm <= Timing::MAX_RPM);
 
-    // Compute dwell metrics (unchanged logic)
-    uint16_t dwell_ticks       = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
+  if (engine.running) {
+    // Precompute dwell metrics
+    uint16_t dwell_ticks = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
     uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
-
     engine.next_dwell_ticks = dwell_ticks;
 
-    if(engine.n_ticks>2) {
-      engine.running=true;
-    }
-
-    if (rpm>7000) {
-      engine.running=false;
-    }
-    
-    if (engine.running) {
+    // Schedule dwell start
     schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
-    }
+  }
 }
 
 // Timer1 COMPB interrupt: start dwell (output goes LOW)
@@ -301,20 +306,16 @@ void setup() {
 
 void loop() {
   // Arm relay when D2 is HIGH (with startup delay)
-  bool d2_high = digitalRead(2);
-  
-  if (!sys.relay_armed && d2_high) {
+  if (!sys.relay_armed && digitalRead(2)) {
     if (sys.startup_millis == 0) {
-      sys.startup_millis = millis();  // Record when D2 went HIGH
-    } else if (millis() - sys.startup_millis > 1000) {  // 1 second startup delay
+      sys.startup_millis = millis();  // Record the time when trigger went HIGH
+    } else if (millis() - sys.startup_millis > 1000) {  // 1-second delay
       digitalWrite(RELAY_PIN, HIGH);  // Open relay to arm coil
       sys.relay_armed = true;
       Serial.println(F("Relay armed - coil ready"));
     }
   }
-  
 
-  
   // Print diagnostics every 5 seconds
   if (millis() - sys.last_diagnostic_millis > 5000) {
     if (engine.running) {
@@ -323,3 +324,6 @@ void loop() {
     sys.last_diagnostic_millis = millis();
   }
 }
+
+  
+

@@ -172,16 +172,16 @@ def main():
     rpm_cubic, advance_cubic = smooth_curve_cubic(original_rpm, original_advance, num_points=200)
     print(f"Cubic + SavGol interpolation: Generated {len(rpm_cubic)} points")
     
-    # Generate lookup table at 100 RPM intervals
-    print("\nGenerating lookup table at 100 RPM intervals:")
-    rpm_table, advance_table = generate_lookup_table(rpm_cubic, advance_cubic, step_size=100)
+    # Generate lookup table at 40 RPM intervals for 201 points (0-8000 RPM)
+    print("\nGenerating lookup table at 40 RPM intervals for 201 points:")
+    rpm_table, advance_table = generate_lookup_table(rpm_cubic, advance_cubic, step_size=40)
     print(f"Lookup table: {len(rpm_table)} points from {rpm_table[0]:.0f} to {rpm_table[-1]:.0f} RPM")
     
     # Save curves to CSV files
     save_curves_to_csv('timing_curve_cubic.csv', rpm_cubic, advance_cubic, 
                       "Cubic interpolation with Savitzky-Golay smoothing")
     save_curves_to_csv('timing_lookup_table.csv', rpm_table, advance_table,
-                      "Lookup table at 100 RPM intervals")
+                      "Lookup table at 40 RPM intervals for 201 points")
     
     # Print lookup table for Arduino in the required format
     print("\n// Timing curve: RPM -> advance_degrees_x10 (Cubic + SavGol smoothed)")
@@ -203,37 +203,13 @@ def main():
             print(f"    {{{rpm_int}, {adv_tenths}}} {comment}")
     
     print("};")
-    print(f"\nconst uint8_t TIMING_CURVE_SIZE = {len(rpm_table)};")
+    print(f"\n#define TIMING_RPM_POINTS {len(rpm_table)}")
+    print(f"#define MAX_TIMING_RPM {int(rpm_table[-1])}")
     
-    # Also print a compact version with key points only
-    print("\n// Compact version with key RPM points only:")
-    print("// Advance values are stored as tenths of degrees (multiply by 10)")
-    print("static const uint16_t timing_rpm_curve_compact[][2] PROGMEM = {")
-    
-    # Select key RPM points
-    key_rpms = [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 6500, 7000, 7500, 8000]
-    
-    for i, target_rpm in enumerate(key_rpms):
-        # Find the advance value for this RPM
-        if target_rpm in rpm_table:
-            idx = list(rpm_table).index(target_rpm)
-            adv = advance_table[idx]
-        else:
-            # Interpolate if needed
-            adv = np.interp(target_rpm, rpm_table, advance_table)
-        
-        rpm_int = int(target_rpm)
-        adv_tenths = int(round(adv * 10))  # Store as tenths
-        
-        comment = f"  // {rpm_int} RPM -> {adv:.1f}°"
-        
-        if i < len(key_rpms) - 1:
-            print(f"    {{{rpm_int}, {adv_tenths}}},{comment}")
-        else:
-            print(f"    {{{rpm_int}, {adv_tenths}}} {comment}")
-    
-    print("};")
-    print(f"\nconst uint8_t TIMING_CURVE_COMPACT_SIZE = {len(key_rpms)};")
+    # Print usage instructions
+    print(f"\n// This 201-point curve provides {40} RPM resolution from 0-{int(rpm_table[-1])} RPM")
+    print("// Use with the existing get_advance_angle_tenths(rpm) function")
+    print("// which performs linear interpolation between adjacent points")
     
     # Plot curve
     plot_curve(original_rpm, original_advance, rpm_cubic, advance_cubic)
