@@ -90,12 +90,9 @@
   ],
   "connections": [
     [ "chip1:GND", "uno:GND.1", "black", [ "h-48", "v48", "h173.1" ] ],
-    [ "logic1:D2", "uno:2", "green", [ "h0" ] ],
-    [ "logic1:D3", "uno:3", "green", [ "h0" ] ],
     [ "logic1:GND", "r1:2", "black", [ "h-96", "v-124.8" ] ],
     [ "r1:2", "uno:GND.1", "black", [ "h27.6", "v76.8", "h-208.8", "v47.4" ] ],
     [ "r1:1", "btn1:2.r", "green", [ "v0" ] ],
-    [ "chip1:PULSE", "uno:2", "green", [ "h0" ] ],
     [ "chip1:VCC", "btn1:1.r", "red", [ "h-28.8", "v-86.4", "h230.4", "v28.8" ] ],
     [ "gnd1:GND", "r2:2", "black", [ "v0" ] ],
     [ "r2:1", "btn3:2.r", "green", [ "h-0.55", "v-8.75" ] ],
@@ -117,7 +114,11 @@
     [ "vcc2:VCC", "btn4:1.r", "red", [ "v0" ] ],
     [ "gnd3:GND", "r4:2", "black", [ "v-19.2" ] ],
     [ "r4:1", "btn4:2.r", "green", [ "h0", "v-38.4" ] ],
-    [ "r4:1", "chip1:SWEEP", "green", [ "h86.4", "v-172.8", "h326.4", "v192" ] ]
+    [ "r4:1", "chip1:SWEEP", "green", [ "h86.4", "v-172.8", "h326.4", "v192" ] ],
+    [ "chip1:PULSE", "uno:2", "green", [ "h0" ] ],
+    [ "uno:2", "logic1:D2", "green", [ "v0" ] ],
+    [ "uno:3", "logic1:D3", "green", [ "v0" ] ],
+    [ "uno:4", "logic1:D4", "green", [ "v-38.4", "h224.7" ] ]
   ],
   "dependencies": { "chip-scope": "github:Dlloydev/Wokwi-Chip-scope@1.0.7" }
 }
