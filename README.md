@@ -28,6 +28,7 @@ This project implements a sophisticated ignition timing controller using an Ardu
 - **Startup Protection**: 2-tick stabilization before enabling ignition
 - **Duty Cycle Protection**: Prevents coil overheating at high RPM
 - **Clean Initialization**: All outputs grounded during startup
+- **Relay Protection**: D4 relay keeps coil grounded until D2 is stable HIGH for 1 second
 
 ## Hardware Configuration
 
@@ -35,7 +36,8 @@ This project implements a sophisticated ignition timing controller using an Ardu
 | Pin | Function | Description |
 |-----|----------|-------------|
 | D2 | Trigger Input (INT0) | Falling edge trigger from crank sensor (47° BTDC) |
-| D3 | Ignition Output | Coil control (HIGH = dwell, LOW = spark) |
+| D3 | Ignition Output | Coil control (HIGH→LOW = start dwell, LOW→HIGH = fire spark) |
+| D4 | Safety Relay | Relay control (HIGH = armed/open, LOW = safe/closed at startup) |
 
 ### Engine Parameters
 - **Trigger Configuration**: 2 pulses per revolution (2 lobes, 180° apart)
@@ -60,11 +62,11 @@ Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
    - Schedules Compare B interrupt for dwell start
 
 2. **Compare B ISR** (`TIMER1_COMPB_vect`):
-   - Sets ignition output HIGH (start dwell)
+   - Sets ignition output LOW (start dwell/coil charging)
    - Schedules Compare A for spark
 
 3. **Compare A ISR** (`TIMER1_COMPA_vect`):
-   - Sets ignition output LOW (fire spark)
+   - Sets ignition output HIGH (fire spark/coil discharge)
    - Completes timing cycle
 
 ### Timing Calculations
@@ -207,11 +209,11 @@ This generates:
    - Test noise immunity and EMI resistance
    - Confirm timing accuracy with strobe light
 
-2. **Safety Relay Implementation**
-   - Add relay isolation for coil power during initialization
-   - Implement hardware watchdog for coil cutout on failure
-   - Add over-temperature protection for coil
-   - Ensure fail-safe grounding of coil during all error states
+2. **Safety Relay Implementation** ✅
+   - D4 relay provides coil isolation during initialization
+   - Relay arms 1 second after D2 goes HIGH (stable trigger signal)
+   - Fail-safe: Relay defaults to closed (coil grounded) on power-up
+   - Once armed, relay remains open during operation
 
 3. **Additional Safety Features**
    - Add backup rev limiter in hardware

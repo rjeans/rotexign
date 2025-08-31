@@ -5,8 +5,8 @@
   It uses Timer1 and external interrupts to precisely control ignition timing and dwell based on engine RPM.
   The timing advance curve is stored in PROGMEM and interpolated for smooth operation.
   Output is provided on FIRE_PIN, and diagnostic information is printed periodically via Serial.
-  Author: [Your Name]
-  Date: [Date]
+  Author: Richard Jeans
+  Date: 31 Aug 2025
 */
 
 #include <avr/interrupt.h>
@@ -24,7 +24,8 @@ static EngineState engine;
 
 struct SystemState {
   volatile uint32_t last_diagnostic_millis = 0;
-
+  volatile uint32_t startup_millis = 0;
+  volatile bool relay_armed = false;
 };
 
 static volatile SystemState sys;
@@ -205,6 +206,7 @@ namespace SerialInterface {
 #define FIRE_DDR   DDRD
 #define FIRE_BIT   PD3
 constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
+constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
 constexpr uint16_t PRESCALE_BITS = _BV(CS11) | _BV(CS10); // /64 -> 4us/tick
 
 // Schedule a COMPB one-shot at absolute tick 'when'
@@ -230,16 +232,12 @@ ISR(INT0_vect) {
     engine.this_interrupt_ticks = tcnt;
     engine.period_ticks = (uint16_t)(engine.this_interrupt_ticks - engine.last_interrupt_ticks);
 
-   
-
     // Compute RPM directly from ticks (single 32-bit division)
     uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
 
     // Compute dwell metrics (unchanged logic)
     uint16_t dwell_ticks       = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
     uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
-
-   
 
     engine.next_dwell_ticks = dwell_ticks;
 
@@ -254,13 +252,12 @@ ISR(INT0_vect) {
     if (engine.running) {
     schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
     }
-  
 }
 
-// Timer1 COMPB interrupt: start ignition pulse
+// Timer1 COMPB interrupt: start dwell (output goes LOW)
 ISR(TIMER1_COMPB_vect) {
-  // Fast pin set
-  FIRE_PORT |= _BV(FIRE_BIT);
+  // Fast pin clear - LOW to start dwell
+  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
   TIMSK1 &= ~_BV(OCIE1B);
 
   const uint16_t width_ticks = engine.next_dwell_ticks;
@@ -268,10 +265,10 @@ ISR(TIMER1_COMPB_vect) {
   schedule_A(t_off);
 }
 
-// Timer1 COMPA interrupt: end ignition pulse
+// Timer1 COMPA interrupt: fire spark (output goes HIGH)
 ISR(TIMER1_COMPA_vect) {
-  // Fast pin clear
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  // Fast pin set - HIGH to fire spark
+  FIRE_PORT |= _BV(FIRE_BIT);
   TIMSK1 &= ~_BV(OCIE1A);
 }
 
@@ -281,7 +278,11 @@ void setup() {
 
   // Replace pinMode/digitalWrite for FIRE_PIN with direct register setup
   FIRE_DDR  |= _BV(FIRE_BIT);
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  FIRE_PORT |= _BV(FIRE_BIT);  // Initialize HIGH (safe state - no dwell)
+
+  // Initialize relay control pin (D4 = PD4)
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);  // Start with relay closed (safe state - coil grounded)
 
   // INT0 on falling edge (D2)
   pinMode(2, INPUT_PULLUP);
@@ -299,6 +300,21 @@ void setup() {
 }
 
 void loop() {
+  // Arm relay when D2 is HIGH (with startup delay)
+  bool d2_high = digitalRead(2);
+  
+  if (!sys.relay_armed && d2_high) {
+    if (sys.startup_millis == 0) {
+      sys.startup_millis = millis();  // Record when D2 went HIGH
+    } else if (millis() - sys.startup_millis > 1000) {  // 1 second startup delay
+      digitalWrite(RELAY_PIN, HIGH);  // Open relay to arm coil
+      sys.relay_armed = true;
+      Serial.println(F("Relay armed - coil ready"));
+    }
+  }
+  
+
+  
   // Print diagnostics every 5 seconds
   if (millis() - sys.last_diagnostic_millis > 5000) {
     if (engine.running) {

@@ -7,11 +7,14 @@ This document provides the theoretical background, physical principles, and desi
 
 ### 2.1 Ignition Coil Operation
 - The ignition coil stores energy when current flows through its primary winding. This charging period is called the **dwell time**.
-- The coil fires (discharges) when the input pulse goes low, creating a high-voltage spark on the secondary side.
+- In this implementation:
+  - **Dwell starts** (coil charging) when output goes HIGH→LOW 
+  - **Spark fires** (coil discharges) when output goes LOW→HIGH
+- This creates a high-voltage spark on the secondary side at the rising edge.
 
 ### 2.2 Dwell Time
-- **Dwell time** is the duration of the pulse that keeps the coil energized (charging).
-- Example: If the Arduino drives a 5 V pulse of 3 ms duration, then the dwell time is 3 ms.
+- **Dwell time** is the duration the output stays LOW, keeping the coil energized (charging).
+- Example: If the Arduino drives the output LOW for 3 ms, then the dwell time is 3 ms.
 
 ### 2.3 Duty Cycle
 - The **duty cycle** is the ratio of the dwell time to the total period between successive sparks:
@@ -44,7 +47,7 @@ This document provides the theoretical background, physical principles, and desi
 - Maximum dwell at 14 V: **9 ms**
 - Recommended dwell at 12 V: **~3 ms**
 
-The software must **never leave the output high continuously**, otherwise the coil burns out.
+The software must **never leave the output LOW continuously** (since LOW = dwell/charging state), otherwise the coil burns out. The output defaults to HIGH (safe state) on startup.
 
 ## 4. Duty Cycle and Safe Dwell vs RPM
 At low RPM the dwell can be kept near 3 ms, but as RPM rises the period per spark shrinks, forcing the duty cycle up. Above ~4000 RPM, a fixed 3 ms dwell exceeds the 40% duty cap.
@@ -87,8 +90,12 @@ Full table: see [previous_lobe_switch_points.csv](previous_lobe_switch_points.cs
    - 40% duty-cycle limit (varies with RPM)
    - Absolute maximum 9 ms
 2. Use **same-lobe timing** up to ~1800 RPM, then switch to **previous-lobe timing**.
-3. Ensure software never leaves the output high; outputs must be grounded safely during startup.
+3. Ensure software never leaves the output in dwell state continuously; outputs must default HIGH (safe) during startup.
 4. Stabilization period: Skip first 2 trigger pulses to allow timing calculations to settle.
+5. **Safety relay on D4**: Keeps coil grounded until D2 is stable HIGH for 1 second, then arms (opens relay).
+   - Relay closed (LOW): Coil grounded, protected state at startup
+   - Relay open (HIGH): Coil armed, ready to fire
+   - Once armed, relay remains open during operation
 
 ## 7. Implementation Notes
 

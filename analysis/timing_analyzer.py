@@ -16,12 +16,12 @@ from typing import List, Tuple, Dict
 SIGNAL_MAPPINGS = {
     '0#': 'trigger_fall',
     '1#': 'trigger_rise',
-    '0$': 'spark_fall',
-    '1$': 'dwell_start',
+    '0$': 'dwell_start',  # Spark signal goes LOW to start dwell (coil charging)
+    '1$': 'spark_fire',   # Spark signal goes HIGH to fire spark (coil discharge)
     '0!': 'trigger_fall',  # Legacy
     '1!': 'trigger_rise',  # Legacy
-    '0"': 'spark_fall',    # Legacy
-    '1"': 'dwell_start'    # Legacy
+    '0"': 'dwell_start',    # Legacy
+    '1"': 'spark_fire'   # Legacy
 }
 
 def parse_vcd_file(vcd_file: str) -> List[Tuple[int, str]]:
@@ -75,6 +75,8 @@ def calculate_rpm(period_ns: int, pulses_per_revolution: int = 2) -> float:
     Returns:
         The calculated RPM.
     """
+    if period_ns == 0:
+        return 0
     period_us = period_ns / 1000.0
     return (60_000_000.0 / period_us) / pulses_per_revolution
 
@@ -94,9 +96,9 @@ def find_corresponding_dwell(signal_changes: List[Tuple[int, str]], spark_idx: i
         check_time, check_event = signal_changes[k]
         if spark_time - check_time > 200000000:  # Stop if too far back (200ms)
             break
-        if check_event == 'dwell_start':
+        if check_event == 'dwell_start':  # Look for dwell_start (falling edge)
             spark_between = any(
-                signal_changes[m][1] == 'spark_fall'
+                signal_changes[m][1] == 'spark_fire'  # Check for other sparks between
                 for m in range(k + 1, spark_idx)
             )
             if not spark_between:
@@ -157,12 +159,12 @@ def find_trigger_pulse_width(signal_changes, trigger_fall_idx):
 
 def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
     """
-    Analyze VCD timing with simplified logic:
+    Analyze VCD timing with updated logic:
     1. Find trigger edge T0
     2. Find next trigger edge T1  
-    3. Find next dwell start D0
+    3. Find next dwell start D0 (falling edge of spark signal)
     4. If T1 < D0 then missing, go to next trigger
-    5. Find spark trailing edge S0
+    5. Find spark fire S0 (rising edge of spark signal)
     6. Advance = S0 - T0, if S0 > T1 then subtract period (previous lobe)
     """
     signal_changes = parse_vcd_file(vcd_file)
@@ -211,14 +213,14 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
             i += 1
             continue  # No next trigger found
         
-        # Step 3: Find next dwell start D0
+        # Step 3: Find next dwell start D0 (falling edge of spark signal)
         D0 = None
         k = i + 1
         while k < len(signal_changes):
             check_time, check_event = signal_changes[k]
             if check_time >= T1:
                 break  # Gone past next trigger
-            if check_event == 'dwell_start':
+            if check_event == 'dwell_start':  # Falling edge starts dwell
                 D0 = check_time
                 break
             k += 1
@@ -233,7 +235,7 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
             i += 1
             continue
             
-        # Step 5: Find spark trailing edge S0
+        # Step 5: Find spark fire S0 (rising edge of spark signal)
         S0 = None
         dwell_time = None
         m = k + 1
@@ -242,7 +244,7 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
             # Don't stop at T1 - spark might be in next period for previous-lobe
             if (check_time - T0) > 200000000:  # 200ms max search
                 break
-            if check_event == 'spark_fall':
+            if check_event == 'spark_fire':  # Rising edge fires spark
                 S0 = check_time
                 dwell_time = (S0 - D0) / 1000.0  # microseconds
                 break
@@ -653,19 +655,19 @@ def create_waveforms_plot(timing_events):
                 pulse_mask = (time_us >= pulse_start) & (time_us <= pulse_end)
                 trigger_signal[pulse_mask] = 0
         
-        # Generate spark signal (normally LOW, HIGH during dwell, brief LOW spike at spark)
-        spark_signal = np.zeros_like(time_us)
+        # Generate spark signal (normally HIGH, goes LOW during dwell, returns HIGH at spark)
+        spark_signal = np.ones_like(time_us) * 2  # Default HIGH
         for trigger_time in [0, period_us, period_us * 2]:
             spark_time = trigger_time + delay_us
             dwell_start_time = spark_time - dwell_us
             
             if spark_time < time_span_us and dwell_start_time >= 0:
-                # Add dwell period (HIGH = coil charging)
+                # Dwell period: signal goes LOW (coil charging)
                 dwell_mask = (time_us >= dwell_start_time) & (time_us < spark_time)
-                spark_signal[dwell_mask] = 2
+                spark_signal[dwell_mask] = 0
                 
-                # Spark event is the falling edge at spark_time (end of dwell)
-                # The signal naturally drops to 0 after dwell ends
+                # Spark fires on rising edge at spark_time (end of dwell)
+                # The signal returns to HIGH after dwell ends
         
         # Plot signals
         ax = axes[i]
