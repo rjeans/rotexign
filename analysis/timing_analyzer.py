@@ -174,31 +174,35 @@ def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
     missing_spark_events = []
     
     i = 0
+    last_valid_trigger_time = None  # Track last trigger that passed the period filter
     while i < len(signal_changes):
         time, event = signal_changes[i]
         
         if event != 'trigger_fall':
             i += 1
             continue
-            
-        # Step 1: Found trigger edge T0
+
         T0 = time
-        
-        # Step 1a: Find PREVIOUS trigger edge T-1 for period calculation
-        T_prev = None
-        for k in range(i - 1, -1, -1):
-            if signal_changes[k][1] == 'trigger_fall':
-                T_prev = signal_changes[k][0]
-                break
-        
+
+        # Use last_valid_trigger_time for period calculation
+        T_prev = last_valid_trigger_time
+
         if T_prev is None:
+            last_valid_trigger_time = T0
             i += 1
-            continue  # No previous trigger, skip first trigger
-            
-        # Calculate period and RPM from T-1 to T0
+            continue  # No previous valid trigger, skip first
+
         period_ns = T0 - T_prev
+        if period_ns < 4_000_000:
+            # Do not update last_valid_trigger_time, skip this trigger
+            i += 1
+            continue
+
         rpm = calculate_rpm(period_ns)
-        
+
+        # Only now update last_valid_trigger_time
+        last_valid_trigger_time = T0
+
         # Step 2: Find next trigger edge T1 (for detecting missing sparks)
         T1 = None
         j = i + 1
@@ -398,7 +402,7 @@ def generate_csv_output(timing_events, missing_spark_events):
             if safe_val != 0:
                 error_percent = (error_degrees / safe_val) * 100
             else:
-                error_percent = error_degrees * 100  # If safe is 0, treat error as percentage
+                error_percent = error_degrees * 100  # If safe value is 0, treat error as percentage
             
             # Calculate period in microseconds (60,000,000 / (rpm * 2))
             period_us = 60_000_000 / (event['rpm'] * 2) if event['rpm'] > 0 else 0
@@ -423,7 +427,7 @@ def generate_csv_output(timing_events, missing_spark_events):
     # Missing sparks CSV
     with open('wokwi-logic-missing-sparks.csv', 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['time_sec', 'rpm', 'reason'])
+        writer.writerow(['time_sec', 'rpm', 'reason']);
         
         for event in missing_spark_events:
             writer.writerow([

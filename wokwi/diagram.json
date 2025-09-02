@@ -118,7 +118,8 @@
     [ "chip1:PULSE", "uno:2", "green", [ "h0" ] ],
     [ "uno:2", "logic1:D2", "green", [ "v0" ] ],
     [ "uno:3", "logic1:D3", "green", [ "v0" ] ],
-    [ "uno:4", "logic1:D4", "green", [ "v-38.4", "h224.7" ] ]
+    [ "uno:4", "logic1:D4", "green", [ "v-38.4", "h224.7" ] ],
+    [ "chip1:SPARK", "uno:3", "green", [ "h0" ] ]
   ],
   "dependencies": { "chip-scope": "github:Dlloydev/Wokwi-Chip-scope@1.0.7" }
 }

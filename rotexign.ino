@@ -59,7 +59,7 @@ namespace Timing {
   const uint16_t MAX_DUTY_CYCLE = 40; 
   const uint16_t NOMINAL_DWELL_US = 3000;
   const uint16_t MAX_RPM = 7000;
-  const uint16_t DWELL_TO_TRIGGER_MARGIN_US = 20;
+  const uint16_t DWELL_TO_TRIGGER_MARGIN_US = 40;
   const uint16_t TRIGGER_BTDC_TENTHS = 470;  // 47.0 degrees in tenths
   const uint8_t  PULSES_PER_REVOLUTION = 2;
 
@@ -235,6 +235,7 @@ static inline void schedule_A(uint16_t when) {
   TIMSK1 |= _BV(OCIE1A);
 }
 
+
 // External interrupt: crank trigger
 ISR(INT0_vect) {
   uint16_t tcnt = TCNT1;  // Snapshot Timer1 as early as possible
@@ -242,12 +243,23 @@ ISR(INT0_vect) {
   // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
   uint16_t period_ticks_candidate = (uint16_t)(tcnt - engine.this_interrupt_ticks);
   
-  // Pulse filtering: reject very short periods (debounce/noise) using ticks directly
-  // MIN_TRIGGER_PERIOD_US = 400us = 100 ticks at 4us/tick
-  if (period_ticks_candidate < 100) {
-    return;  // Ignore this trigger - likely bounce or noise
-  }
+  const uint16_t min_ticks_by_rpm = 1000;
 
+  //min_valid_ticks = max(engine.period_ticks / 10, min_ticks_by_rpm); // 30% or absolute min 
+
+  
+  
+  // 30% window filter: ignore triggers that are less than 30% of the previous period
+  // Only apply if we have a valid previous period
+  if (engine.n_starting_ticks > 2 && period_ticks_candidate < min_ticks_by_rpm) {
+    
+ 
+      return;  // Ignore this trigger - likely bounce or noise
+    
+  }
+  
+  
+ 
   // Update engine timing state
  
   engine.last_interrupt_ticks = engine.this_interrupt_ticks;
@@ -264,7 +276,12 @@ ISR(INT0_vect) {
   uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
   engine.running = ( rpm <= Timing::MAX_RPM);
 
+
+
+      
+
   if (engine.running) {
+ 
     // Precompute dwell metrics
     uint16_t dwell_ticks = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
     uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
@@ -324,6 +341,8 @@ void setup() {
   sei();
 }
 
+
+
 void loop() {
   // Arm relay when D2 is HIGH (with startup delay)
   if (!sys.relay_armed && digitalRead(2)) {
@@ -338,12 +357,12 @@ void loop() {
 
   // Print diagnostics every 5 seconds
   if (millis() - sys.last_diagnostic_millis > 5000) {
-    
-      SerialInterface::print_status();
-    
+    SerialInterface::print_status();
     sys.last_diagnostic_millis = millis();
   }
+
+ 
 }
 
-  
+
 

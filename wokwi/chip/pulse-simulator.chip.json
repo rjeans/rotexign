@@ -9,7 +9,8 @@
     "UP",
     "DOWN",
     "SWEEP",
-    "PULSE"
+    "PULSE",
+    "SPARK"
   ]
   
 }

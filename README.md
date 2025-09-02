@@ -27,7 +27,9 @@ This project implements a sophisticated ignition timing controller using an Ardu
 - **Rev Limiter**: Hard cut at 7000 RPM with immediate interrupt cancellation
 - **Startup Protection**: 3-trigger stabilization before enabling ignition
 - **Duty Cycle Protection**: Prevents coil overheating at high RPM
-- **Input Pulse Filtering**: Hardware-level debounce (400μs minimum period) in interrupt handler
+- **Input Pulse Filtering**: Dual-stage filtering system:
+  - Hardware debounce: 400μs minimum period rejection in interrupt handler
+  - Exponential moving average: Smooths period measurements to reduce jitter (α=0.3)
 - **Interrupt Cancellation**: Automatically disables dwell/spark interrupts when engine stops
 - **Clean Initialization**: All outputs grounded during startup
 - **Relay Protection**: D4 relay keeps coil grounded until D2 is stable HIGH for 1 second
@@ -60,8 +62,9 @@ Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
 1. **Trigger ISR** (`INT0_vect`):
    - Captures Timer1 count immediately
    - Filters trigger pulses to reject noise/bounce (periods <400μs)
+   - Applies exponential moving average to smooth period measurements
    - Waits for 3-trigger stabilization before enabling ignition
-   - Calculates period from previous trigger
+   - Calculates period from filtered trigger data
    - Computes RPM and required timing
    - Schedules Compare B interrupt for dwell start or cancels interrupts if engine stops
 

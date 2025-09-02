@@ -19,7 +19,7 @@ static bool last_ignition_pin = false;  // Previous ignition pin state for edge 
 // Auto-sweep mode variables
 static bool auto_sweep_active = false;  // Auto-sweep mode active
 static float auto_sweep_time = 0;       // Time at current RPM step
-static const float AUTO_SWEEP_DURATION = 2.0f;  // 5 seconds at each RPM
+static const float AUTO_SWEEP_DURATION = 2.0f;  // 2 seconds at each RPM
 static const float AUTO_SWEEP_STEP = 200.0f;    // 200 RPM increment
 
  // RPM range: idle (800 RPM) to max (8000 RPM)
@@ -28,6 +28,8 @@ static const float MAX_RPM = 8000.0f;
 static const float RPM_CHANGE = 200.0f;
 
 static float rpm = 0;
+static int noise_pulse=1000;
+static timer_t noise_timer_id;
     
 
 
@@ -37,6 +39,7 @@ typedef struct {
   pin_t pin_throttle_up;  
   pin_t pin_throttle_down;
   pin_t pin_auto_sweep;     // Auto-sweep button
+  pin_t pin_spark;     
 } chip_state_t;
 
 
@@ -44,10 +47,13 @@ typedef struct {
 
 
 static void chip_timer_event(void *user_data);
+static void noise_timer_event(void *user_data);
+
 static void ignition_change(void * user_data, pin_t pin, uint32_t value);
 static void throttle_up(void * user_data, pin_t pin, uint32_t value);
 static void throttle_down(void * user_data, pin_t pin, uint32_t value);
 static void auto_sweep_button(void * user_data, pin_t pin, uint32_t value);
+static void spark(void * user_data, pin_t pin, uint32_t value);
 
 void chip_init(void) {
   chip_state_t *chip = malloc(sizeof(chip_state_t));
@@ -57,9 +63,15 @@ void chip_init(void) {
   chip->pin_throttle_up = pin_init("UP", INPUT);     
   chip->pin_throttle_down = pin_init("DOWN", INPUT);
   chip->pin_auto_sweep = pin_init("SWEEP", INPUT);        // Auto-sweep button     
+  chip->pin_spark = pin_init("SPARK", INPUT);        
 
   const timer_config_t timer_config = {
     .callback = chip_timer_event,
+    .user_data = chip,
+  };
+
+  const timer_config_t noise_timer_config = {
+    .callback = noise_timer_event,
     .user_data = chip,
   };
 
@@ -87,13 +99,22 @@ void chip_init(void) {
    .user_data = chip
 };
 
+  const pin_watch_config_t spark_config = {
+   .edge = RISING,
+   .pin_change = spark,
+   .user_data = chip
+};
+
   pin_watch(chip->pin_ignition_switch,&ign_config);
  pin_watch(chip->pin_throttle_up,&throttle_up_config);
  pin_watch(chip->pin_throttle_down,&throttle_down_config);
  pin_watch(chip->pin_auto_sweep,&auto_sweep_config);
+pin_watch(chip->pin_spark,&spark_config);
 
   timer_t timer_id = timer_init(&timer_config);
   timer_start(timer_id, interval, true);
+
+  noise_timer_id = timer_init(&noise_timer_config);
   
   printf("[PULSE_GEN] Initialized - Ignition simulator mode\n");
   printf("[PULSE_GEN] IGN pin: Send pulse to toggle ignition on/off\n");
@@ -101,6 +122,17 @@ void chip_init(void) {
   printf("[PULSE_GEN] SWEEP pin: Auto-sweep from idle to max RPM\n");
 }
 
+void spark(void * user_data, pin_t pin, uint32_t value) {
+
+  chip_state_t *chip = (chip_state_t*)user_data;
+
+   if((rand() % 10 )==0) {
+    pin_write(chip->pin_out_pulse, LOW);  // LOW = GND (trigger pulse)
+ 
+    timer_start(noise_timer_id,noise_pulse,false);
+   }
+
+}
 void ignition_change(void * user_data, pin_t pin, uint32_t value) {
   ignition_on = !ignition_on;
   if (ignition_on) {
@@ -155,6 +187,15 @@ void auto_sweep_button(void * user_data, pin_t pin, uint32_t value) {
     printf("[PULSE_GEN] Auto-sweep stopped at RPM %.0f\n", rpm);
   }
 }
+
+void noise_timer_event(void *user_data) {
+  chip_state_t *chip = (chip_state_t*)user_data;
+
+ 
+  pin_write(chip->pin_out_pulse, HIGH);  // LOW = GND (trigger pulse)
+ 
+}
+ 
 
 void chip_timer_event(void *user_data) {
   chip_state_t *chip = (chip_state_t*)user_data;
