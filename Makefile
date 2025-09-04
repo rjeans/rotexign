@@ -1,35 +1,53 @@
-
 # --- Project layout ---
 SKETCH        := rotexign
-SKETCH_DIR    := firmware/$(SKETCH)
+SKETCH_DIR    := .
 BUILD_DIR     := build
+SKETCH_SRC    := $(SKETCH_DIR)/$(SKETCH).ino
 
 
 
 
 TARGET_HEX    := $(BUILD_DIR)/$(SKETCH).ino.hex
-TARGET_ELF    := $(BUILD_DIR)/$(SKETCH).ino.elf
 
 # --- Arduino ---
 FQBN          := arduino:avr:uno
 
-# --- WASM ---
-WASI_SYSROOT := /opt/wasi-sysroot
+
+
+# --- Environment ---
+ifneq ("$(wildcard .env)","")
+  include .env
+  export
+endif
+
+# --- WASM chip build ---
+CHIP_SRC      := wokwi/chip/pulse-simulator.chip.c
+CHIP_JSON     := wokwi/chip/pulse-simulator.chip.json
+CHIP_WASM     := $(BUILD_DIR)/pulse-simulator.chip.wasm
+
+# Default clang command if not set in environment
+CLANG_CHIP ?= clang 
+CLANG_OPTIONS := --target=wasm32-unknown-wasi -nostartfiles -Wl,--import-memory -Wl,--export-table -Wl,--no-entry -Werror
 
 # --- Phonies ---
 .PHONY: all clean 
 
-all: $(TARGET_JSON) $(TARGET_HEX) $(TARGET_WASM)
+all: $(TARGET_JSON) $(TARGET_HEX) $(TARGET_WASM) $(CHIP_WASM) $(BUILD_DIR)/pulse-simulator.chip.json
 
 # -------- Firmware (Arduino CLI) --------
-$(TARGET_HEX): | $(BUILD_DIR)
+$(TARGET_HEX): $(SKETCH_SRC) | $(BUILD_DIR)
 	@echo "Compiling Arduino sketch..."
 	arduino-cli compile --fqbn "$(FQBN)" --output-dir "$(BUILD_DIR)" --warnings default "$(SKETCH_DIR)"
-	@test -f "$(TARGET_ELF)" || (echo "ERROR: ELF file not generated" && exit 1)
-	@test -f "$(TARGET_HEX)" || (echo "ERROR: HEX file not generated" && exit 1)
+	@test -f "$(TARGET_HEX)" || (echo "ERROR: HEX file $(TARGET_HEX) not generated" && exit 1)
 	@echo "Arduino compilation successful"
 
+$(CHIP_WASM): $(CHIP_SRC) | $(BUILD_DIR)
+	@echo "Compiling chip code to WASM..."
+	$(CLANG_CHIP) $(CLANG_OPTIONS) -o $@ $<
 
+$(BUILD_DIR)/pulse-simulator.chip.json: $(CHIP_JSON) | $(BUILD_DIR)
+	@echo "Copying chip JSON to build directory..."
+	cp $< $@
 
 # Ensure build dir exists
 $(BUILD_DIR):
@@ -40,4 +58,9 @@ $(BUILD_DIR):
 list: all
 	@echo "Build outputs:"
 	@ls -la $(BUILD_DIR)/
+
+
+clean:
+	@echo "Cleaning build outputs..."
+	rm -rf $(BUILD_DIR)
 

@@ -25,3 +25,8 @@ tmp/
 .pio/
 .pioenvs/
 .clangd
+
+wokwi/wokwi-token.sh
+
+.env
+

@@ -5,10 +5,7 @@
   "pins": [
     "GND",
     "VCC",
-    "IGN",
-    "UP",
-    "DOWN",
-    "SWEEP",
+    "READY",
     "PULSE",
     "SPARK"
   ]

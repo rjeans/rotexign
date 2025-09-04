@@ -6,53 +6,8 @@
     { "type": "wokwi-arduino-uno", "id": "uno", "top": 0.6, "left": -0.6, "attrs": {} },
     { "type": "wokwi-logic-analyzer", "id": "logic1", "top": -76.45, "left": 432, "attrs": {} },
     { "type": "chip-pulse-simulator", "id": "chip1", "top": -94.98, "left": -14.4, "attrs": {} },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn1",
-      "top": -147.4,
-      "left": 115.2,
-      "attrs": { "color": "green", "xray": "", "bounce": "0", "label": "Ignition" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "r1",
-      "top": -120.85,
-      "left": 240,
-      "attrs": { "value": "1000" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn2",
-      "top": -99.4,
-      "left": -182.4,
-      "attrs": { "color": "green", "xray": "", "bounce": "0", "label": "Up" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn3",
-      "top": -22.6,
-      "left": -182.4,
-      "attrs": { "color": "green", "xray": "1", "bounce": "0", "label": "Down" }
-    },
-    {
-      "type": "wokwi-resistor",
-      "id": "r2",
-      "top": 42.35,
-      "left": -115.2,
-      "rotate": 90,
-      "attrs": { "value": "1000" }
-    },
     { "type": "wokwi-gnd", "id": "gnd1", "top": 96, "left": -96.6, "attrs": {} },
     { "type": "wokwi-vcc", "id": "vcc1", "top": -162.44, "left": -96, "attrs": {} },
-    {
-      "type": "wokwi-resistor",
-      "id": "r3",
-      "top": -44.05,
-      "left": -268.8,
-      "rotate": 90,
-      "attrs": { "value": "1000" }
-    },
-    { "type": "wokwi-gnd", "id": "gnd2", "top": 38.4, "left": -250.2, "attrs": {} },
     {
       "type": "chip-scope",
       "id": "scope1",
@@ -69,56 +24,18 @@
         "trace2Color": "10",
         "trace3Color": "2"
       }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn4",
-      "top": -166.6,
-      "left": -393.6,
-      "attrs": { "color": "green", "xray": "1", "label": "Auto Sweep", "bounce": "0" }
-    },
-    { "type": "wokwi-vcc", "id": "vcc2", "top": -268.04, "left": -307.2, "attrs": {} },
-    { "type": "wokwi-gnd", "id": "gnd3", "top": -19.2, "left": -307.8, "attrs": {} },
-    {
-      "type": "wokwi-resistor",
-      "id": "r4",
-      "top": -72,
-      "left": -326.95,
-      "rotate": 90,
-      "attrs": { "value": "1000" }
     }
   ],
   "connections": [
-    [ "chip1:GND", "uno:GND.1", "black", [ "h-48", "v48", "h173.1" ] ],
-    [ "logic1:GND", "r1:2", "black", [ "h-96", "v-124.8" ] ],
-    [ "r1:2", "uno:GND.1", "black", [ "h27.6", "v76.8", "h-208.8", "v47.4" ] ],
-    [ "r1:1", "btn1:2.r", "green", [ "v0" ] ],
-    [ "chip1:VCC", "btn1:1.r", "red", [ "h-28.8", "v-86.4", "h230.4", "v28.8" ] ],
-    [ "gnd1:GND", "r2:2", "black", [ "v0" ] ],
-    [ "r2:1", "btn3:2.r", "green", [ "h-0.55", "v-8.75" ] ],
-    [ "r2:1", "chip1:DOWN", "green", [ "h-0.55", "v-47.15", "h220.8", "v-28.8" ] ],
-    [ "vcc1:VCC", "btn3:1.r", "red", [ "v86.4", "h-19.2", "v38.4" ] ],
-    [ "vcc1:VCC", "btn2:1.r", "red", [ "v0" ] ],
-    [ "gnd2:GND", "r3:2", "black", [ "v0" ] ],
-    [ "r3:1", "btn2:2.r", "green", [ "h37.85", "v29.65", "h96", "v-28.8" ] ],
-    [ "btn2:2.r", "chip1:UP", "green", [ "h77", "v9.8" ] ],
-    [
-      "r1:1",
-      "chip1:IGN",
-      "green",
-      [ "v-86.4", "h-307.2", "v124.8", "h19.2", "v0", "h9.6", "v9.6", "h28.8" ]
-    ],
     [ "vcc1:VCC", "chip1:VCC", "red", [ "v0" ] ],
     [ "logic1:D2", "scope1:D0", "green", [ "h-48", "v9.6" ] ],
     [ "logic1:D3", "scope1:D1", "green", [ "h-38.4", "v172.8" ] ],
-    [ "vcc2:VCC", "btn4:1.r", "red", [ "v0" ] ],
-    [ "gnd3:GND", "r4:2", "black", [ "v-19.2" ] ],
-    [ "r4:1", "btn4:2.r", "green", [ "h0", "v-38.4" ] ],
-    [ "r4:1", "chip1:SWEEP", "green", [ "h86.4", "v-172.8", "h326.4", "v192" ] ],
     [ "chip1:PULSE", "uno:2", "green", [ "h0" ] ],
     [ "uno:2", "logic1:D2", "green", [ "v0" ] ],
     [ "uno:3", "logic1:D3", "green", [ "v0" ] ],
     [ "uno:4", "logic1:D4", "green", [ "v-38.4", "h224.7" ] ],
+    [ "gnd1:GND", "chip1:GND", "black", [ "v0" ] ],
+    [ "uno:4", "chip1:READY", "green", [ "v-48", "h-255.3", "v-28.8" ] ],
     [ "chip1:SPARK", "uno:3", "green", [ "h0" ] ]
   ],
   "dependencies": { "chip-scope": "github:Dlloydev/Wokwi-Chip-scope@1.0.7" }

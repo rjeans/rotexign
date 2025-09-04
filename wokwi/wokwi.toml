@@ -1,0 +1,8 @@
+[wokwi]
+version = 1
+firmware = '../build/rotexign.ino.hex'
+elf = '../build/rotexign.ino.elf'
+
+[[chip]]
+name= 'pulse-simulator'
+binary = '../build/pulse-simulator.chip.wasm'

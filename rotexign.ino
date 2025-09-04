@@ -59,7 +59,7 @@ namespace Timing {
   const uint16_t MAX_DUTY_CYCLE = 40; 
   const uint16_t NOMINAL_DWELL_US = 3000;
   const uint16_t MAX_RPM = 7000;
-  const uint16_t DWELL_TO_TRIGGER_MARGIN_US = 40;
+  const uint16_t DWELL_TO_TRIGGER_MARGIN = 100; // number of ticks below which dwell starts immediately
   const uint16_t TRIGGER_BTDC_TENTHS = 470;  // 47.0 degrees in tenths
   const uint8_t  PULSES_PER_REVOLUTION = 2;
 
@@ -169,7 +169,7 @@ namespace Timing {
     uint32_t max_dwell_us = ((period_us + 50) / 100) * MAX_DUTY_CYCLE;
     uint16_t dwell_us = min(NOMINAL_DWELL_US, max_dwell_us);
 
-    boolean skip_period = (dwell_us + DWELL_TO_TRIGGER_MARGIN_US) > spark_delay_us;
+    boolean skip_period = (dwell_us + DWELL_TO_TRIGGER_MARGIN / 4UL)  > spark_delay_us;
     uint16_t dwell_delay_us;
 
     if (skip_period) {
@@ -221,18 +221,37 @@ constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
 constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
 constexpr uint16_t PRESCALE_BITS = _BV(CS11) | _BV(CS10); // /64 -> 4us/tick
 
-// Schedule a COMPB one-shot at absolute tick 'when'
-static inline void schedule_B(uint16_t when) {
+// Schedule a COMPB one-shot at absolute tick 'when' (for dwell start)
+static inline void schedule_dwell(uint16_t when) {
   TIFR1  = _BV(OCF1B);   // clear stale flag
   OCR1B  = when;         // set absolute time
   TIMSK1 |= _BV(OCIE1B); // enable COMPB interrupt
 }
 
-// Schedule a COMPA one-shot at absolute tick 'when' (for pulse end)
-static inline void schedule_A(uint16_t when) {
+// Schedule a COMPA one-shot at absolute tick 'when' (for spark fire)
+static inline void schedule_spark(uint16_t when) {
   TIFR1  = _BV(OCF1A);
   OCR1A  = when;
   TIMSK1 |= _BV(OCIE1A);
+}
+
+// Start dwell (called from COMPB ISR)
+static inline void start_dwell(uint16_t from) {
+  // Fast pin clear - LOW to start dwell
+  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  TIMSK1 &= ~_BV(OCIE1B);
+
+  const uint16_t width_ticks = engine.next_dwell_ticks;
+  uint16_t t_off = (uint16_t)(from + width_ticks);
+  
+  schedule_spark(t_off);
+}
+
+// Fire spark (called from COMPA ISR)
+static inline void fire_spark() {
+  // Fast pin set - HIGH to fire spark
+  FIRE_PORT |= _BV(FIRE_BIT);
+  TIMSK1 &= ~_BV(OCIE1A);
 }
 
 
@@ -243,23 +262,15 @@ ISR(INT0_vect) {
   // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
   uint16_t period_ticks_candidate = (uint16_t)(tcnt - engine.this_interrupt_ticks);
   
-  const uint16_t min_ticks_by_rpm = 1000;
+  const uint16_t min_valid_ticks = max((engine.period_ticks/3) , 0); // 33% or absolute min
 
-  //min_valid_ticks = max(engine.period_ticks / 10, min_ticks_by_rpm); // 30% or absolute min 
-
-  
-  
   // 30% window filter: ignore triggers that are less than 30% of the previous period
-  // Only apply if we have a valid previous period
-  if (engine.n_starting_ticks > 2 && period_ticks_candidate < min_ticks_by_rpm) {
-    
- 
-      return;  // Ignore this trigger - likely bounce or noise
-    
+  // Only apply if we have a valid previous period (after first pulse)
+  if (engine.n_starting_ticks > 1 && period_ticks_candidate < min_valid_ticks) {
+    // Ignore this trigger - likely bounce or noise
+    return;  
   }
-  
-  
- 
+
   // Update engine timing state
  
   engine.last_interrupt_ticks = engine.this_interrupt_ticks;
@@ -270,53 +281,55 @@ ISR(INT0_vect) {
     engine.n_starting_ticks++; 
     return; 
   }
-  
 
   // Calculate RPM and update engine state (MAX_RPM check covers high RPM filtering)
   uint16_t rpm = Utils::rpm_from_period_ticks(engine.period_ticks, Timing::PULSES_PER_REVOLUTION);
+
   engine.running = ( rpm <= Timing::MAX_RPM);
 
-
-
-      
+  uint16_t dwell_ticks = 0;
+  uint16_t dwell_delay_ticks = 0;
+  uint16_t spark_delay_ticks = 0;
 
   if (engine.running) {
- 
     // Precompute dwell metrics
-    uint16_t dwell_ticks = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
-    uint16_t dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
+    dwell_ticks = Utils::us_to_ticks64(Timing::get_dwell_us_from_rpm(rpm));
+    dwell_delay_ticks = Utils::us_to_ticks64(Timing::get_dwell_delay_us_from_rpm(rpm));
+    spark_delay_ticks = Utils::us_to_ticks64(Timing::get_spark_delay_us_from_rpm(rpm));
     engine.next_dwell_ticks = dwell_ticks;
 
-    // Schedule dwell start
-    schedule_B(engine.this_interrupt_ticks + dwell_delay_ticks);
+    if (dwell_delay_ticks < Timing::DWELL_TO_TRIGGER_MARGIN) {
+      // If dwell delay is too short, start dwell immediately
+
+      engine.next_dwell_ticks += dwell_delay_ticks;
+      start_dwell(engine.this_interrupt_ticks);
+    } else {
+      // Schedule dwell start
+      schedule_dwell(engine.this_interrupt_ticks + dwell_delay_ticks);
+    }
   } else {
     // Engine stopped - cancel any pending timer interrupts and ensure safe state
     TIMSK1 &= ~(_BV(OCIE1A) | _BV(OCIE1B));  // Disable both compare interrupts
     FIRE_PORT |= _BV(FIRE_BIT);              // Ensure D3 HIGH (safe state - no dwell)
-  } 
+  }
+
+  
 }
 
 // Timer1 COMPB interrupt: start dwell (output goes LOW)
 ISR(TIMER1_COMPB_vect) {
-  // Fast pin clear - LOW to start dwell
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
-  TIMSK1 &= ~_BV(OCIE1B);
-
-  const uint16_t width_ticks = engine.next_dwell_ticks;
-  uint16_t t_off = (uint16_t)(OCR1B + width_ticks);
-  schedule_A(t_off);
+  start_dwell(OCR1B);
 }
 
 // Timer1 COMPA interrupt: fire spark (output goes HIGH)
 ISR(TIMER1_COMPA_vect) {
-  // Fast pin set - HIGH to fire spark
-  FIRE_PORT |= _BV(FIRE_BIT);
-  TIMSK1 &= ~_BV(OCIE1A);
+  fire_spark();
 }
+
 
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("Rotax 787 Ignition Controller"));
+  Serial.println(F("Rotax 787 Ignition Controller with timing curve"));
 
   // Replace pinMode/digitalWrite for FIRE_PIN with direct register setup
   FIRE_DDR  |= _BV(FIRE_BIT);
@@ -351,17 +364,18 @@ void loop() {
     } else if (millis() - sys.startup_millis > 1000) {  // 1-second delay
       digitalWrite(RELAY_PIN, HIGH);  // Open relay to arm coil
       sys.relay_armed = true;
-      Serial.println(F("Relay armed - coil ready"));
+      Serial.println(F("Relay armed and ready")); 
     }
   }
 
-  // Print diagnostics every 5 seconds
-  if (millis() - sys.last_diagnostic_millis > 5000) {
+  // Print diagnostics every 1000 milliseconds
+  if (millis() - sys.last_diagnostic_millis > 1000) {
     SerialInterface::print_status();
     sys.last_diagnostic_millis = millis();
+
   }
 
- 
+  // ...existing code...
 }
 
 
