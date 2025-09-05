@@ -5,6 +5,7 @@ One line per trigger pulse with theoretical comparison
 """
 import sys
 import csv
+import math
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -350,11 +351,32 @@ def create_timing_plot(results: List[Dict]):
         title += f' ({" & ".join(exclusions)} excluded)'
     ax1.set_title(title)
     ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    ax1.legend(loc='lower right')
     
     # Set x-axis limits to rounded RPM range
     ax1.set_xlim(min_rpm_plot, max_rpm_plot)
-    ax1.set_ylim(-5, 25)
+    
+    # Set y-axis limits based on actual data range
+    if found_results:
+        found_advances = [r['advance_degrees'] for r in found_results]
+        y_min = min(found_advances)
+        y_max = max(found_advances)
+        
+        # Add some padding (10% on each side)
+        y_range = y_max - y_min
+        y_padding = y_range * 0.1
+        
+        # Round to nice values
+        y_min_plot = math.floor(y_min - y_padding)
+        y_max_plot = math.ceil(y_max + y_padding)
+        
+        # Ensure we show the theoretical curve range too
+        theoretical_max = max(theoretical_curve) if theoretical_curve else 15
+        y_max_plot = max(y_max_plot, math.ceil(theoretical_max + 1))
+        
+        ax1.set_ylim(y_min_plot, y_max_plot)
+    else:
+        ax1.set_ylim(-5, 20)
     
     # Bottom plot: Dwell time and duty cycle vs RPM
     dwell_results = [r for r in found_results if r['dwell_us'] is not None]
@@ -413,7 +435,7 @@ def create_timing_plot(results: List[Dict]):
         # Legends
         lines1, labels1 = ax2.get_legend_handles_labels()
         lines2, labels2 = ax2_twin.get_legend_handles_labels()
-        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
     else:
         ax2.text(0.5, 0.5, 'No dwell data available', transform=ax2.transAxes,
                 ha='center', va='center', fontsize=12)
