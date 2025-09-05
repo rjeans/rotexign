@@ -13,17 +13,19 @@ static const float DEGREES_PER_REVOLUTION = 360.0f;
 static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 
 // Timing constants  
-static const float IDLE_DURATION_S = 0.0f;
+static const float IDLE_DURATION_S = 10.0f;
 static const float IDLE_RPM = 1500.0f;
 static const float MAX_RPM = 6000.0f;
-static const float ACCELERATION_TIME_S = 60.0f;
+static const float ACCELERATION_TIME_S = .5f;
+static const float MAX_RPM_DURATION_S = 10.0f;  // Stay at max RPM for 10 seconds
 
 // State machine states
 typedef enum {
     STATE_WAITING_FOR_READY,
     STATE_IDLING,
     STATE_ACCELERATING,
-    STATE_AT_MAX_RPM
+    STATE_AT_MAX_RPM,
+    STATE_STOPPED
 } SimulatorState;
 
 // Pin structure
@@ -105,7 +107,7 @@ static float time_to_angle(float target_deg, float omega0_deg_s, float alpha_deg
 
 // Schedule the next pulse based on current angular motion
 static void schedule_next_pulse(void) {
-    if (sim_state == STATE_WAITING_FOR_READY) return;
+    if (sim_state == STATE_WAITING_FOR_READY || sim_state == STATE_STOPPED) return;
     
     float current_time = get_current_time_ms() / 1000.0f;
     float time_in_state = current_time - state_start_time;
@@ -208,7 +210,18 @@ static void monitoring_timer_event(void *user_data) {
             break;
             
         case STATE_AT_MAX_RPM:
-            // Stay at max RPM
+            if (time_in_state >= MAX_RPM_DURATION_S) {
+                // Transition to stopped state
+                sim_state = STATE_STOPPED;
+                state_start_time = current_time;
+                
+                printf("[PULSE_GEN] t=%.2fs Stopping triggers after %.1fs at max RPM\n", 
+                       current_time, MAX_RPM_DURATION_S);
+            }
+            break;
+            
+        case STATE_STOPPED:
+            // Stay stopped - no more pulses
             break;
     }
     

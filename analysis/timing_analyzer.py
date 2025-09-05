@@ -19,9 +19,9 @@ SIGNAL_MAPPINGS = {
     '0"': 'dwell_start',    # D3 falling edge (dwell start)
     '1"': 'spark_fire',     # D3 rising edge (spark fire)
     
-    # Legacy format support
-    '0#': 'trigger_fall',
-    '1#': 'trigger_rise', 
+    # Legacy format support  
+    '0#': 'd4_fall',
+    '1#': 'd4_rise',
     '0$': 'dwell_start',
     '1$': 'spark_fire',
 }
@@ -97,6 +97,7 @@ def get_theoretical_advance(rpm: float) -> float:
 def analyze_triggers(vcd_file: str) -> List[Dict]:
     """
     Simple first-principles spark detection:
+    Only analyze triggers after D4 goes high (ready signal)
     For trigger T1 and next trigger T2:
     - If spark exists > T1 and <= T2, it belongs to T1
     - Otherwise T1 has missing spark
@@ -105,17 +106,30 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
     signal_changes = parse_vcd_file(vcd_file)
     print(f"Found {len(signal_changes)} signal changes")
     
+    # Find when D4 goes high (ready signal)
+    d4_ready_time = None
+    for time, event in signal_changes:
+        if event == 'd4_rise':
+            d4_ready_time = time
+            print(f"D4 ready signal at {time} ns = {time/1000000:.3f} ms")
+            break
+    
+    if d4_ready_time is None:
+        print("Warning: D4 ready signal not found, analyzing all triggers")
+        d4_ready_time = 0
+    
     results = []
     
-    # Find all trigger falling edges
+    # Find all trigger falling edges after D4 goes high
     trigger_indices = []
     for i, (time, event) in enumerate(signal_changes):
-        if event == 'trigger_fall':
+        if event == 'trigger_fall' and time >= d4_ready_time:
             trigger_indices.append(i)
     
     print(f"Found {len(trigger_indices)} trigger pulses")
     
-    # Process each trigger (skip last one - no next trigger)
+    # Process each trigger (skip last one - no next trigger)  
+    previous_period_ns = None
     for idx in range(len(trigger_indices) - 1):
         T1_idx = trigger_indices[idx]
         T2_idx = trigger_indices[idx + 1]
@@ -125,13 +139,38 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
         
         # Calculate period and RPM
         period_ns = T2_time - T1_time
-        
-        # Skip noise pulses (too short period)
-        if period_ns < 4_000_000:  # Less than 4ms
-            continue
-            
-        rpm = calculate_rpm_from_period(period_ns)
         period_us = period_ns / 1000.0
+        
+        # Arduino-style noise filtering
+        MIN_PERIOD_NS = 1_000_000  # 1ms minimum period (60,000 RPM limit)
+        MAX_REALISTIC_RPM = 6500  # Maximum realistic RPM (pulse sim stops at 6000)
+        
+        # Detect noise triggers
+        is_noise = False
+        noise_reason = ""
+        
+        # Handle zero or very small periods
+        if period_ns <= 1000:  # Less than 1 microsecond - likely duplicate
+            is_noise = True
+            noise_reason = "duplicate"
+            
+        # Apply 30% window filter like Arduino (if we have a previous period)
+        elif previous_period_ns is not None:
+            min_valid_period = max(previous_period_ns // 3, MIN_PERIOD_NS)  # 33% or absolute min
+            if period_ns < min_valid_period:
+                is_noise = True
+                noise_reason = "30% filter"
+        
+        rpm = calculate_rpm_from_period(period_ns)
+        
+        # Mark unrealistic RPMs as noise (pulse sim only goes to 6000)
+        if rpm > MAX_REALISTIC_RPM:
+            is_noise = True
+            noise_reason = f"RPM {rpm:.0f} > {MAX_REALISTIC_RPM}"
+        
+        # Don't update previous_period if this is noise
+        if not is_noise:
+            previous_period_ns = period_ns
         
         # Find spark between T1 and T2: spark > T1_time and spark <= T2_time
         spark_time = None
@@ -212,7 +251,9 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
             'dwell_delay_us': dwell_delay_us,
             'theoretical_advance': theoretical_advance,
             'theoretical_delay_us': theoretical_delay_us,
-            'error_degrees': error_degrees
+            'error_degrees': error_degrees,
+            'is_noise': is_noise,
+            'noise_reason': noise_reason
         })
     
     return results
@@ -227,7 +268,7 @@ def generate_csv_output(results: List[Dict]):
             'trigger_num', 'time_ms', 'period_us', 'rpm', 
             'spark_found', 'delay_us', 'delay_degrees', 
             'advance_degrees', 'dwell_us', 'dwell_delay_us', 'theoretical_advance', 
-            'theoretical_delay_us', 'error_degrees'
+            'theoretical_delay_us', 'error_degrees', 'is_noise', 'noise_reason'
         ])
         
         # Data rows
@@ -245,7 +286,9 @@ def generate_csv_output(results: List[Dict]):
                 f"{r['dwell_delay_us']:.1f}" if r['dwell_delay_us'] is not None else 'MISSING',
                 f"{r['theoretical_advance']:.2f}",
                 f"{r['theoretical_delay_us']:.1f}" if r['theoretical_delay_us'] is not None else 'N/A',
-                f"{r['error_degrees']:.2f}" if r['error_degrees'] is not None else 'N/A'
+                f"{r['error_degrees']:.2f}" if r['error_degrees'] is not None else 'N/A',
+                r['is_noise'],
+                r['noise_reason']
             ])
     
     print(f"Generated wokwi-logic-analysis.csv with {len(results)} trigger events")
@@ -256,9 +299,26 @@ def create_timing_plot(results: List[Dict]):
         print("No results to plot")
         return
     
-    # Separate data into found and missing sparks
-    found_results = [r for r in results if r['spark_found']]
-    missing_results = [r for r in results if not r['spark_found']]
+    # Filter out noise triggers first
+    valid_results = [r for r in results if not r.get('is_noise', False)]
+    noise_results = [r for r in results if r.get('is_noise', False)]
+    
+    # Calculate RPM plot range from VALID triggers only (exclude noise)
+    if valid_results:
+        valid_rpms = [r['rpm'] for r in valid_results]
+        min_rpm = min(valid_rpms)
+        max_rpm = max(valid_rpms)
+    else:
+        min_rpm = 0
+        max_rpm = 6000
+    
+    # Round to nearest 1000
+    min_rpm_plot = int(min_rpm // 1000) * 1000
+    max_rpm_plot = int((max_rpm + 999) // 1000) * 1000  # Round up
+    
+    # Separate valid data into found and missing sparks
+    found_results = [r for r in valid_results if r['spark_found']]
+    missing_results = [r for r in valid_results if not r['spark_found']]
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12))
     
@@ -269,26 +329,31 @@ def create_timing_plot(results: List[Dict]):
         ax1.scatter(found_rpms, found_advances, alpha=0.4, s=8, c='blue', 
                    label=f'Observed ({len(found_results)} sparks)', zorder=2)
     
-    # Plot theoretical curve
-    if results:
-        rpm_range = np.linspace(0, max([r['rpm'] for r in results]), 100)
-        theoretical_curve = [get_theoretical_advance(rpm) for rpm in rpm_range]
-        ax1.plot(rpm_range, theoretical_curve, 'r--', linewidth=2, 
-                label='Theoretical curve', zorder=1)
+    # Plot theoretical curve over the data range
+    rpm_range = np.linspace(min_rpm_plot, max_rpm_plot, 100)
+    theoretical_curve = [get_theoretical_advance(rpm) for rpm in rpm_range]
+    ax1.plot(rpm_range, theoretical_curve, 'r--', linewidth=2, 
+            label='Theoretical curve', zorder=1)
     
-    # Mark missing sparks on theoretical curve
-    if missing_results:
-        missing_rpms = [r['rpm'] for r in missing_results]
-        missing_theoretical = [r['theoretical_advance'] for r in missing_results]
-        ax1.scatter(missing_rpms, missing_theoretical, marker='x', s=25, c='red', 
-                   label=f'Missing sparks ({len(missing_results)})', zorder=3)
+    # Note: Missing sparks are excluded from the timing graph for clarity
+    # They are still tracked in the statistics and CSV output
     
     ax1.set_xlabel('RPM')
     ax1.set_ylabel('Ignition Advance (degrees BTDC)')
-    ax1.set_title('Ignition Timing: Observed vs Theoretical')
+    title = 'Ignition Timing: Observed vs Theoretical'
+    exclusions = []
+    if noise_results:
+        exclusions.append(f'{len(noise_results)} noise')
+    if missing_results:
+        exclusions.append(f'{len(missing_results)} missing')
+    if exclusions:
+        title += f' ({" & ".join(exclusions)} excluded)'
+    ax1.set_title(title)
     ax1.grid(True, alpha=0.3)
     ax1.legend()
-    ax1.set_xlim(0, max([r['rpm'] for r in results]) + 200 if results else 8000)
+    
+    # Set x-axis limits to rounded RPM range
+    ax1.set_xlim(min_rpm_plot, max_rpm_plot)
     ax1.set_ylim(-5, 25)
     
     # Bottom plot: Dwell time and duty cycle vs RPM
@@ -307,8 +372,9 @@ def create_timing_plot(results: List[Dict]):
         ax2.scatter(dwell_rpms, dwell_times_ms, alpha=0.4, s=8, c='green', 
                    label='Dwell time', zorder=2)
         
-        # Plot duty cycle (right axis) 
-        ax2_twin.scatter(dwell_rpms, duty_cycles, alpha=0.4, s=8, c='orange',
+        # Plot duty cycle (right axis) - cap at 100% for visualization
+        duty_cycles_capped = np.minimum(duty_cycles, 100)
+        ax2_twin.scatter(dwell_rpms, duty_cycles_capped, alpha=0.4, s=8, c='orange',
                         label='Duty cycle', zorder=2)
         
         # Add reference lines
@@ -328,10 +394,21 @@ def create_timing_plot(results: List[Dict]):
         ax2.tick_params(axis='y', labelcolor='green')
         ax2_twin.tick_params(axis='y', labelcolor='orange')
         
-        # Set axis limits
-        ax2.set_xlim(0, max([r['rpm'] for r in results]) + 200 if results else 8000)
+        # Set axis limits using same RPM range as top plot
+        ax2.set_xlim(min_rpm_plot, max_rpm_plot)
         ax2.set_ylim(0, max(dwell_times_ms) * 1.1 if len(dwell_times_ms) > 0 else 10)
-        ax2_twin.set_ylim(0, max(duty_cycles) * 1.1 if len(duty_cycles) > 0 else 50)
+        
+        # Better duty cycle scaling - use capped values for reasonable max
+        max_duty_capped = max(duty_cycles_capped) if len(duty_cycles_capped) > 0 else 50
+        if max_duty_capped <= 10:
+            duty_cycle_max = 10
+        elif max_duty_capped <= 20:
+            duty_cycle_max = 20
+        elif max_duty_capped <= 50:
+            duty_cycle_max = 50
+        else:
+            duty_cycle_max = 100  # Cap at 100%
+        ax2_twin.set_ylim(0, duty_cycle_max)
         
         # Legends
         lines1, labels1 = ax2.get_legend_handles_labels()
@@ -354,19 +431,28 @@ def print_summary(results: List[Dict]):
         print("No results to summarize")
         return
     
+    # Separate noise from valid triggers
+    noise_triggers = [r for r in results if r.get('is_noise', False)]
+    valid_triggers = [r for r in results if not r.get('is_noise', False)]
+    
     total_triggers = len(results)
-    found_sparks = sum(1 for r in results if r['spark_found'])
-    missing_sparks = total_triggers - found_sparks
+    found_sparks = sum(1 for r in valid_triggers if r['spark_found'])
+    missing_sparks = sum(1 for r in valid_triggers if not r['spark_found'])
     
     print("\n" + "="*50)
     print("TIMING ANALYSIS SUMMARY")
     print("="*50)
     print(f"Total trigger pulses analyzed: {total_triggers}")
-    print(f"Sparks found: {found_sparks} ({100*found_sparks/total_triggers:.1f}%)")
-    print(f"Sparks missing: {missing_sparks} ({100*missing_sparks/total_triggers:.1f}%)")
+    print(f"  Valid triggers: {len(valid_triggers)}")
+    print(f"  Noise triggers: {len(noise_triggers)} (excluded from analysis)")
+    
+    if valid_triggers:
+        print(f"\nValid trigger analysis:")
+        print(f"  Sparks found: {found_sparks} ({100*found_sparks/len(valid_triggers):.1f}%)")
+        print(f"  Sparks missing: {missing_sparks} ({100*missing_sparks/len(valid_triggers):.1f}%)")
     
     if found_sparks > 0:
-        found_results = [r for r in results if r['spark_found']]
+        found_results = [r for r in valid_triggers if r['spark_found']]
         rpms = [r['rpm'] for r in found_results]
         advances = [r['advance_degrees'] for r in found_results]
         errors = [r['error_degrees'] for r in found_results]
@@ -385,9 +471,18 @@ def print_summary(results: List[Dict]):
             print(f"Dwell delay range: {min(dwell_delays):.1f} to {max(dwell_delays):.1f} μs")
     
     if missing_sparks > 0:
-        missing_results = [r for r in results if not r['spark_found']]
+        missing_results = [r for r in valid_triggers if not r['spark_found']]
         missing_rpms = [r['rpm'] for r in missing_results]
         print(f"\nMissing sparks at RPMs: {sorted(set(int(r) for r in missing_rpms))}")
+    
+    if noise_triggers:
+        noise_reasons = {}
+        for r in noise_triggers:
+            reason = r.get('noise_reason', 'unknown')
+            noise_reasons[reason] = noise_reasons.get(reason, 0) + 1
+        print(f"\nNoise trigger breakdown:")
+        for reason, count in sorted(noise_reasons.items()):
+            print(f"  {reason}: {count}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

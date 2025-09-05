@@ -29,8 +29,6 @@ namespace Engine {
   volatile uint16_t tcnt=0;
   volatile uint16_t dwell_ticks = 0;
 
-  
-
 }
 
 namespace System {
@@ -312,13 +310,55 @@ namespace SerialInterface {
 constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
 constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
 
+// Minimum safety margin for timer scheduling (100μs = 200 ticks at 0.5μs/tick)
+constexpr uint16_t MIN_TIMER_LEAD_TICKS = 200;
+
 // Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
-static inline void schedule_dwell(uint16_t when,uint16_t length) {
+// Returns true if scheduled successfully, false if immediate fallback used
+static inline bool schedule_dwell(uint16_t when, uint16_t length) {
+  uint16_t current_ticks = TCNT1;
+  
+  // Calculate lead time, handling timer wraparound properly
+  // For 16-bit timer wraparound: treat differences > 32767 as negative (already passed)
+  uint16_t lead_time = when - current_ticks;  // Unsigned subtraction handles wraparound
+  
+  // Check if we have enough lead time or if the time has already passed
+  // If lead_time > 32767, the target time is in the past (wrapped around)
+  if (lead_time < MIN_TIMER_LEAD_TICKS || lead_time > 32767) {
+    // Too close or already past - start dwell immediately
+    FIRE_PORT &= ~_BV(FIRE_BIT);  // Start dwell immediately (coil charging)
+    Engine::state = Engine::DWELLING;
+    
+    // Calculate adjusted dwell length to maintain spark timing accuracy
+    // Original spark time = when + length
+    // Current time = current_ticks  
+    // Adjusted length = (when + length) - current_ticks
+    uint16_t original_spark_time = when + length;
+    uint16_t adjusted_length;
+    
+    
+    adjusted_length = original_spark_time - current_ticks;
+    
+    
+    Engine::dwell_ticks = adjusted_length;
+
+
+    // Schedule spark timing using adjusted length
+    TIFR1  = _BV(OCF1A);
+    OCR1A  = original_spark_time;  // Maintain original spark timing
+    TIMSK1 |= _BV(OCIE1A);
+    
+    return false; // Indicate immediate fallback was used
+  }
+  
+  // Safe to schedule normally
   TIFR1  = _BV(OCF1A);   // clear stale flag
   OCR1A  = when;         // set absolute time
   TIMSK1 |= _BV(OCIE1A); // enable COMPA interrupt
-  Engine::dwell_ticks=length;
+  Engine::dwell_ticks = length;
   Engine::state = Engine::DWELL_SCHEDULED;
+  
+  return true; // Indicate normal scheduling was used
 }
 
 // Schedule a COMPA one-shot at absolute tick 'when' (for spark fire)
@@ -347,6 +387,7 @@ static inline void fire_spark() {
   FIRE_PORT |= _BV(FIRE_BIT);
   TIMSK1 &= ~_BV(OCIE1A);
   Engine::state = Engine::WAITING;
+
 }
 
 
@@ -374,11 +415,7 @@ ISR(INT0_vect) {
   // 30% window filter: ignore triggers that are less than 30% of the previous period
   // Only apply if we have a valid previous period (after first pulse)
   if (period_ticks_candidate < min_valid_ticks && Engine::ignition_on) {
-    // Ignore this trigger - likely bounce or noise
-    Serial.print(F("Ignoring trigger (noise): "));
-    Serial.print(period_ticks_candidate);
-    Serial.print(F(" < "));
-    Serial.println(min_valid_ticks);
+
     return;
   }
 
@@ -516,13 +553,7 @@ void loop() {
     }
   } else {
 
-  // Print diagnostics every 1000 milliseconds
-  if (millis() - System::last_diagnostic_millis > 5000) {
-    SerialInterface::print_status();
-//    Logger::print_log();
-    System::last_diagnostic_millis = millis();
 
-  }
 
   if (Engine::state == Engine::WAITING && Timing::events_ready() && Engine::ignition_on) {
     // Start dwell process
@@ -554,10 +585,11 @@ void loop() {
    
   
 
-    schedule_dwell(event->time + dwell_delay_ticks, dwell_ticks);
-  }
+    // Schedule dwell with safety protection
+    bool scheduled_normally = schedule_dwell(event->time + dwell_delay_ticks, dwell_ticks);
 
-  
+
+  }
 
 }
 }
