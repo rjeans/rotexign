@@ -1,8 +1,8 @@
 # rotexign — Arduino Ignition Controller
 
-**Simulation-validated** Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. This implementation delivers precise, interrupt-driven timing control with extensive simulation testing across the entire operational range (800-8000 RPM).
+Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. This implementation uses interrupt-driven timing control with a deferred processing architecture for precise dwell and spark scheduling.
 
-⚠️ **Status**: Fully tested in simulation, awaiting physical hardware validation
+⚠️ **Status**: Hardware prototype with known timing bugs - missing sparks and acceleration errors
 
 ## Overview
 
@@ -11,28 +11,26 @@ This project implements a sophisticated ignition timing controller using an Ardu
 ## Key Features
 
 ### Core Timing Engine
-- **Hardware Timer-Based**: Uses Timer1 with 4μs resolution (prescaler /64 at 16MHz)
-- **Interrupt-Driven**: External interrupt (INT0) for trigger input, Timer1 Compare Match for dwell/spark scheduling
+- **Hardware Timer-Based**: Uses Timer1 with 0.5μs resolution (prescaler /8 at 16MHz)
+- **Deferred Processing**: External interrupt (INT0) captures timing, main loop processes events
+- **Ring Buffer**: Buffered event system prevents missed triggers during processing
 - **Direct Port Control**: Bypasses Arduino digitalRead/Write for minimal latency
-- **Tick-Based Math**: All calculations in timer ticks to avoid floating-point in ISRs
+- **Tick-Based Math**: All calculations in timer ticks to avoid floating-point
 
 ### Timing Control
 - **Adaptive Advance Curve**: 201-point interpolated timing map stored in PROGMEM
-- **Smoothed Curve Generation**: Cubic interpolation with Savitzky-Golay filtering
-- **Dynamic Scheduling**: Automatic transition between same-lobe and previous-lobe timing
+- **Previous-Lobe Timing**: Always uses previous lobe for timing (one full period delay)
 - **Precision Dwell Control**: 3ms target with 40% duty cycle protection
-- **RPM Range**: Validated operation from 800-8000 RPM
+- **Two-Stage Scheduling**: Separate dwell start and spark fire events
+- **RPM Range**: Designed for 800-8000 RPM operation
 
 ### Safety Features
-- **Rev Limiter**: Hard cut at 7000 RPM with immediate interrupt cancellation
+- **Rev Limiter**: Hard cut at 7000 RPM with immediate ignition disable
 - **Startup Protection**: 3-trigger stabilization before enabling ignition
 - **Duty Cycle Protection**: Prevents coil overheating at high RPM
-- **Input Pulse Filtering**: Dual-stage filtering system:
-  - Hardware debounce: 400μs minimum period rejection in interrupt handler
-  - Exponential moving average: Smooths period measurements to reduce jitter (α=0.3)
-- **Interrupt Cancellation**: Automatically disables dwell/spark interrupts when engine stops
-- **Clean Initialization**: All outputs grounded during startup
+- **Input Pulse Filtering**: 30% period change rejection to filter noise
 - **Relay Protection**: D4 relay keeps coil grounded until D2 is stable HIGH for 1 second
+- **Clean Initialization**: All outputs start in safe state
 
 ## Hardware Configuration
 
@@ -51,45 +49,49 @@ This project implements a sophisticated ignition timing controller using an Ardu
 
 ## Implementation Details
 
-### Architecture
+### Current Architecture
 
-The controller uses a streamlined interrupt-driven architecture:
+The controller uses a deferred processing architecture with event buffering:
 
 ```
-Trigger (INT0) → Calculate timing → Schedule Compare Match → Fire coil
+Trigger (INT0) → Buffer Event → Main Loop → Schedule Dwell → Fire Spark
 ```
 
 1. **Trigger ISR** (`INT0_vect`):
-   - Captures Timer1 count immediately
-   - Filters trigger pulses to reject noise/bounce (periods <400μs)
-   - Applies exponential moving average to smooth period measurements
+   - Captures Timer1 count immediately for precise timing
+   - Filters trigger pulses to reject 30% period changes (noise rejection)
    - Waits for 3-trigger stabilization before enabling ignition
-   - Calculates period from filtered trigger data
-   - Computes RPM and required timing
-   - Schedules Compare B interrupt for dwell start or cancels interrupts if engine stops
+   - Buffers timing events in ring buffer for main loop processing
+   - Minimal processing in ISR to prevent missed triggers
 
-2. **Compare B ISR** (`TIMER1_COMPB_vect`):
-   - Sets ignition output LOW (start dwell/coil charging)
-   - Schedules Compare A for spark
+2. **Main Loop Processing**:
+   - Processes buffered timing events when engine is waiting
+   - Calculates RPM, advance angle, and timing delays
+   - Schedules dwell start using Timer1 Compare A interrupt
+   - Handles relay arming logic and diagnostics
 
-3. **Compare A ISR** (`TIMER1_COMPA_vect`):
-   - Sets ignition output HIGH (fire spark/coil discharge)
-   - Completes timing cycle
+3. **Timer1 Compare A ISR** (`TIMER1_COMPA_vect`):
+   - **State DWELL_SCHEDULED**: Start dwell (LOW), schedule spark
+   - **State DWELLING**: Fire spark (HIGH), return to waiting
+   - Implements two-stage scheduling for precise timing control
 
 ### Timing Calculations
 
-All timing uses integer math with Timer1 ticks (4μs resolution):
+All timing uses integer math with Timer1 ticks (0.5μs resolution):
 
 ```cpp
-// RPM from period ticks (avoids floating point)
-rpm = 15,000,000 / (period_ticks * 2)
+// RPM from period ticks (avoids floating point) 
+rpm = 60,000,000 / (period_ticks * 2)
 
-// Advance angle from 81-point curve (PROGMEM)
-advance_tenths = interpolate_curve(rpm)
+// Advance angle from 201-point curve (PROGMEM)
+advance_tenths = get_advance_angle_tenths(rpm)
 
-// Delay angle and timing
-delay_tenths = 470 - advance_tenths  // 47° - advance
-delay_us = (delay_tenths * period_us) / 1800
+// Spark delay calculation
+delay_angle_tenths = 470 - advance_tenths  // 47° BTDC - advance
+delay_ticks = (delay_angle_tenths * period_ticks + 900) / 1800
+
+// Dwell timing (always previous lobe)
+dwell_delay_ticks = (period_ticks + spark_delay_ticks) - dwell_ticks
 ```
 
 ### Timing Curve Generation
@@ -108,61 +110,48 @@ This process (`analysis/smooth_timing_curve.py`) ensures:
 - Efficient storage in limited PROGMEM space
 - Fast runtime lookup with linear interpolation between points
 
-### Previous-Lobe Scheduling
+### Previous-Lobe Timing
 
-The controller automatically switches to previous-lobe timing when the dwell window becomes insufficient:
+The controller uses previous-lobe timing exclusively for all RPM ranges:
 
-- **Same-lobe**: Used at low RPM when `dwell_us < spark_delay_us`
-- **Previous-lobe**: Engages ~1800-2000 RPM, adds one period to delay calculation
-- **Seamless transition**: No timing glitches during mode switch
+- **Always Previous-Lobe**: Adds one full period to dwell delay calculation  
+- **Benefit**: Provides maximum dwell time window at all RPM
+- **Trade-off**: Uses more recent RPM data but requires larger timing buffer
 
-## Simulation Testing
+## Known Issues
 
-### Wokwi Online Simulator
+⚠️ **Critical Issues Requiring Resolution**
 
-All testing has been performed using the Wokwi circuit simulator with a custom RPM sweep test chip:
+### 1. Missing Sparks
+- **Symptom**: Intermittent spark failures, especially during steady-state operation
+- **Suspected Cause**: Event buffer overflow or timing race conditions
+- **Impact**: Engine misfiring and poor performance
+- **Location**: `rotexign.ino:516-528` event processing in main loop
+
+### 2. Timing Errors on Acceleration  
+- **Symptom**: Incorrect timing advance during RPM changes
+- **Suspected Cause**: Using stale period data from ring buffer during acceleration
+- **Impact**: Poor throttle response and potential engine damage
+- **Location**: `rotexign.ino:520-527` period calculation and scheduling
+
+### 3. Deferred Processing Latency
+- **Symptom**: Variable delay between trigger and dwell start
+- **Root Cause**: Main loop processing creates timing uncertainty
+- **Impact**: Inconsistent ignition timing
+- **Location**: Ring buffer architecture throughout main loop
+
+## Previous Testing Status
+
+The controller was previously extensively tested in Wokwi simulation:
 
 🔗 **[Live Simulation Project](https://wokwi.com/projects/439745280978700289)**
 
-The simulation includes:
-- **Custom Test Chip**: Generates trigger pulses with configurable RPM sweep (800-8000 RPM)
-- **Full Circuit Design**: Complete with pull-ups, LEDs, and signal routing
-- **VCD Export**: Allows detailed timing analysis of all signals
-- **Real-time Monitoring**: Serial output shows RPM and timing values
+**Previous Results**: 99.9% timing accuracy within ±0.1° across 14,533 measurements
 
-Circuit design files are in the `wokwi/` directory including the custom simulator chip implementation.
-
-### Simulation Results
-
-Comprehensive testing using VCD analysis from Wokwi shows excellent timing accuracy:
-
-![Timing vs RPM](analysis/timing_vs_rpm.png)
-*Figure 1: Measured timing advance vs RPM showing ±0.1° accuracy across operational range*
-
-![Timing Waveforms](analysis/timing_waveforms.png)
-*Figure 2: Sample timing waveforms at different RPM points showing dwell and spark timing*
-
-### Accuracy Analysis
-
-| RPM | Measured Advance | Target Advance | Error | Status |
-|-----|-----------------|----------------|-------|---------|
-| 800 | 4.69° | 4.68° | +0.01° | Excellent |
-| 1200 | 7.27° | 7.28° | -0.01° | Excellent |
-| 2000 | 11.77° | 11.78° | -0.01° | Excellent |
-| 3000 | 14.93° | 14.95° | -0.02° | Excellent |
-| 5000 | 13.66° | 13.70° | -0.04° | Excellent |
-| 7000 | 11.85° | 11.90° | -0.05° | Excellent |
-
-**Simulation Coverage**: 14,533 timing measurements analyzed with 99.9% within ±0.1° of target
-
-### Dwell Control
-
-The controller maintains precise dwell control with duty cycle protection:
-
-- **Target Dwell**: 3000μs (3ms) at 12V
-- **Low RPM**: Full 3ms dwell maintained
-- **High RPM**: Automatically reduced to respect 40% duty cycle limit
-- **Consistency**: ±50μs variation across all measurements
+**Current Status**: Hardware implementation shows timing bugs not present in simulation, likely due to:
+- Real-world timing constraints not modeled in simulation
+- Race conditions between ISR and main loop processing  
+- Ring buffer management issues under varying load conditions
 
 ## Building and Installation
 
@@ -206,38 +195,44 @@ This generates:
 - `timing_vs_rpm.png`: Advance curve validation plot
 - `timing_waveforms.png`: Sample waveform visualization
 
-## Important TODOs
+## Immediate Action Items
 
-### 🚨 Critical Before Engine Use
+### 🚨 Critical Bug Fixes Required
 
-1. **Physical Hardware Testing**
-   - Validate trigger input sensing with real crank sensor
-   - Verify coil drive output with oscilloscope
-   - Test noise immunity and EMI resistance
-   - Confirm timing accuracy with strobe light
+1. **Fix Missing Sparks**
+   - Investigate ring buffer overflow conditions
+   - Add buffer status monitoring and diagnostics
+   - Consider immediate processing instead of deferred
+   - Test under high trigger rates to identify race conditions
 
-2. **Safety Relay Implementation** ✅
-   - D4 relay provides coil isolation during initialization
-   - Relay arms 1 second after D2 goes HIGH (stable trigger signal)
-   - Fail-safe: Relay defaults to closed (coil grounded) on power-up
-   - Once armed, relay remains open during operation
+2. **Resolve Acceleration Timing Errors**
+   - Review period calculation during RPM changes
+   - Consider using most recent trigger data instead of buffered data
+   - Add acceleration detection and handling logic
+   - Validate timing accuracy during RPM transitions
 
-3. **Additional Safety Features**
-   - Add backup rev limiter in hardware
-   - Implement voltage monitoring for brown-out protection
-   - Add diagnostic LEDs for error states
-   - Consider redundant timing verification
+3. **Address Processing Latency**
+   - Move critical timing calculations back to ISR if necessary
+   - Minimize main loop processing delays
+   - Consider hybrid approach: ISR for urgent, main loop for diagnostics
+
+### 🛡️ Safety Implementation Status
+
+- **Safety Relay**: ✅ Implemented and tested
+- **Rev Limiter**: ✅ Functional at 7000 RPM  
+- **Startup Protection**: ✅ 3-trigger stabilization working
+- **Physical Hardware Testing**: ⚠️ **REQUIRED BEFORE ENGINE USE**
 
 ## Design Philosophy
 
 This implementation prioritizes:
 
-1. **Simplicity**: Minimal code in ISRs, no complex state machines
-2. **Precision**: Hardware timers, tick-based math, direct port control
-3. **Safety**: Multiple protection mechanisms, fail-safe defaults
-4. **Testability**: Comprehensive analysis tools and validation data
+1. **Safety First**: Multiple protection mechanisms, fail-safe defaults
+2. **Precision**: Hardware timers, tick-based math, direct port control  
+3. **Robustness**: Noise filtering, startup protection, duty cycle limits
+4. **Maintainability**: Clear code structure, comprehensive diagnostics
 
-The result is a robust ignition controller that has been thoroughly validated in simulation with consistent sub-degree timing accuracy.
+**Current Status**: Core design is sound, but timing architecture needs refinement to resolve hardware-specific issues not present in simulation.
 
 ## Files
 
