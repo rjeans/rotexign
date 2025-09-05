@@ -18,9 +18,9 @@ NOMINAL_DWELL_US = NOMINAL_DWELL_MS * 1000
 MAX_DUTY_CYCLE = 0.40  # Maximum 40% duty cycle
 
 # Arduino Timer1 constants
-TIMER_PRESCALER = 64  # Timer1 prescaler
+TIMER_PRESCALER = 8  # Timer1 prescaler
 ARDUINO_CLOCK = 16000000  # 16 MHz Arduino clock
-US_PER_TICK = TIMER_PRESCALER / (ARDUINO_CLOCK / 1000000)  # 4μs per tick
+US_PER_TICK = TIMER_PRESCALER / (ARDUINO_CLOCK / 1000000)  # Microseconds per timer tick
 
 def interpolate_advance(rpm, rpm_points, advance_curve):
     """Linear interpolation of advance angle from curve."""
@@ -85,7 +85,7 @@ def calculate_timing(rpm):
     if dwell_delay_us < 0:
         dwell_delay_us += period_us
     
-    # Convert to timer ticks (4μs per tick with prescaler 64)
+    # Convert to timer ticks 
     spark_delay_ticks = int(round(spark_delay_us / US_PER_TICK))
     dwell_delay_ticks = int(round(dwell_delay_us / US_PER_TICK))
     period_ticks = int(round(period_us / US_PER_TICK))
@@ -151,7 +151,7 @@ def main():
     print("Timing calculations saved to timing_calculations.csv")
     
     # Show spark delay ticks at interpolation points
-    print("\n/64 prescaler timing at interpolation points:")
+    print("\nPrescaler timing at interpolation points:")
     print("RPM\tAdvance°\tPeriod (ticks)\tSpark Delay (ticks)")
     print("-" * 60)
     

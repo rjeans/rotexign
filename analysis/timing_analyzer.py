@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
 """
-VCD Timing Analyzer with Comprehensive Plotting
-Measures trigger falling edge to spark falling edge timing
-Generates timing curves, waveforms, and analysis plots with scatter points
+Simplified VCD Timing Analyzer
+One line per trigger pulse with theoretical comparison
 """
 import sys
 import csv
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 # Signal mappings for VCD parsing
 SIGNAL_MAPPINGS = {
+    # Current VCD format (D2=trigger, D3=spark)  
+    '0!': 'trigger_fall',   # D2 falling edge
+    '1!': 'trigger_rise',   # D2 rising edge
+    '0"': 'dwell_start',    # D3 falling edge (dwell start)
+    '1"': 'spark_fire',     # D3 rising edge (spark fire)
+    
+    # Legacy format support
     '0#': 'trigger_fall',
-    '1#': 'trigger_rise',
-    '0$': 'dwell_start',  # Spark signal goes LOW to start dwell (coil charging)
-    '1$': 'spark_fire',   # Spark signal goes HIGH to fire spark (coil discharge)
-    '0!': 'trigger_fall',  # Legacy
-    '1!': 'trigger_rise',  # Legacy
-    '0"': 'dwell_start',    # Legacy
-    '1"': 'spark_fire'   # Legacy
+    '1#': 'trigger_rise', 
+    '0$': 'dwell_start',
+    '1$': 'spark_fire',
 }
 
 def parse_vcd_file(vcd_file: str) -> List[Tuple[int, str]]:
-    """
-    Parse the VCD file and extract signal changes.
-
-    Args:
-        vcd_file: Path to the VCD file.
-
-    Returns:
-        A list of tuples containing the time and event type.
-    """
+    """Parse VCD file and extract signal changes."""
     signal_changes = []
     current_time = 0
 
@@ -47,571 +41,306 @@ def parse_vcd_file(vcd_file: str) -> List[Tuple[int, str]]:
 
     return signal_changes
 
-def find_previous_event(signal_changes: List[Tuple[int, str]], start_index: int, event_type: str) -> int:
-    """
-    Find the most recent event of a given type before a specific index.
-
-    Args:
-        signal_changes: List of signal changes.
-        start_index: Index to start searching backward from.
-        event_type: The event type to search for.
-
-    Returns:
-        The time of the most recent event, or None if not found.
-    """
-    for j in range(start_index - 1, -1, -1):
-        if signal_changes[j][1] == event_type:
-            return signal_changes[j][0]
-    return None
-
-def calculate_rpm(period_ns: int, pulses_per_revolution: int = 2) -> float:
-    """
-    Calculate RPM from a period in nanoseconds.
-
-    Args:
-        period_ns: The period in nanoseconds.
-        pulses_per_revolution: Number of pulses per revolution (default: 2).
-
-    Returns:
-        The calculated RPM.
-    """
-    if period_ns == 0:
+def calculate_rpm_from_period(period_ns: int) -> float:
+    """Calculate RPM from period between triggers (2 pulses per revolution)."""
+    if period_ns <= 0:
         return 0
     period_us = period_ns / 1000.0
-    return (60_000_000.0 / period_us) / pulses_per_revolution
+    return (60_000_000.0 / period_us) / 2  # 2 pulses per revolution
 
-def find_corresponding_dwell(signal_changes: List[Tuple[int, str]], spark_idx: int, spark_time: int) -> float:
-    """
-    Find the dwell start corresponding to a given spark event.
-
-    Args:
-        signal_changes: List of signal changes.
-        spark_idx: Index of the spark event.
-        spark_time: Time of the spark event.
-
-    Returns:
-        The dwell time in microseconds, or None if not found.
-    """
-    for k in range(spark_idx - 1, -1, -1):
-        check_time, check_event = signal_changes[k]
-        if spark_time - check_time > 200000000:  # Stop if too far back (200ms)
-            break
-        if check_event == 'dwell_start':  # Look for dwell_start (falling edge)
-            spark_between = any(
-                signal_changes[m][1] == 'spark_fire'  # Check for other sparks between
-                for m in range(k + 1, spark_idx)
-            )
-            if not spark_between:
-                return (spark_time - check_time) / 1000.0
-    return None
-
-def find_dwell_for_trigger(signal_changes: List[Tuple[int, str]], trigger_idx: int, spark_idx: int, spark_time: int, trigger_time: int) -> float:
-    """
-    Find dwell start after trigger, looking forward to next period.
-    
-    Args:
-        signal_changes: List of signal changes.
-        trigger_idx: Index of the trigger event.
-        spark_idx: Index of the spark event.
-        spark_time: Time of the spark event.
-        trigger_time: Time of the trigger event.
-    
-    Returns:
-        The dwell time in microseconds, or None if not found.
-    """
-    # Calculate expected next trigger time (rough estimate based on period)
-    prev_trigger_time = find_previous_event(signal_changes, trigger_idx, 'trigger_fall')
-    if prev_trigger_time is not None:
-        period_ns = trigger_time - prev_trigger_time
-        next_trigger_time = trigger_time + period_ns
-    else:
-        # Use a default period estimate
-        next_trigger_time = trigger_time + 30000000  # ~30ms default
-    
-    # Look forward from current trigger to find dwell start
-    for k in range(trigger_idx + 1, len(signal_changes)):
-        check_time, check_event = signal_changes[k]
-        
-        # Stop if we've gone past the next trigger time
-        if check_time > next_trigger_time:
-            break
-            
-        if check_event == 'dwell_start':
-            # Check if this dwell belongs to our spark
-            if check_time < spark_time:
-                return (spark_time - check_time) / 1000.0
-    
-    # If no dwell found in next period, pulse is missing
-    return None
-
-def find_trigger_pulse_width(signal_changes, trigger_fall_idx):
-    """Find the trigger pulse width by looking for the next trigger_rise."""
-    if trigger_fall_idx >= len(signal_changes) - 1:
-        return None
-    
-    trigger_fall_time = signal_changes[trigger_fall_idx][0]
-    
-    for j in range(trigger_fall_idx + 1, min(len(signal_changes), trigger_fall_idx + 10)):
-        check_time, check_event = signal_changes[j]
-        if check_event == 'trigger_rise':
-            return (check_time - trigger_fall_time) / 1000.0  # Return in microseconds
-    return None
-
-def analyze_vcd(vcd_file: str) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Analyze VCD timing with updated logic:
-    1. Find trigger edge T0
-    2. Find next trigger edge T1  
-    3. Find next dwell start D0 (falling edge of spark signal)
-    4. If T1 < D0 then missing, go to next trigger
-    5. Find spark fire S0 (rising edge of spark signal)
-    6. Advance = S0 - T0, if S0 > T1 then subtract period (previous lobe)
-    """
-    signal_changes = parse_vcd_file(vcd_file)
-    print(f"Found {len(signal_changes)} signal changes")
-
-    timing_events = []
-    missing_spark_events = []
-    
-    i = 0
-    last_valid_trigger_time = None  # Track last trigger that passed the period filter
-    while i < len(signal_changes):
-        time, event = signal_changes[i]
-        
-        if event != 'trigger_fall':
-            i += 1
-            continue
-
-        T0 = time
-
-        # Use last_valid_trigger_time for period calculation
-        T_prev = last_valid_trigger_time
-
-        if T_prev is None:
-            last_valid_trigger_time = T0
-            i += 1
-            continue  # No previous valid trigger, skip first
-
-        period_ns = T0 - T_prev
-        if period_ns < 4_000_000:
-            # Do not update last_valid_trigger_time, skip this trigger
-            i += 1
-            continue
-
-        rpm = calculate_rpm(period_ns)
-
-        # Only now update last_valid_trigger_time
-        last_valid_trigger_time = T0
-
-        # Step 2: Find next trigger edge T1 (for detecting missing sparks)
-        T1 = None
-        j = i + 1
-        while j < len(signal_changes):
-            check_time, check_event = signal_changes[j]
-            if check_event == 'trigger_fall':
-                T1 = check_time
-                break
-            j += 1
-        
-        if T1 is None:
-            i += 1
-            continue  # No next trigger found
-        
-        # Step 3: Find next dwell start D0 (falling edge of spark signal)
-        D0 = None
-        k = i + 1
-        while k < len(signal_changes):
-            check_time, check_event = signal_changes[k]
-            if check_time >= T1:
-                break  # Gone past next trigger
-            if check_event == 'dwell_start':  # Falling edge starts dwell
-                D0 = check_time
-                break
-            k += 1
-        
-        # Step 4: Check if T1 < D0 (missing spark)
-        if D0 is None or T1 < D0:
-            missing_spark_events.append({
-                'time_sec': T0 / 1e9,
-                'rpm': rpm,
-                'reason': 'Missing spark - no dwell before next trigger'
-            })
-            i += 1
-            continue
-            
-        # Step 5: Find spark fire S0 (rising edge of spark signal)
-        S0 = None
-        dwell_time = None
-        m = k + 1
-        while m < len(signal_changes):
-            check_time, check_event = signal_changes[m]
-            # Don't stop at T1 - spark might be in next period for previous-lobe
-            if (check_time - T0) > 200000000:  # 200ms max search
-                break
-            if check_event == 'spark_fire':  # Rising edge fires spark
-                S0 = check_time
-                dwell_time = (S0 - D0) / 1000.0  # microseconds
-                break
-            m += 1
-            
-        if S0 is None:
-            missing_spark_events.append({
-                'time_sec': T0 / 1e9,
-                'rpm': rpm,
-                'reason': 'No spark found after dwell start'
-            })
-            i += 1
-            continue
-            
-        # Step 6: Calculate advance
-        spark_delay_us = (S0 - T0) / 1000.0
-        period_us = period_ns / 1000.0
-        
-        # Check if previous-lobe timing (S0 > T1)
-        if S0 > T1:
-            is_previous_lobe = True
-            # Subtract period to get actual timing within cycle
-            actual_delay_us = spark_delay_us - period_us
-        else:
-            is_previous_lobe = False
-            actual_delay_us = spark_delay_us
-            
-        # Convert to degrees (180° per trigger period)
-        degrees_per_us = 180.0 / period_us
-        delay_degrees = actual_delay_us * degrees_per_us
-        advance_degrees = 47.0 - delay_degrees
-        
-        # Only keep valid measurements
-        if 0 <= advance_degrees <= 47:
-            # Find trigger pulse width
-            trigger_pulse_width_us = None
-            for n in range(i + 1, min(i + 10, len(signal_changes))):
-                if signal_changes[n][1] == 'trigger_rise':
-                    trigger_pulse_width_us = (signal_changes[n][0] - T0) / 1000.0
-                    break
-                    
-            timing_events.append({
-                'trigger_ns': T0,  # VCD timestamp for trigger
-                'spark_ns': S0,    # VCD timestamp for spark
-                'time_sec': T0 / 1e9,
-                'rpm': rpm,
-                'delay_us': actual_delay_us,
-                'delay_degrees': delay_degrees,
-                'advance_degrees': advance_degrees,
-                'dwell_us': dwell_time,
-                'trigger_pulse_width_us': trigger_pulse_width_us,
-                'is_previous_lobe': is_previous_lobe
-            })
-        
-        i += 1
-
-    print(f"\nFound {len(timing_events)} timing measurements")
-    print(f"Found {len(missing_spark_events)} missing spark events")
-
-    return timing_events, missing_spark_events
-
-def get_theoretical_curve(rpm_range):
-    """
-    Load and interpolate the Cubic + SavGol smoothed timing curve.
-    Falls back to original linear interpolation if file not found.
-    """
+def get_theoretical_advance(rpm: float) -> float:
+    """Calculate theoretical advance using interpolated smooth curve."""
     try:
-        # Try to load the Cubic + SavGol curve from CSV
+        # Try to load the smoothed curve from CSV
         import os
         curve_file = 'timing_curve_cubic.csv'
         
         if os.path.exists(curve_file):
-            # Load the smoothed curve
-            curve_rpm = []
-            curve_advance = []
+            # Load the smoothed curve data once and cache it
+            if not hasattr(get_theoretical_advance, 'curve_data'):
+                curve_rpm = []
+                curve_advance = []
+                
+                with open(curve_file, 'r') as f:
+                    reader = csv.reader(f)
+                    next(reader)  # Skip comment line
+                    next(reader)  # Skip header
+                    for row in reader:
+                        curve_rpm.append(float(row[0]))
+                        curve_advance.append(float(row[1]))
+                
+                get_theoretical_advance.curve_data = (curve_rpm, curve_advance)
             
-            with open(curve_file, 'r') as f:
-                reader = csv.reader(f)
-                next(reader)  # Skip comment line
-                next(reader)  # Skip header
-                for row in reader:
-                    curve_rpm.append(float(row[0]))
-                    curve_advance.append(float(row[1]))
+            # Interpolate for the requested RPM
+            curve_rpm, curve_advance = get_theoretical_advance.curve_data
+            return float(np.interp(rpm, curve_rpm, curve_advance))
             
-            # Interpolate to match the requested RPM range
-            from scipy.interpolate import interp1d
-            f_interp = interp1d(curve_rpm, curve_advance, kind='linear', 
-                               bounds_error=False, fill_value='extrapolate')
-            safe_curve = f_interp(rpm_range)
-            safe_curve = np.clip(safe_curve, 0, 20)
-            
-            print("Using Cubic + SavGol smoothed curve for comparison")
-            return safe_curve
-            
-    except (FileNotFoundError, ImportError) as e:
-        print(f"Using original linear curve (could not load smoothed curve: {e})")
+    except (FileNotFoundError, ImportError, ValueError):
+        pass
     
-    # Fallback to original linear interpolation
-    safe_curve = []
-    for rpm in rpm_range:
-        if rpm <= 1000:
-            safe_adv = rpm * 0.006  # 0-6° from 0-1000 RPM
-        elif rpm <= 2000:
-            safe_adv = 6 + (rpm - 1000) * 0.006  # 6-12° from 1000-2000 RPM
-        elif rpm <= 3000:
-            safe_adv = 12 + (rpm - 2000) * 0.003  # 12-15° from 2000-3000 RPM
-        elif rpm <= 4000:
-            safe_adv = 15  # Hold at 15°
-        elif rpm <= 5000:
-            safe_adv = 15 - (rpm - 4000) * 0.001  # 15-14° from 4000-5000 RPM
-        elif rpm <= 6000:
-            safe_adv = 14 - (rpm - 5000) * 0.001  # 14-13° from 5000-6000 RPM
-        else:
-            safe_adv = 13 - (rpm - 6000) * 0.001  # 13-12° from 6000-7000 RPM
-        
-        safe_curve.append(max(0, safe_adv))
-    
-    return np.array(safe_curve)
+    # Fallback to simple curve if file not available
+    if rpm <= 1000:
+        return rpm * 0.006  # 0-6° from 0-1000 RPM
+    elif rpm <= 2000:
+        return 6 + (rpm - 1000) * 0.006  # 6-12° from 1000-2000 RPM
+    elif rpm <= 3000:
+        return 12 + (rpm - 2000) * 0.003  # 12-15° from 2000-3000 RPM
+    elif rpm <= 4000:
+        return 15  # Hold at 15°
+    elif rpm <= 5000:
+        return 15 - (rpm - 4000) * 0.001  # 15-14° from 4000-5000 RPM
+    elif rpm <= 6000:
+        return 14 - (rpm - 5000) * 0.001  # 14-13° from 5000-6000 RPM
+    else:
+        return max(12 - (rpm - 6000) * 0.001, 10)  # 13-12° from 6000-7000 RPM
 
-def generate_csv_output(timing_events, missing_spark_events):
-    """Generate CSV files with timing data."""
+def analyze_triggers(vcd_file: str) -> List[Dict]:
+    """
+    Simple first-principles spark detection:
+    For trigger T1 and next trigger T2:
+    - If spark exists > T1 and <= T2, it belongs to T1
+    - Otherwise T1 has missing spark
+    - Find dwell start > T1 and < T2 (can be negative delay = previous lobe)
+    """
+    signal_changes = parse_vcd_file(vcd_file)
+    print(f"Found {len(signal_changes)} signal changes")
     
-    # Main timing analysis CSV
+    results = []
+    
+    # Find all trigger falling edges
+    trigger_indices = []
+    for i, (time, event) in enumerate(signal_changes):
+        if event == 'trigger_fall':
+            trigger_indices.append(i)
+    
+    print(f"Found {len(trigger_indices)} trigger pulses")
+    
+    # Process each trigger (skip last one - no next trigger)
+    for idx in range(len(trigger_indices) - 1):
+        T1_idx = trigger_indices[idx]
+        T2_idx = trigger_indices[idx + 1]
+        T1_time = signal_changes[T1_idx][0]
+        T2_time = signal_changes[T2_idx][0]
+        trigger_num = idx + 1
+        
+        # Calculate period and RPM
+        period_ns = T2_time - T1_time
+        
+        # Skip noise pulses (too short period)
+        if period_ns < 4_000_000:  # Less than 4ms
+            continue
+            
+        rpm = calculate_rpm_from_period(period_ns)
+        period_us = period_ns / 1000.0
+        
+        # Find spark between T1 and T2: spark > T1_time and spark <= T2_time
+        spark_time = None
+        spark_found = False
+        
+        for i in range(len(signal_changes)):
+            time, event = signal_changes[i]
+            if event == 'spark_fire' and time > T1_time and time <= T2_time:
+                spark_time = time
+                spark_found = True
+                break
+        
+        # Calculate timing if spark found
+        if spark_found:
+            delay_us = (spark_time - T1_time) / 1000.0
+            
+            # Find dwell start by going backward from spark
+            dwell_start_time = None
+            for i in range(len(signal_changes)):
+                time, event = signal_changes[i]
+                if time >= spark_time:
+                    # Found spark or later event, search backwards for dwell_start
+                    for j in range(i-1, -1, -1):
+                        back_time, back_event = signal_changes[j]
+                        if back_event == 'dwell_start':
+                            # Found a dwell start, check if it's reasonable (within 50ms)
+                            if (spark_time - back_time) < 50_000_000:  # 50ms limit
+                                dwell_start_time = back_time
+                                break
+                    break
+            
+            # Calculate dwell duration (always positive) and delay (can be negative)
+            if dwell_start_time is not None:
+                dwell_us = (spark_time - dwell_start_time) / 1000.0  # Always positive
+                dwell_delay_us = (dwell_start_time - T1_time) / 1000.0  # Can be negative for previous-lobe
+            else:
+                dwell_us = None
+                dwell_delay_us = None
+            
+            # Convert delay to degrees (180° per trigger period)
+            degrees_per_us = 180.0 / period_us
+            delay_degrees = delay_us * degrees_per_us
+            advance_degrees = 47.0 - delay_degrees  # 47° is TDC position
+        else:
+            # Missing spark
+            delay_us = None
+            delay_degrees = None
+            advance_degrees = None
+            dwell_us = None
+            dwell_delay_us = None
+        
+        # Calculate theoretical advance and delay
+        theoretical_advance = get_theoretical_advance(rpm)
+        
+        # Convert theoretical advance to delay in microseconds
+        # theoretical_advance is degrees BTDC, delay is degrees ATDC
+        theoretical_delay_degrees = 47.0 - theoretical_advance  # 47° is TDC position
+        degrees_per_us = 180.0 / period_us if period_us > 0 else 0
+        theoretical_delay_us = theoretical_delay_degrees / degrees_per_us if degrees_per_us > 0 else None
+        
+        # Calculate error if spark present
+        if advance_degrees is not None:
+            error_degrees = advance_degrees - theoretical_advance
+        else:
+            error_degrees = None
+        
+        results.append({
+            'trigger_num': trigger_num,
+            'trigger_time_ns': T1_time,
+            'trigger_time_ms': T1_time / 1_000_000,
+            'period_us': period_us,
+            'rpm': rpm,
+            'spark_found': spark_found,
+            'delay_us': delay_us,
+            'delay_degrees': delay_degrees,
+            'advance_degrees': advance_degrees,
+            'dwell_us': dwell_us,
+            'dwell_delay_us': dwell_delay_us,
+            'theoretical_advance': theoretical_advance,
+            'theoretical_delay_us': theoretical_delay_us,
+            'error_degrees': error_degrees
+        })
+    
+    return results
+
+def generate_csv_output(results: List[Dict]):
+    """Generate CSV file with one line per trigger."""
     with open('wokwi-logic-analysis.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         
-        # Calculate theoretical curve for comparison
-        rpms = [event['rpm'] for event in timing_events]
-        if rpms:
-            rpm_range = np.linspace(min(rpms), max(rpms), 100)
-            safe_curve = get_theoretical_curve(rpm_range)
-            
-            # Create lookup for theoretical values
-            safe_interp = np.interp(rpms, rpm_range, safe_curve)
-        else:
-            safe_interp = []
-        
         # Header
         writer.writerow([
-            'trigger_ns', 'spark_ns', 'time_sec', 'rpm', 'period_us', 'delay_us', 'delay_degrees', 'advance_degrees',
-            'dwell_us', 'trigger_pulse_width_us', 'is_previous_lobe', 'safe_advance',
-            'error_degrees', 'error_percent'
+            'trigger_num', 'time_ms', 'period_us', 'rpm', 
+            'spark_found', 'delay_us', 'delay_degrees', 
+            'advance_degrees', 'dwell_us', 'dwell_delay_us', 'theoretical_advance', 
+            'theoretical_delay_us', 'error_degrees'
         ])
         
         # Data rows
-        for i, event in enumerate(timing_events):
-            safe_val = safe_interp[i] if i < len(safe_interp) else 0.0
-            actual_val = event['advance_degrees']
-            error_degrees = actual_val - safe_val
-            # Calculate percentage error relative to safe value (or use 1 if safe value is 0)
-            if safe_val != 0:
-                error_percent = (error_degrees / safe_val) * 100
-            else:
-                error_percent = error_degrees * 100  # If safe value is 0, treat error as percentage
-            
-            # Calculate period in microseconds (60,000,000 / (rpm * 2))
-            period_us = 60_000_000 / (event['rpm'] * 2) if event['rpm'] > 0 else 0
-            
+        for r in results:
             writer.writerow([
-                f"{event['trigger_ns']}",
-                f"{event['spark_ns']}",
-                f"{event['time_sec']:.3f}",
-                f"{event['rpm']:.0f}",
-                f"{period_us:.1f}",
-                f"{event['delay_us']:.1f}",
-                f"{event['delay_degrees']:.2f}",
-                f"{event['advance_degrees']:.2f}",
-                f"{event['dwell_us']:.1f}" if event['dwell_us'] is not None else "N/A",
-                f"{event['trigger_pulse_width_us']:.1f}" if event['trigger_pulse_width_us'] is not None else "N/A",
-                event['is_previous_lobe'],
-                f"{safe_val:.2f}",
-                f"{error_degrees:.2f}",
-                f"{error_percent:.1f}"
+                r['trigger_num'],
+                f"{r['trigger_time_ms']:.3f}",
+                f"{r['period_us']:.1f}",
+                f"{r['rpm']:.0f}",
+                r['spark_found'],
+                f"{r['delay_us']:.1f}" if r['delay_us'] is not None else 'MISSING',
+                f"{r['delay_degrees']:.2f}" if r['delay_degrees'] is not None else 'MISSING',
+                f"{r['advance_degrees']:.2f}" if r['advance_degrees'] is not None else 'MISSING',
+                f"{r['dwell_us']:.1f}" if r['dwell_us'] is not None else 'MISSING',
+                f"{r['dwell_delay_us']:.1f}" if r['dwell_delay_us'] is not None else 'MISSING',
+                f"{r['theoretical_advance']:.2f}",
+                f"{r['theoretical_delay_us']:.1f}" if r['theoretical_delay_us'] is not None else 'N/A',
+                f"{r['error_degrees']:.2f}" if r['error_degrees'] is not None else 'N/A'
             ])
     
-    # Missing sparks CSV
-    with open('wokwi-logic-missing-sparks.csv', 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['time_sec', 'rpm', 'reason']);
-        
-        for event in missing_spark_events:
-            writer.writerow([
-                f"{event['time_sec']:.3f}",
-                f"{event['rpm']:.0f}",
-                event['reason']
-            ])
+    print(f"Generated wokwi-logic-analysis.csv with {len(results)} trigger events")
 
-def create_timing_vs_rpm_plot(timing_events):
-    """Create ignition timing vs RPM plot with scatter points."""
-    if not timing_events:
-        print("No timing events to plot")
+def create_timing_plot(results: List[Dict]):
+    """Create plots showing timing analysis and dwell characteristics."""
+    if not results:
+        print("No results to plot")
         return
     
-    # Show ALL data - no filtering
-    all_advances = [event['advance_degrees'] for event in timing_events]
-    all_rpms = [event['rpm'] for event in timing_events]
+    # Separate data into found and missing sparks
+    found_results = [r for r in results if r['spark_found']]
+    missing_results = [r for r in results if not r['spark_found']]
     
-    print(f"Advance range: {min(all_advances):.1f}° to {max(all_advances):.1f}°")
-    print(f"RPM range: {min(all_rpms):.0f} to {max(all_rpms):.0f}")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12))
     
-    # Use all events - no filtering
-    rpms = np.array(all_rpms)
-    advances = np.array(all_advances)
+    # Top plot: Timing advance vs RPM
+    if found_results:
+        found_rpms = [r['rpm'] for r in found_results]
+        found_advances = [r['advance_degrees'] for r in found_results]
+        ax1.scatter(found_rpms, found_advances, alpha=0.4, s=8, c='blue', 
+                   label=f'Observed ({len(found_results)} sparks)', zorder=2)
     
-    # Output plot data to CSV for verification
-    with open('plot_data_verification.csv', 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['rpm', 'advance_degrees', 'data_source'])
-        for event in timing_events:
-            writer.writerow([
-                f"{event['rpm']:.0f}",
-                f"{event['advance_degrees']:.2f}",
-                'plot_data'
-            ])
+    # Plot theoretical curve
+    if results:
+        rpm_range = np.linspace(0, max([r['rpm'] for r in results]), 100)
+        theoretical_curve = [get_theoretical_advance(rpm) for rpm in rpm_range]
+        ax1.plot(rpm_range, theoretical_curve, 'r--', linewidth=2, 
+                label='Theoretical curve', zorder=1)
     
-    print(f"Plot data written to plot_data_verification.csv ({len(timing_events)} points)")
-    
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-    
-    # Generate theoretical curve
-    rpm_range = np.linspace(0, 8000, 100)
-    safe_curve = get_theoretical_curve(rpm_range)
-    
-    # Upper plot: Timing vs RPM with scatter points
-    ax1.scatter(rpms, advances, alpha=0.3, s=20, c='lightblue', label='Individual measurements', zorder=1)
-    
-    # Calculate measured curve (binned averages with error bars)
-    # Start binning from the minimum measured RPM (rounded down to nearest 50)
-    min_rpm = min(rpms) if rpms.size > 0 else 0
-    min_bin = (min_rpm // 50) * 50
-    rpm_bins = np.arange(min_bin, 8000, 100)
-    bin_centers = rpm_bins[:-1] + 50
-    bin_means = []
-    bin_stds = []
-    
-    for i in range(len(rpm_bins)-1):
-        mask = (rpms >= rpm_bins[i]) & (rpms < rpm_bins[i+1])
-        if np.sum(mask) > 0:
-            bin_means.append(np.mean(advances[mask]))
-            bin_stds.append(np.std(advances[mask]))
-        else:
-            bin_means.append(np.nan)
-            bin_stds.append(np.nan)
-    
-    # Remove NaN values for plotting
-    valid_mask = ~np.isnan(bin_means)
-    valid_centers = bin_centers[valid_mask]
-    valid_means = np.array(bin_means)[valid_mask]
-    valid_stds = np.array(bin_stds)[valid_mask]
-    
-    # Output binned data to CSV for verification
-    with open('binned_plot_data.csv', 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['rpm_bin_center', 'mean_advance_degrees', 'std_advance_degrees', 'data_source'])
-        for i in range(len(valid_centers)):
-            writer.writerow([
-                f"{valid_centers[i]:.0f}",
-                f"{valid_means[i]:.2f}",
-                f"{valid_stds[i]:.2f}",
-                'binned_plot_data'
-            ])
-    
-    print(f"Binned plot data written to binned_plot_data.csv ({len(valid_centers)} bins)")
-    
-    # Plot curves
-    ax1.plot(rpm_range, safe_curve, '--', color='orange', linewidth=2, label='Target (Cubic+SavGol)')
-    ax1.errorbar(valid_centers, valid_means, yerr=valid_stds, fmt='o-', 
-                color='blue', capsize=3, capthick=1, linewidth=2, 
-                label='Measured (±1σ)', zorder=3)
+    # Mark missing sparks on theoretical curve
+    if missing_results:
+        missing_rpms = [r['rpm'] for r in missing_results]
+        missing_theoretical = [r['theoretical_advance'] for r in missing_results]
+        ax1.scatter(missing_rpms, missing_theoretical, marker='x', s=25, c='red', 
+                   label=f'Missing sparks ({len(missing_results)})', zorder=3)
     
     ax1.set_xlabel('RPM')
     ax1.set_ylabel('Ignition Advance (degrees BTDC)')
-    ax1.set_title('Ignition Timing vs RPM')
+    ax1.set_title('Ignition Timing: Observed vs Theoretical')
     ax1.grid(True, alpha=0.3)
     ax1.legend()
-    ax1.set_xlim(0, 8000)
-    # Set y-axis limits based on actual data range (with some padding)
-    if timing_events:
-        y_min = min(all_advances) - 1
-        y_max = max(all_advances) + 1
-        ax1.set_ylim(y_min, y_max)
+    ax1.set_xlim(0, max([r['rpm'] for r in results]) + 200 if results else 8000)
+    ax1.set_ylim(-5, 25)
+    
+    # Bottom plot: Dwell time and duty cycle vs RPM
+    dwell_results = [r for r in found_results if r['dwell_us'] is not None]
+    
+    if dwell_results:
+        dwell_rpms = np.array([r['rpm'] for r in dwell_results])
+        dwell_times_ms = np.array([r['dwell_us'] / 1000.0 for r in dwell_results])
+        periods_us = np.array([r['period_us'] for r in dwell_results])
+        duty_cycles = (np.array([r['dwell_us'] for r in dwell_results]) / periods_us) * 100
+        
+        # Create twin y-axis for duty cycle
+        ax2_twin = ax2.twinx()
+        
+        # Plot dwell time (left axis)
+        ax2.scatter(dwell_rpms, dwell_times_ms, alpha=0.4, s=8, c='green', 
+                   label='Dwell time', zorder=2)
+        
+        # Plot duty cycle (right axis) 
+        ax2_twin.scatter(dwell_rpms, duty_cycles, alpha=0.4, s=8, c='orange',
+                        label='Duty cycle', zorder=2)
+        
+        # Add reference lines
+        ax2.axhline(y=3, color='green', linestyle='--', alpha=0.7, 
+                   label='Target 3ms dwell')
+        ax2_twin.axhline(y=40, color='orange', linestyle='--', alpha=0.7,
+                        label='40% max duty cycle')
+        
+        # Configure axes
+        ax2.set_xlabel('RPM')
+        ax2.set_ylabel('Dwell Time (ms)', color='green')
+        ax2_twin.set_ylabel('Duty Cycle (%)', color='orange')
+        ax2.set_title('Dwell Time and Duty Cycle vs RPM')
+        ax2.grid(True, alpha=0.3)
+        
+        # Color the tick labels
+        ax2.tick_params(axis='y', labelcolor='green')
+        ax2_twin.tick_params(axis='y', labelcolor='orange')
+        
+        # Set axis limits
+        ax2.set_xlim(0, max([r['rpm'] for r in results]) + 200 if results else 8000)
+        ax2.set_ylim(0, max(dwell_times_ms) * 1.1 if len(dwell_times_ms) > 0 else 10)
+        ax2_twin.set_ylim(0, max(duty_cycles) * 1.1 if len(duty_cycles) > 0 else 50)
+        
+        # Legends
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_twin.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
     else:
-        ax1.set_ylim(-5, 25)
-    
-    # Lower plot: Duty Cycle and Dwell Time vs RPM
-    # Filter out events with None dwell_us values
-    valid_events = [event for event in timing_events if event['dwell_us'] is not None]
-    dwells = np.array([event['dwell_us'] for event in valid_events])
-    valid_rpms = np.array([event['rpm'] for event in valid_events])
-    
-    # Calculate duty cycle: dwell_time / period_time * 100
-    periods_us = 60_000_000 / (valid_rpms * 2)  # Period between triggers in microseconds
-    duty_cycles = (dwells / periods_us) * 100
-    
-    # Create twin axis for dwell time
-    ax2_twin = ax2.twinx()
-    
-    # Plot duty cycle (left axis)
-    ax2.scatter(valid_rpms, duty_cycles, alpha=0.3, s=20, c='lightgreen', label='Individual duty cycle', zorder=1)
-    
-    # Calculate duty cycle statistics by RPM bins
-    duty_means = []
-    duty_stds = []
-    dwell_means = []
-    dwell_stds = []
-    
-    for i in range(len(rpm_bins)-1):
-        mask = (valid_rpms >= rpm_bins[i]) & (valid_rpms < rpm_bins[i+1])
-        if np.sum(mask) > 0:
-            duty_means.append(np.mean(duty_cycles[mask]))
-            duty_stds.append(np.std(duty_cycles[mask]))
-            dwell_means.append(np.mean(dwells[mask]))
-            dwell_stds.append(np.std(dwells[mask]))
-        else:
-            duty_means.append(np.nan)
-            duty_stds.append(np.nan)
-            dwell_means.append(np.nan)
-            dwell_stds.append(np.nan)
-    
-    # Remove NaN values for plotting
-    valid_duty_mask = ~np.isnan(duty_means)
-    valid_duty_centers = bin_centers[valid_duty_mask]
-    valid_duty_means = np.array(duty_means)[valid_duty_mask]
-    valid_duty_stds = np.array(duty_stds)[valid_duty_mask]
-    valid_dwell_means = np.array(dwell_means)[valid_duty_mask]
-    valid_dwell_stds = np.array(dwell_stds)[valid_duty_mask]
-    
-    # Plot duty cycle trend line (left axis)
-    ax2.errorbar(valid_duty_centers, valid_duty_means, yerr=valid_duty_stds,
-                fmt='o-', color='green', capsize=3, capthick=1, linewidth=2,
-                label='Mean duty cycle ± std dev', zorder=3)
-    
-    # Plot dwell time scatter (right axis)
-    ax2_twin.scatter(valid_rpms, dwells/1000, alpha=0.3, s=20, c='lightcoral', label='Individual dwell time', zorder=1)
-    
-    # Plot dwell time trend line (right axis)
-    ax2_twin.errorbar(valid_duty_centers, valid_dwell_means/1000, yerr=valid_dwell_stds/1000,
-                     fmt='s-', color='red', capsize=3, capthick=1, linewidth=2,
-                     label='Mean dwell time ± std dev', zorder=3)
-    
-    # Add reference lines
-    ax2.axhline(y=40, color='orange', linestyle='--', alpha=0.7, label='40% max duty cycle')
-    ax2_twin.axhline(y=3, color='blue', linestyle='--', alpha=0.7, label='Target 3ms dwell')
-    
-    # Configure axes
-    ax2.set_xlabel('RPM')
-    ax2.set_ylabel('Duty Cycle (%)', color='green')
-    ax2_twin.set_ylabel('Dwell Time (ms)', color='red')
-    ax2.set_title('Duty Cycle and Dwell Time vs RPM')
-    ax2.grid(True, alpha=0.3)
-    
-    # Configure colors
-    ax2.tick_params(axis='y', labelcolor='green')
-    ax2_twin.tick_params(axis='y', labelcolor='red')
-    
-    # Legends
-    ax2.legend(loc='upper left')
-    ax2_twin.legend(loc='upper right')
-    
-    ax2.set_xlim(0, 8000)
-    ax2.set_ylim(0, 50)  # 0-50% duty cycle
-    ax2_twin.set_ylim(0, 5)  # 0-5ms dwell time
+        ax2.text(0.5, 0.5, 'No dwell data available', transform=ax2.transAxes,
+                ha='center', va='center', fontsize=12)
+        ax2.set_title('Dwell Time and Duty Cycle vs RPM')
     
     plt.tight_layout()
     plt.savefig('timing_vs_rpm.png', dpi=300, bbox_inches='tight')
@@ -619,95 +348,46 @@ def create_timing_vs_rpm_plot(timing_events):
     
     print("Generated timing_vs_rpm.png")
 
-def create_waveforms_plot(timing_events):
-    """Create timing waveforms plot showing sample waveforms at different RPMs."""
-    if not timing_events:
-        print("No timing events to plot")
+def print_summary(results: List[Dict]):
+    """Print analysis summary."""
+    if not results:
+        print("No results to summarize")
         return
     
-    # Select representative RPM points
-    rpms = np.array([event['rpm'] for event in timing_events])
-    target_rpms = [1000, 2000, 4000, 6000]
+    total_triggers = len(results)
+    found_sparks = sum(1 for r in results if r['spark_found'])
+    missing_sparks = total_triggers - found_sparks
     
-    fig, axes = plt.subplots(len(target_rpms), 1, figsize=(12, 8))
-    if len(target_rpms) == 1:
-        axes = [axes]
+    print("\n" + "="*50)
+    print("TIMING ANALYSIS SUMMARY")
+    print("="*50)
+    print(f"Total trigger pulses analyzed: {total_triggers}")
+    print(f"Sparks found: {found_sparks} ({100*found_sparks/total_triggers:.1f}%)")
+    print(f"Sparks missing: {missing_sparks} ({100*missing_sparks/total_triggers:.1f}%)")
     
-    for i, target_rpm in enumerate(target_rpms):
-        # Find closest measurement to target RPM
-        closest_idx = np.argmin(np.abs(rpms - target_rpm))
-        event = timing_events[closest_idx]
-        actual_rpm = event['rpm']
+    if found_sparks > 0:
+        found_results = [r for r in results if r['spark_found']]
+        rpms = [r['rpm'] for r in found_results]
+        advances = [r['advance_degrees'] for r in found_results]
+        errors = [r['error_degrees'] for r in found_results]
         
-        # Calculate period and timing
-        period_us = 60_000_000 / (actual_rpm * 2)  # Period between triggers
-        delay_us = event['delay_us']
-        dwell_us = event['dwell_us'] if event['dwell_us'] else 3000
-        trigger_pulse_width_us = event['trigger_pulse_width_us'] if event['trigger_pulse_width_us'] else 500
+        print(f"\nRPM range: {min(rpms):.0f} - {max(rpms):.0f}")
+        print(f"Advance range: {min(advances):.1f}° - {max(advances):.1f}°")
+        print(f"Mean error: {np.mean(errors):.2f}°")
+        print(f"Error std dev: {np.std(errors):.2f}°")
         
-        # Create time axis (show ~2.5 periods)
-        time_span_us = period_us * 2.5
-        time_us = np.linspace(0, time_span_us, 1000)
-        
-        # Generate trigger signal (normally HIGH, brief LOW pulse at trigger times)
-        trigger_signal = np.ones_like(time_us) * 3
-        for trigger_time in [0, period_us, period_us * 2]:
-            if trigger_time < time_span_us:
-                # Add trigger falling edge (measured pulse width from VCD data)
-                pulse_start = trigger_time
-                pulse_end = trigger_time + trigger_pulse_width_us
-                pulse_mask = (time_us >= pulse_start) & (time_us <= pulse_end)
-                trigger_signal[pulse_mask] = 0
-        
-        # Generate spark signal (normally HIGH, goes LOW during dwell, returns HIGH at spark)
-        spark_signal = np.ones_like(time_us) * 2  # Default HIGH
-        for trigger_time in [0, period_us, period_us * 2]:
-            spark_time = trigger_time + delay_us
-            dwell_start_time = spark_time - dwell_us
-            
-            if spark_time < time_span_us and dwell_start_time >= 0:
-                # Dwell period: signal goes LOW (coil charging)
-                dwell_mask = (time_us >= dwell_start_time) & (time_us < spark_time)
-                spark_signal[dwell_mask] = 0
-                
-                # Spark fires on rising edge at spark_time (end of dwell)
-                # The signal returns to HIGH after dwell ends
-        
-        # Plot signals
-        ax = axes[i]
-        ax.plot(time_us / 1000, trigger_signal, 'b-', linewidth=2, label='Trigger')
-        ax.plot(time_us / 1000, spark_signal, 'r-', linewidth=2, label='Spark')
-        
-        # Add timing annotations
-        advance_angle = event['advance_degrees']
-        btdc_label = f"{advance_angle:.1f}° BTDC"
-        dwell_label = f"{dwell_us/1000:.1f} ms dwell"
-        
-        ax.text(0.02, 0.95, btdc_label, transform=ax.transAxes, 
-                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7),
-                verticalalignment='top')
-        ax.text(0.02, 0.80, dwell_label, transform=ax.transAxes,
-                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7),
-                verticalalignment='top')
-        
-        ax.set_ylabel('Signal')
-        ax.set_title(f'{int(actual_rpm)} RPM (Same-lobe)' if not event['is_previous_lobe'] 
-                    else f'{int(actual_rpm)} RPM (Previous-lobe) - {advance_angle:.1f}° advance - GOOD')
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(-0.5, 3.5)
-        
-        if i == 0:
-            ax.legend()
-        if i == len(target_rpms) - 1:
-            ax.set_xlabel('Time (ms)')
+        # Count dwell delay statistics
+        dwell_delays = [r['dwell_delay_us'] for r in found_results if r.get('dwell_delay_us') is not None]
+        if dwell_delays:
+            positive_delays = sum(1 for d in dwell_delays if d > 0)
+            negative_delays = sum(1 for d in dwell_delays if d < 0)
+            print(f"\nDwell delays: {positive_delays} positive, {negative_delays} negative")
+            print(f"Dwell delay range: {min(dwell_delays):.1f} to {max(dwell_delays):.1f} μs")
     
-    plt.suptitle('Ignition Timing Waveforms')
-    plt.tight_layout()
-    plt.savefig('timing_waveforms.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print("Generated timing_waveforms.png")
-
+    if missing_sparks > 0:
+        missing_results = [r for r in results if not r['spark_found']]
+        missing_rpms = [r['rpm'] for r in missing_results]
+        print(f"\nMissing sparks at RPMs: {sorted(set(int(r) for r in missing_rpms))}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -715,27 +395,14 @@ if __name__ == "__main__":
         sys.exit(1)
     
     vcd_file = sys.argv[1]
-    timing_events, missing_spark_events = analyze_vcd(vcd_file)
+    results = analyze_triggers(vcd_file)
     
-    # Generate CSV output files
-    generate_csv_output(timing_events, missing_spark_events)
-    print("Generated CSV files: wokwi-logic-analysis.csv, wokwi-logic-missing-sparks.csv")
+    # Generate output
+    generate_csv_output(results)
+    create_timing_plot(results)
+    print_summary(results)
     
-    # Generate plots
-    create_timing_vs_rpm_plot(timing_events)
-    create_waveforms_plot(timing_events)
-    
-    print("\nAnalysis complete! Generated:")
-    print("- CSV files with timing data")
-    print("- timing_vs_rpm.png (with scatter points)")
-    print("- timing_waveforms.png")
-    
-    # Summary statistics
-    if timing_events:
-        rpms = [event['rpm'] for event in timing_events]
-        advances = [event['advance_degrees'] for event in timing_events]
-        print(f"\nSummary:")
-        print(f"RPM range: {min(rpms):.0f} - {max(rpms):.0f}")
-        print(f"Advance range: {min(advances):.1f}° - {max(advances):.1f}° BTDC")
-        print(f"Timing measurements: {len(timing_events)}")
-        print(f"Missing spark events: {len(missing_spark_events)}")
+    print("\nAnalysis complete!")
+    print("Generated files:")
+    print("- wokwi-logic-analysis.csv")
+    print("- timing_vs_rpm.png")
