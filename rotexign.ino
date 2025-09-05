@@ -427,6 +427,12 @@ ISR(INT0_vect) {
       Engine::period_ticks = period_ticks_candidate;
       uint16_t previous_time = Engine::tcnt;
       Engine::tcnt=tcnt_candidate;
+/*
+      uint16_t dwell_ticks = Timing::get_dwell(period_ticks_candidate);
+      uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks_candidate,dwell_ticks);
+      bool scheduled_normally = schedule_dwell(tcnt_candidate + dwell_delay_ticks, dwell_ticks);
+*/
+
       Timing::add_event(tcnt_candidate, previous_time, period_ticks_candidate);
     }
 
@@ -488,55 +494,7 @@ void setup() {
   sei();
 }
 
-namespace Logger {
-  struct LogEntry {
-    uint16_t time;
-    uint16_t previous_time;
-    uint16_t period_ticks;
-    uint16_t dwell_ticks;
-    uint16_t dwell_delay_ticks;
-  };
 
-  constexpr uint8_t LOG_BUFFER_SIZE = 128;
-  LogEntry log_buffer[LOG_BUFFER_SIZE];
-  uint8_t log_head = 0;
-  uint8_t log_tail = 0;
-  bool log_full = false;
-
-  // Add an entry to the log buffer
-  void add_log(uint16_t time, uint16_t previous_time, uint16_t period_ticks, uint16_t dwell_ticks, uint16_t dwell_delay_ticks) {
-    log_buffer[log_head] = {time, previous_time, period_ticks, dwell_ticks, dwell_delay_ticks};
-    log_head = (log_head + 1) % LOG_BUFFER_SIZE;
-    if (log_head == log_tail) {
-      log_full = true;
-    }
-  }
-
-  // Print the log buffer
-  void print_log() {
-    Serial.println(F("Log buffer contents:"));
-    uint8_t index = log_tail;
-    for (uint8_t i= 0; i < LOG_BUFFER_SIZE; i++) {
-      LogEntry &entry = log_buffer[index];
-      Serial.print(F("Time: ")); Serial.print(entry.time/2);
-      Serial.print(F(", Previous Time: ")); Serial.print(entry.previous_time/2);
-      Serial.print(F(", Period: ")); Serial.print(entry.period_ticks/2);
-      Serial.print(F(", Dwell: ")); Serial.print(entry.dwell_ticks/2);
-      Serial.print(F(", Dwell_delay: ")); Serial.print(entry.dwell_delay_ticks/2);
-      Serial.print(F(", Delay: ")); Serial.print((entry.dwell_delay_ticks+entry.dwell_ticks)/2);
-      Serial.print(F(", Spark at: ")); Serial.print((entry.dwell_delay_ticks+entry.dwell_ticks+entry.time)/2);
-      Serial.println("");
-      index = (index + 1) % LOG_BUFFER_SIZE;
-    }
-  }
-
-  // Clear the log buffer
-  void clear_log() {
-    log_head = 0;
-    log_tail = 0;
-    log_full = false;
-  }
-}
 
 
 
@@ -563,27 +521,7 @@ void loop() {
 
     uint16_t dwell_ticks = Timing::get_dwell(event->period_ticks);
     uint16_t dwell_delay_ticks = Timing::get_dwell_delay(event->period_ticks,dwell_ticks);
-/*
-    if (Logger::log_full) {
-  Serial.println(F("Log buffer full. Stopping engine."));
-  Engine::ignition_on  = false;
-  Logger::print_log();
-  Logger::clear_log();
-} else {
-  Logger::add_log(event->time, event->previous_time, event->period_ticks, dwell_ticks, dwell_delay_ticks);
 
-
-}
-*/
-
-
-
-
-  //  Serial.print(F("(MAIN) Time=")); Serial.print(event->time);
-  //  Serial.print(F(" Period_ticks=")); Serial.print(event->period_ticks);
-  //  Serial.print(F(" Dwell: ")); Serial.print(dwell_ticks); Serial.print(F(" us, Delay: ")); Serial.print(dwell_delay_ticks); Serial.println(F(" us"));
-   
-  
 
     // Schedule dwell with safety protection
     bool scheduled_normally = schedule_dwell(event->time + dwell_delay_ticks, dwell_ticks);

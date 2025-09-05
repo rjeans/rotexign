@@ -16,7 +16,7 @@ static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 static const float IDLE_DURATION_S = 10.0f;
 static const float IDLE_RPM = 1500.0f;
 static const float MAX_RPM = 6000.0f;
-static const float ACCELERATION_TIME_S = 60.0f;
+static const float ACCELERATION_TIME_S = 5.0f;
 static const float MAX_RPM_DURATION_S = 10.0f;  // Stay at max RPM for 10 seconds
 
 // State machine states
