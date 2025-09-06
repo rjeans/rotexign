@@ -129,57 +129,104 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
     
     print(f"Found {len(trigger_indices)} trigger pulses")
     
+    # Process each trigger with improved noise detection
+    # First pass: identify noise spikes by looking at period patterns
+    trigger_times = [signal_changes[idx][0] for idx in trigger_indices]
+    noise_flags = [False] * len(trigger_indices)
+    
+    # Calculate all periods
+    periods = []
+    for i in range(len(trigger_times) - 1):
+        periods.append(trigger_times[i+1] - trigger_times[i])
+    
+    # Look for noise spikes using local context
+    # Pattern: If we see a very short period followed by a compensating period,
+    # the trigger causing the short period is likely noise
+    MIN_PERIOD_NS = 1_000_000  # 1ms minimum period
+    
+    for i in range(len(periods)):
+        if i > 0 and i < len(periods) - 1:  # Need previous and next periods
+            prev_period = periods[i-1]
+            current_period = periods[i]
+            next_period = periods[i+1]
+            
+            # If previous period was reasonable (> 5ms)
+            if prev_period > MIN_PERIOD_NS * 5:
+                # And current period is much shorter than previous (< 25%)
+                if current_period < prev_period * 0.25:
+                    # And the sum of current + next is close to previous (within 20%)
+                    combined = current_period + next_period
+                    if abs(combined - prev_period) < prev_period * 0.2:
+                        # The trigger after the short period (i+1) is noise
+                        noise_flags[i+1] = True
+    
     # Process each trigger (skip last one - no next trigger)  
-    previous_period_ns = None
+    previous_valid_period_ns = None
     for idx in range(len(trigger_indices) - 1):
         T1_idx = trigger_indices[idx]
-        T2_idx = trigger_indices[idx + 1]
         T1_time = signal_changes[T1_idx][0]
-        T2_time = signal_changes[T2_idx][0]
         trigger_num = idx + 1
         
-        # Calculate period and RPM
-        period_ns = T2_time - T1_time
+        # Check if this trigger was pre-identified as noise
+        is_noise = noise_flags[idx]
+        noise_reason = "pattern detection" if is_noise else ""
+        
+        # Find next non-noise trigger for period calculation
+        # Skip noise triggers to get accurate period measurement
+        next_valid_idx = None
+        for next_idx in range(idx + 1, len(trigger_indices)):
+            if not noise_flags[next_idx]:
+                next_valid_idx = next_idx
+                break
+        
+        # Calculate period to next valid trigger
+        if next_valid_idx is not None and not is_noise:
+            # For valid triggers, calculate period to next valid trigger
+            T2_time = signal_changes[trigger_indices[next_valid_idx]][0]
+            period_ns = T2_time - T1_time
+        else:
+            # For noise triggers or when no next valid trigger, use immediate next
+            T2_idx = trigger_indices[idx + 1]
+            T2_time = signal_changes[T2_idx][0]
+            period_ns = T2_time - T1_time
+        
         period_us = period_ns / 1000.0
         
-        # Arduino-style noise filtering
-        MIN_PERIOD_NS = 1_000_000  # 1ms minimum period (60,000 RPM limit)
-        MAX_REALISTIC_RPM = 6500  # Maximum realistic RPM (pulse sim stops at 6000)
+        # For spark search, always use immediate next trigger (not skipping noise)
+        T2_idx = trigger_indices[idx + 1]
+        T2_time_spark_search = signal_changes[T2_idx][0]
         
-        # Detect noise triggers
-        is_noise = False
-        noise_reason = ""
+        # Check if the NEXT trigger is flagged as noise (affects filtering)
+        next_is_noise = noise_flags[idx+1] if idx+1 < len(noise_flags) else False
         
-        # Handle zero or very small periods
-        if period_ns <= 1000:  # Less than 1 microsecond - likely duplicate
-            is_noise = True
-            noise_reason = "duplicate"
-            
-        # Apply 30% window filter like Arduino (if we have a previous period)
-        elif previous_period_ns is not None:
-            min_valid_period = max(previous_period_ns // 3, MIN_PERIOD_NS)  # 33% or absolute min
-            if period_ns < min_valid_period:
+        # Additional noise checks if not already flagged
+        if not is_noise and not next_is_noise:
+            # Handle zero or very small periods
+            if period_ns <= 1000:  # Less than 1 microsecond - likely duplicate
                 is_noise = True
-                noise_reason = "30% filter"
+                noise_reason = "duplicate"
+            
+            # Apply 30% window filter (if we have a previous valid period)
+            # But skip this check if the next trigger is noise (would give false positive)
+            elif previous_valid_period_ns is not None:
+                min_valid_period = max(previous_valid_period_ns // 3, MIN_PERIOD_NS)
+                if period_ns < min_valid_period:
+                    is_noise = True
+                    noise_reason = "30% filter"
         
         rpm = calculate_rpm_from_period(period_ns)
         
-        # Mark unrealistic RPMs as noise (pulse sim only goes to 6000)
-        if rpm > MAX_REALISTIC_RPM:
-            is_noise = True
-            noise_reason = f"RPM {rpm:.0f} > {MAX_REALISTIC_RPM}"
-        
-        # Don't update previous_period if this is noise
+        # Don't update previous_valid_period if this is noise
         if not is_noise:
-            previous_period_ns = period_ns
+            previous_valid_period_ns = period_ns
         
-        # Find spark between T1 and T2: spark > T1_time and spark <= T2_time
+        # Find spark between T1 and T2_spark_search: spark > T1_time and spark <= T2_time_spark_search
         spark_time = None
         spark_found = False
         
         for i in range(len(signal_changes)):
             time, event = signal_changes[i]
-            if event == 'spark_fire' and time > T1_time and time <= T2_time:
+            if event == 'spark_fire' and time > T1_time and time <= T2_time_spark_search:
                 spark_time = time
                 spark_found = True
                 break

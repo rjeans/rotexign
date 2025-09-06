@@ -363,9 +363,9 @@ static inline bool schedule_dwell(uint16_t when, uint16_t length) {
 
 // Schedule a COMPA one-shot at absolute tick 'when' (for spark fire)
 static inline void schedule_spark(uint16_t when) {
-  TIFR1  = _BV(OCF1A);
-  OCR1A  = when;
-  TIMSK1 |= _BV(OCIE1A);
+  TIFR1  = _BV(OCF1B);
+  OCR1B  = when;
+  TIMSK1 |= _BV(OCIE1B);
 }
 
 static inline void start_dwell(uint16_t from, uint16_t length) {
@@ -373,7 +373,7 @@ static inline void start_dwell(uint16_t from, uint16_t length) {
   
   Engine::state = Engine::DWELLING;
   FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
-  TIMSK1 &= ~_BV(OCIE1A);
+
 
   uint16_t t_off = (uint16_t)(from + length);
 
@@ -385,7 +385,7 @@ static inline void start_dwell(uint16_t from, uint16_t length) {
 static inline void fire_spark() {
   // Fast pin set - HIGH to fire spark
   FIRE_PORT |= _BV(FIRE_BIT);
-  TIMSK1 &= ~_BV(OCIE1A);
+
   Engine::state = Engine::WAITING;
 
 }
@@ -427,13 +427,13 @@ ISR(INT0_vect) {
       Engine::period_ticks = period_ticks_candidate;
       uint16_t previous_time = Engine::tcnt;
       Engine::tcnt=tcnt_candidate;
-/*
+
       uint16_t dwell_ticks = Timing::get_dwell(period_ticks_candidate);
       uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks_candidate,dwell_ticks);
       bool scheduled_normally = schedule_dwell(tcnt_candidate + dwell_delay_ticks, dwell_ticks);
-*/
 
-      Timing::add_event(tcnt_candidate, previous_time, period_ticks_candidate);
+
+    //  Timing::add_event(tcnt_candidate, previous_time, period_ticks_candidate);
     }
 
 
@@ -448,22 +448,18 @@ ISR(INT0_vect) {
 
 // Timer1 COMPA interrupt
 ISR(TIMER1_COMPA_vect) {
-  if (Engine::state == Engine::DWELL_SCHEDULED) {
-    // Start dwell
-    start_dwell(OCR1A,Engine::dwell_ticks);
-  } else if (Engine::state == Engine::DWELLING) {
-    // Fire spark
-    fire_spark();
-  } else {
-    // Unexpected state - should not happen
-    TIMSK1 &= ~_BV(OCIE1A); // Disable COMPA interrupt
-    FIRE_PORT |= _BV(FIRE_BIT); // Ensure D3 HIGH (safe state - no dwell)
-    Engine::state = Engine::WAITING;
-
-  }
+    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
+    start_dwell(TCNT1,Engine::dwell_ticks);
 
 }
 
+// Timer1 COMPB interrupt
+ISR(TIMER1_COMPB_vect) {
+    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
+    fire_spark();
+
+
+}
 
 void setup() {
   Serial.begin(115200);
@@ -509,7 +505,7 @@ void loop() {
       Engine::ignition_on = true;
       Serial.println(F("Relay armed and ready")); 
     }
-  } else {
+  } /*else {
 
 
 
@@ -529,7 +525,7 @@ void loop() {
 
   }
 
-}
+}*/
 }
 
 
