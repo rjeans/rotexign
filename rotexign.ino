@@ -358,8 +358,7 @@ struct TimingTriggerEvent {
 
 
 
-// Minimum safety margin for timer scheduling (100μs = 200 ticks at 0.5μs/tick)
-constexpr uint16_t MIN_TIMER_LEAD_TICKS = 200;
+
 
 // Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
 static inline void schedule_dwell() {
@@ -367,6 +366,10 @@ static inline void schedule_dwell() {
   calculate_dwell();
   calculate_spark_delay();
   calculate_dwell_delay();
+
+  if (Timing::state == Timing::DWELL_SCHEDULED) {
+    Serial.println(F("Warning: scheduling dwell while another is scheduled"));
+  }
   
   // Calculate when to start dwell
   uint16_t when = last_trigger_tcnt + dwell_delay_ticks;
@@ -378,25 +381,19 @@ static inline void schedule_dwell() {
   
   // Check if we have enough lead time or if the time has already passed
   // If lead_time > 32767, the target time is in the past (wrapped around)
-  if (lead_time < MIN_TIMER_LEAD_TICKS || lead_time > 32767) {
+  if (lead_time > 32767) {
     // Too close or already past - start dwell immediately
     System::spark_pin_low();  // Start dwell immediately (coil charging)
     Timing::state = Timing::DWELLING;
     
-    // Calculate adjusted dwell length to maintain spark timing accuracy
+    // Calculate the original planned spark time to maintain timing accuracy
     // Original spark time = when + dwell_ticks
-    // Current time = current_ticks  
-    // Adjusted length = (when + dwell_ticks) - current_ticks
     uint16_t original_spark_time = when + Timing::dwell_ticks;
-    uint16_t adjusted_length = original_spark_time - current_ticks;
-    
-    // Update dwell_ticks for the ISR to use
-    Timing::dwell_ticks = adjusted_length;
 
-    // Schedule spark timing using adjusted length
-    System::clear_dwell_flag();
-    System::set_dwell_compare(original_spark_time);  // Maintain original spark timing
-    System::enable_dwell_interrupt();
+    // Schedule spark timing at the original planned time (skip dwell interrupt)
+    System::clear_spark_flag();
+    System::set_spark_compare(original_spark_time);  // Maintain original spark timing
+    System::enable_spark_interrupt();
     
     return;
   }
