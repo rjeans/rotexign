@@ -11,25 +11,13 @@
 
 #include <avr/interrupt.h>
 
-namespace Engine {
+
+// Direct port control for FIRE_PIN (digital pin 3 = PD3 on ATmega328P)
+#define FIRE_PORT  PORTD
+#define FIRE_DDR   DDRD
+#define FIRE_BIT   PD3
 
 
-  enum EngineState {
-    WAITING,
-    DWELL_SCHEDULED,
-    DWELLING
-  };
-
-  constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
-
-  volatile EngineState state = WAITING;
-  volatile bool ignition_on = false;
-  volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
-  volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
-  volatile uint16_t tcnt=0;
-  volatile uint16_t dwell_ticks = 0;
-
-}
 
 namespace System {
 
@@ -39,6 +27,8 @@ namespace System {
   volatile bool relay_armed = false;
 
 
+constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
+constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
 
 }
 
@@ -46,10 +36,26 @@ namespace System {
 
 namespace Timing {
 
+    enum TimingState {
+    WAITING,
+    DWELL_SCHEDULED,
+    DWELLING
+  };
+
+  constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
+
+  volatile TimingState state = WAITING;
+  volatile bool ignition_on = false;
+  volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
+  volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
+  volatile uint16_t last_trigger_tcnt=0;
+  volatile uint16_t next_dwell_ticks = 0;
+
+
+
 struct TimingTriggerEvent {
     volatile uint16_t time;
-    volatile uint16_t previous_time;
-    volatile uint16_t period_ticks;
+
   };
 
   
@@ -59,29 +65,15 @@ struct TimingTriggerEvent {
     uint8_t tail = 0;
 
     // Add an event to the buffer
-    static inline void add_event(uint16_t time, uint16_t previous_time, uint16_t period_ticks) {
-      buffer[head] = {time, previous_time, period_ticks};
+    static inline void add_event(uint16_t time) {
+      buffer[head] = {time};
       head = (head + 1) % BUFFER_SIZE;
       if (head == tail) {
         tail = (tail + 1) % BUFFER_SIZE; // Overwrite oldest event
       }
     }
 
-    // Get an event from the buffer
-    static inline TimingTriggerEvent * get_event() {
-      if (head == tail) {
-        return nullptr; // Buffer is empty
-      }
-      TimingTriggerEvent *event = &buffer[tail];
-      tail = (tail + 1) % BUFFER_SIZE;
-      return event;
-    }
 
-    // Check if the buffer is empty
-    static inline bool events_ready() {
-      return head != tail;
-    }
-  
 
 
 
@@ -224,11 +216,7 @@ struct TimingTriggerEvent {
     uint16_t delay_ticks = ((uint32_t)delay_angle_tenths * (uint32_t)period_ticks + 900UL) / 1800UL;
 
 
-   // Serial.print(F("[get_spark_delay] Period (ticks): ")); Serial.println(period_ticks);
-   // Serial.print(F("[get_spark_delay] Spark Delay (ticks): ")); Serial.println(delay_ticks);
-   // Serial.print(F("[get_spark_delay] Advance Angle (tenths): ")); Serial.println(advance_tenths);
-   // Serial.print(F("[get_spark_delay] Delay Angle (tenths): ")); Serial.println(delay_angle_tenths);
-   // Serial.print(F("[get_spark_delay] RPM: ")); Serial.println(rpm);
+
 
     // Return delay in timer ticks
     return delay_ticks;
@@ -238,9 +226,7 @@ struct TimingTriggerEvent {
   static inline uint16_t get_dwell_delay(uint16_t period_ticks,uint16_t dwell_ticks) {
     uint16_t spark_delay_ticks = get_spark_delay(period_ticks);
 
-   // Serial.print(F("[get_dwell_delay] Period (ticks): ")); Serial.println(period_ticks);
-   // Serial.print(F("[get_dwell_delay] Spark Delay (ticks): ")); Serial.println(spark_delay_ticks);
-   // Serial.print(F("[get_dwell_delay] Dwell (ticks): ")); Serial.println(dwell_ticks);
+ 
 
     uint16_t dwell_delay_ticks;
 
@@ -254,7 +240,7 @@ struct TimingTriggerEvent {
 
   }
 
-   // Serial.print(F("[get_dwell_delay] Dwell delay (ticks): ")); Serial.println(dwell_delay_ticks);
+ 
 
     return dwell_delay_ticks;
   }
@@ -265,20 +251,173 @@ struct TimingTriggerEvent {
     uint16_t max_dwell_ticks = ((period_ticks + 50) / 100) * MAX_DUTY_CYCLE;
     uint16_t dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
 
-   // Serial.print(F("[get_dwell] Period (ticks): ")); Serial.println(period_ticks);
-  //  Serial.print(F("[get_dwell] Nominal dwell (ticks): ")); Serial.println(NOMINAL_DWELL_TICKS);
-   // Serial.print(F("[get_dwell] Dwell (ticks): ")); Serial.println(dwell_ticks);
-   // Serial.print(F("[get_dwell] Max Dwell (ticks): ")); Serial.println(max_dwell_ticks);
+
     return dwell_ticks;
   }
+
+
+
+
+
+
+
+// Minimum safety margin for timer scheduling (100μs = 200 ticks at 0.5μs/tick)
+constexpr uint16_t MIN_TIMER_LEAD_TICKS = 200;
+
+// Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
+// Returns true if scheduled successfully, false if immediate fallback used
+
+static inline void schedule_dwell(uint16_t when, uint16_t length) {
+  uint16_t current_ticks = TCNT1;
+  
+  // Calculate lead time, handling timer wraparound properly
+  // For 16-bit timer wraparound: treat differences > 32767 as negative (already passed)
+  uint16_t lead_time = when - current_ticks;  // Unsigned subtraction handles wraparound
+  
+  // Check if we have enough lead time or if the time has already passed
+  // If lead_time > 32767, the target time is in the past (wrapped around)
+  if (lead_time < MIN_TIMER_LEAD_TICKS || lead_time > 32767) {
+    // Too close or already past - start dwell immediately
+    FIRE_PORT &= ~_BV(FIRE_BIT);  // Start dwell immediately (coil charging)
+    Timing::state = Timing::DWELLING;
+    
+    // Calculate adjusted dwell length to maintain spark timing accuracy
+    // Original spark time = when + length
+    // Current time = current_ticks  
+    // Adjusted length = (when + length) - current_ticks
+    uint16_t original_spark_time = when + length;
+    uint16_t adjusted_length;
+    
+    
+    adjusted_length = original_spark_time - current_ticks;
+    
+    
+    Timing::next_dwell_ticks = adjusted_length;
+
+
+    // Schedule spark timing using adjusted length
+    TIFR1  = _BV(OCF1A);
+    OCR1A  = original_spark_time;  // Maintain original spark timing
+    TIMSK1 |= _BV(OCIE1A);
+    
+    return; // Indicate immediate fallback was used
+  }
+  
+  // Safe to schedule normally
+  TIFR1  = _BV(OCF1A);   // clear stale flag
+  OCR1A  = when;         // set absolute time
+  TIMSK1 |= _BV(OCIE1A); // enable COMPA interrupt
+  Timing::next_dwell_ticks = length;
+  Timing::state = Timing::DWELL_SCHEDULED;
+  
+  return; // Indicate normal scheduling was used
 }
 
+// Schedule a COMPA one-shot at absolute tick 'when' (for spark fire)
+static inline void schedule_spark(uint16_t when) {
+  TIFR1  = _BV(OCF1B);
+  OCR1B  = when;
+  TIMSK1 |= _BV(OCIE1B);
+}
+
+static inline void start_dwell(uint16_t from, uint16_t length) {
+  // Fast pin clear - LOW to start dwell
+  
+  Timing::state = Timing::DWELLING;
+  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+
+
+  uint16_t t_off = (uint16_t)(from + length);
+
+  schedule_spark(t_off);
+
+}
+
+// Fire spark (called from COMPA ISR)
+static inline void fire_spark() {
+  // Fast pin set - HIGH to fire spark
+  FIRE_PORT |= _BV(FIRE_BIT);
+
+  Timing::state = Timing::WAITING;
+
+}
+
+}
+// External interrupt: crank trigger
+ISR(INT0_vect) {
+  uint16_t tcnt_candidate = TCNT1;  // Snapshot Timer1 as early as possible
+
+ 
+
+  if (Timing::n_starting_triggers++ <= Timing::NUMBER_STARTUP_TRIGGERS) {
+    // During startup phase, just count triggers to stabilize
+    Timing::period_ticks = tcnt_candidate - Timing::last_trigger_tcnt;
+    Timing::last_trigger_tcnt = tcnt_candidate;
+    return;
+  } 
+
+    // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
+  uint16_t period_ticks_candidate = (uint16_t)(tcnt_candidate - Timing::last_trigger_tcnt);
+
+  
+
+
+  const uint16_t min_valid_ticks = max((Timing::period_ticks/3) , Timing::MIN_PERIOD_TICKS); // 33% or absolute min
+
+  // 30% window filter: ignore triggers that are less than 30% of the previous period
+  // Only apply if we have a valid previous period (after first pulse)
+  if (period_ticks_candidate < min_valid_ticks && Timing::ignition_on) {
+
+    return;
+  }
+
+    if (period_ticks_candidate < Timing::CUTOFF_PERIOD_TICKS) {
+      Timing::ignition_on = false;
+    }
+    // Update engine timing state
+    if (Timing::ignition_on) {
+      Timing::period_ticks = period_ticks_candidate;
+      uint16_t previous_time = Timing::last_trigger_tcnt;
+      Timing::last_trigger_tcnt=tcnt_candidate;
+
+      uint16_t dwell_ticks = Timing::get_dwell(period_ticks_candidate);
+      uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks_candidate,dwell_ticks);
+      Timing::schedule_dwell(tcnt_candidate + dwell_delay_ticks, dwell_ticks);
+
+
+ 
+    }
+
+
+
+  
+
+
+
+}
+
+
+
+// Timer1 COMPA interrupt
+ISR(TIMER1_COMPA_vect) {
+    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
+    Timing::start_dwell(TCNT1,Timing::next_dwell_ticks);
+
+}
+
+// Timer1 COMPB interrupt
+ISR(TIMER1_COMPB_vect) {
+    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
+    Timing::fire_spark();
+
+
+}
 
 namespace SerialInterface {
   // Print diagnostic status to Serial
   void print_status() {
     // Use new rpm_from_period_ticks to keep consistency
-    uint16_t period_ticks = Engine::period_ticks;
+    uint16_t period_ticks = Timing::period_ticks;
     uint16_t dwell_ticks = Timing::get_dwell(period_ticks);
     uint16_t spark_delay_ticks = Timing::get_spark_delay(period_ticks);
     uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks,dwell_ticks);
@@ -286,7 +425,7 @@ namespace SerialInterface {
     uint8_t advance_angle_tenths = Timing::get_advance_angle_tenths(rpm);
   
 
-    Serial.print(F("Ignition ")); Serial.print(Engine::ignition_on ? F("on") : F("off"));
+    Serial.print(F("Ignition ")); Serial.print(Timing::ignition_on ? F("on") : F("off"));
     Serial.print(F(" RPM: ")); Serial.print(rpm);
     Serial.print(F(" Period ticks: ")); Serial.print(period_ticks);
     Serial.print(F(" Advance angle: ")); Serial.print(advance_angle_tenths);
@@ -303,164 +442,6 @@ namespace SerialInterface {
 
 
 
-// Direct port control for FIRE_PIN (digital pin 3 = PD3 on ATmega328P)
-#define FIRE_PORT  PORTD
-#define FIRE_DDR   DDRD
-#define FIRE_BIT   PD3
-constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
-constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
-
-// Minimum safety margin for timer scheduling (100μs = 200 ticks at 0.5μs/tick)
-constexpr uint16_t MIN_TIMER_LEAD_TICKS = 200;
-
-// Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
-// Returns true if scheduled successfully, false if immediate fallback used
-static inline bool schedule_dwell(uint16_t when, uint16_t length) {
-  uint16_t current_ticks = TCNT1;
-  
-  // Calculate lead time, handling timer wraparound properly
-  // For 16-bit timer wraparound: treat differences > 32767 as negative (already passed)
-  uint16_t lead_time = when - current_ticks;  // Unsigned subtraction handles wraparound
-  
-  // Check if we have enough lead time or if the time has already passed
-  // If lead_time > 32767, the target time is in the past (wrapped around)
-  if (lead_time < MIN_TIMER_LEAD_TICKS || lead_time > 32767) {
-    // Too close or already past - start dwell immediately
-    FIRE_PORT &= ~_BV(FIRE_BIT);  // Start dwell immediately (coil charging)
-    Engine::state = Engine::DWELLING;
-    
-    // Calculate adjusted dwell length to maintain spark timing accuracy
-    // Original spark time = when + length
-    // Current time = current_ticks  
-    // Adjusted length = (when + length) - current_ticks
-    uint16_t original_spark_time = when + length;
-    uint16_t adjusted_length;
-    
-    
-    adjusted_length = original_spark_time - current_ticks;
-    
-    
-    Engine::dwell_ticks = adjusted_length;
-
-
-    // Schedule spark timing using adjusted length
-    TIFR1  = _BV(OCF1A);
-    OCR1A  = original_spark_time;  // Maintain original spark timing
-    TIMSK1 |= _BV(OCIE1A);
-    
-    return false; // Indicate immediate fallback was used
-  }
-  
-  // Safe to schedule normally
-  TIFR1  = _BV(OCF1A);   // clear stale flag
-  OCR1A  = when;         // set absolute time
-  TIMSK1 |= _BV(OCIE1A); // enable COMPA interrupt
-  Engine::dwell_ticks = length;
-  Engine::state = Engine::DWELL_SCHEDULED;
-  
-  return true; // Indicate normal scheduling was used
-}
-
-// Schedule a COMPA one-shot at absolute tick 'when' (for spark fire)
-static inline void schedule_spark(uint16_t when) {
-  TIFR1  = _BV(OCF1B);
-  OCR1B  = when;
-  TIMSK1 |= _BV(OCIE1B);
-}
-
-static inline void start_dwell(uint16_t from, uint16_t length) {
-  // Fast pin clear - LOW to start dwell
-  
-  Engine::state = Engine::DWELLING;
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
-
-
-  uint16_t t_off = (uint16_t)(from + length);
-
-  schedule_spark(t_off);
-
-}
-
-// Fire spark (called from COMPA ISR)
-static inline void fire_spark() {
-  // Fast pin set - HIGH to fire spark
-  FIRE_PORT |= _BV(FIRE_BIT);
-
-  Engine::state = Engine::WAITING;
-
-}
-
-
-// External interrupt: crank trigger
-ISR(INT0_vect) {
-  uint16_t tcnt_candidate = TCNT1;  // Snapshot Timer1 as early as possible
-
- 
-
-  if (Engine::n_starting_triggers++ <= Engine::NUMBER_STARTUP_TRIGGERS) {
-    // During startup phase, just count triggers to stabilize
-    Engine::period_ticks = tcnt_candidate - Engine::tcnt;
-    Engine::tcnt = tcnt_candidate;
-    return;
-  } 
-
-    // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
-  uint16_t period_ticks_candidate = (uint16_t)(tcnt_candidate - Engine::tcnt);
-
-  
-
-
-  const uint16_t min_valid_ticks = max((Engine::period_ticks/3) , Timing::MIN_PERIOD_TICKS); // 33% or absolute min
-
-  // 30% window filter: ignore triggers that are less than 30% of the previous period
-  // Only apply if we have a valid previous period (after first pulse)
-  if (period_ticks_candidate < min_valid_ticks && Engine::ignition_on) {
-
-    return;
-  }
-
-    if (period_ticks_candidate < Timing::CUTOFF_PERIOD_TICKS) {
-      Engine::ignition_on = false;
-    }
-    // Update engine timing state
-    if (Engine::ignition_on) {
-      Engine::period_ticks = period_ticks_candidate;
-      uint16_t previous_time = Engine::tcnt;
-      Engine::tcnt=tcnt_candidate;
-
-      uint16_t dwell_ticks = Timing::get_dwell(period_ticks_candidate);
-      uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks_candidate,dwell_ticks);
-      bool scheduled_normally = schedule_dwell(tcnt_candidate + dwell_delay_ticks, dwell_ticks);
-
-
-    //  Timing::add_event(tcnt_candidate, previous_time, period_ticks_candidate);
-    }
-
-
-
-  
-
-
-
-}
-
-
-
-// Timer1 COMPA interrupt
-ISR(TIMER1_COMPA_vect) {
-    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
-    start_dwell(TCNT1,Engine::dwell_ticks);
-
-}
-
-// Timer1 COMPB interrupt
-ISR(TIMER1_COMPB_vect) {
-    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
-    fire_spark();
-
-
-}
-
 void setup() {
   Serial.begin(115200);
   Serial.println(F("Rotax 787 Ignition Controller with timing curve"));
@@ -472,8 +453,8 @@ void setup() {
   FIRE_PORT |= _BV(FIRE_BIT);  // Initialize HIGH (safe state - no dwell)
 
   // Initialize relay control pin (D4 = PD4)
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);  // Start with relay closed (safe state - coil grounded)
+  pinMode(System::RELAY_PIN, OUTPUT);
+  digitalWrite(System::RELAY_PIN, LOW);  // Start with relay closed (safe state - coil grounded)
 
   // INT0 on falling edge (D2)
   pinMode(2, INPUT_PULLUP);
@@ -500,32 +481,12 @@ void loop() {
     if (System::startup_millis == 0) {
       System::startup_millis = millis();  // Record the time when trigger went HIGH
     } else if (millis() - System::startup_millis > 1000) {  // 1-second delay
-      digitalWrite(RELAY_PIN, HIGH);  // Open relay to arm coil
+      digitalWrite(System::RELAY_PIN, HIGH);  // Open relay to arm coil
       System::relay_armed = true;
-      Engine::ignition_on = true;
+      Timing::ignition_on = true;
       Serial.println(F("Relay armed and ready")); 
     }
-  } /*else {
-
-
-
-  if (Engine::state == Engine::WAITING && Timing::events_ready() && Engine::ignition_on) {
-    // Start dwell process
-   
-
-    Timing::TimingTriggerEvent * event = Timing::get_event();
-
-    uint16_t dwell_ticks = Timing::get_dwell(event->period_ticks);
-    uint16_t dwell_delay_ticks = Timing::get_dwell_delay(event->period_ticks,dwell_ticks);
-
-
-    // Schedule dwell with safety protection
-    bool scheduled_normally = schedule_dwell(event->time + dwell_delay_ticks, dwell_ticks);
-
-
-  }
-
-}*/
+  } 
 }
 
 
