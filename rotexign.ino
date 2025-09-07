@@ -12,10 +12,10 @@
 #include <avr/interrupt.h>
 
 
-// Direct port control for FIRE_PIN (digital pin 3 = PD3 on ATmega328P)
-#define FIRE_PORT  PORTD
-#define FIRE_DDR   DDRD
-#define FIRE_BIT   PD3
+// Direct port control for SPARK_PIN (digital pin 3 = PD3 on ATmega328P)
+#define SPARK_PORT  PORTD
+#define SPARK_DDR   DDRD
+#define SPARK_BIT   PD3
 
 
 
@@ -27,8 +27,115 @@ namespace System {
   volatile bool relay_armed = false;
 
 
-constexpr uint8_t FIRE_PIN = 3;          // Output pin for ignition pulse
+constexpr uint8_t SPARK_PIN = 3;         // Output pin for spark pulse
 constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
+constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
+
+  // Low-level spark pin control
+  static inline void spark_pin_high() {
+    SPARK_PORT |= _BV(SPARK_BIT);
+  }
+  
+  static inline void spark_pin_low() {
+    SPARK_PORT &= ~_BV(SPARK_BIT);
+  }
+  
+  static inline void spark_pin_low8() {
+    SPARK_PORT &= (uint8_t)~_BV(SPARK_BIT);
+  }
+  
+  static inline void set_spark_pin_output() {
+    SPARK_DDR |= _BV(SPARK_BIT);
+  }
+  
+  static inline void set_spark_pin_safe() {
+    spark_pin_high();  // HIGH = safe state (no dwell)
+  }
+  
+  // Timer1 interrupt flag clearing
+  static inline void clear_dwell_flag() {
+    TIFR1 = _BV(OCF1A);
+  }
+  
+  static inline void clear_spark_flag() {
+    TIFR1 = _BV(OCF1B);
+  }
+  
+  static inline void clear_all_timer_flags() {
+    TIFR1 = _BV(TOV1) | _BV(OCF1A) | _BV(OCF1B);
+  }
+  
+  // Timer1 interrupt enable/disable
+  static inline void enable_dwell_interrupt() {
+    TIMSK1 |= _BV(OCIE1A);
+  }
+  
+  static inline void enable_spark_interrupt() {
+    TIMSK1 |= _BV(OCIE1B);
+  }
+  
+  static inline void disable_dwell_interrupt() {
+    TIMSK1 &= ~_BV(OCIE1A);
+  }
+  
+  static inline void disable_spark_interrupt() {
+    TIMSK1 &= ~_BV(OCIE1B);
+  }
+  
+  // Timer1 compare register setters
+  static inline void set_dwell_compare(uint16_t when) {
+    OCR1A = when;
+  }
+  
+  static inline void set_spark_compare(uint16_t when) {
+    OCR1B = when;
+  }
+  
+  // Timer1 counter getter/setter
+  static inline uint16_t get_timer_count() {
+    return TCNT1;
+  }
+  
+  static inline void reset_timer_count() {
+    TCNT1 = 0;
+  }
+  
+  // Timer1 setup
+  static inline void setup_timer1(uint8_t prescale_bits) {
+    TCCR1A = 0;  // Normal mode
+    TCCR1B = prescale_bits;
+    reset_timer_count();
+    clear_all_timer_flags();
+  }
+  
+  // External interrupt (INT0) setup for trigger input
+  static inline void setup_trigger_interrupt() {
+    // Configure pin as input with pullup
+    pinMode(TRIGGER_PIN, INPUT_PULLUP);
+    
+    // Configure INT0 for falling edge
+    EICRA = (1 << ISC01);  // ISC01 = 1, ISC00 = 0: falling edge
+    
+    // Clear any pending interrupt flag
+    EIFR = (1 << INTF0);
+    
+    // Enable INT0
+    EIMSK = (1 << INT0);
+  }
+  
+  // Relay control
+  static inline void setup_relay() {
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);  // Start with relay closed (safe state)
+  }
+  
+  static inline void arm_relay() {
+    digitalWrite(RELAY_PIN, HIGH);  // Open relay to arm coil
+  }
+  
+  static inline void disarm_relay() {
+    digitalWrite(RELAY_PIN, LOW);  // Close relay to ground coil (safe)
+  }
 
 }
 
@@ -201,7 +308,7 @@ struct TimingTriggerEvent {
   }
 
   // Calculate spark delay in microseconds from RPM using advance angle and 47° BTDC trigger
-  static inline uint16_t get_spark_delay(uint16_t period_ticks) {
+  static inline uint16_t calculate_spark_delay(uint16_t period_ticks) {
     // Get advance angle in tenths of degrees
     uint16_t rpm = Timing::rpm_from_period_ticks(period_ticks);
     uint16_t advance_tenths = get_advance_angle_tenths(rpm);
@@ -223,8 +330,8 @@ struct TimingTriggerEvent {
   }
 
   // Calculate dwell delay in microseconds from RPM
-  static inline uint16_t get_dwell_delay(uint16_t period_ticks,uint16_t dwell_ticks) {
-    uint16_t spark_delay_ticks = get_spark_delay(period_ticks);
+  static inline uint16_t calculate_dwell_delay(uint16_t period_ticks,uint16_t dwell_ticks) {
+    uint16_t spark_delay_ticks = calculate_spark_delay(period_ticks);
 
  
 
@@ -245,8 +352,8 @@ struct TimingTriggerEvent {
     return dwell_delay_ticks;
   }
 
-  // Get dwell time in microseconds from RPM
-  static inline uint16_t get_dwell(uint16_t period_ticks) {
+  // Calculate dwell time in microseconds from RPM
+  static inline uint16_t calculate_dwell(uint16_t period_ticks) {
 
     uint16_t max_dwell_ticks = ((period_ticks + 50) / 100) * MAX_DUTY_CYCLE;
     uint16_t dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
@@ -265,10 +372,8 @@ struct TimingTriggerEvent {
 constexpr uint16_t MIN_TIMER_LEAD_TICKS = 200;
 
 // Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
-// Returns true if scheduled successfully, false if immediate fallback used
-
-static inline void schedule_dwell(uint16_t when, uint16_t length) {
-  uint16_t current_ticks = TCNT1;
+static inline void schedule_dwell(uint16_t when) {
+  uint16_t current_ticks = System::get_timer_count();
   
   // Calculate lead time, handling timer wraparound properly
   // For 16-bit timer wraparound: treat differences > 32767 as negative (already passed)
@@ -278,65 +383,55 @@ static inline void schedule_dwell(uint16_t when, uint16_t length) {
   // If lead_time > 32767, the target time is in the past (wrapped around)
   if (lead_time < MIN_TIMER_LEAD_TICKS || lead_time > 32767) {
     // Too close or already past - start dwell immediately
-    FIRE_PORT &= ~_BV(FIRE_BIT);  // Start dwell immediately (coil charging)
+    System::spark_pin_low();  // Start dwell immediately (coil charging)
     Timing::state = Timing::DWELLING;
     
     // Calculate adjusted dwell length to maintain spark timing accuracy
-    // Original spark time = when + length
+    // Original spark time = when + next_dwell_ticks
     // Current time = current_ticks  
-    // Adjusted length = (when + length) - current_ticks
-    uint16_t original_spark_time = when + length;
-    uint16_t adjusted_length;
+    // Adjusted length = (when + next_dwell_ticks) - current_ticks
+    uint16_t original_spark_time = when + Timing::next_dwell_ticks;
+    uint16_t adjusted_length = original_spark_time - current_ticks;
     
-    
-    adjusted_length = original_spark_time - current_ticks;
-    
-    
+    // Update next_dwell_ticks for the ISR to use
     Timing::next_dwell_ticks = adjusted_length;
 
-
     // Schedule spark timing using adjusted length
-    TIFR1  = _BV(OCF1A);
-    OCR1A  = original_spark_time;  // Maintain original spark timing
-    TIMSK1 |= _BV(OCIE1A);
+    System::clear_dwell_flag();
+    System::set_dwell_compare(original_spark_time);  // Maintain original spark timing
+    System::enable_dwell_interrupt();
     
-    return; // Indicate immediate fallback was used
+    return;
   }
   
   // Safe to schedule normally
-  TIFR1  = _BV(OCF1A);   // clear stale flag
-  OCR1A  = when;         // set absolute time
-  TIMSK1 |= _BV(OCIE1A); // enable COMPA interrupt
-  Timing::next_dwell_ticks = length;
+  System::clear_dwell_flag();   // clear stale flag
+  System::set_dwell_compare(when);         // set absolute time
+  System::enable_dwell_interrupt(); // enable dwell interrupt
   Timing::state = Timing::DWELL_SCHEDULED;
-  
-  return; // Indicate normal scheduling was used
 }
 
-// Schedule a COMPA one-shot at absolute tick 'when' (for spark fire)
+// Schedule a COMPB one-shot at absolute tick 'when' (for spark fire)
 static inline void schedule_spark(uint16_t when) {
-  TIFR1  = _BV(OCF1B);
-  OCR1B  = when;
-  TIMSK1 |= _BV(OCIE1B);
+  System::clear_spark_flag();
+  System::set_spark_compare(when);
+  System::enable_spark_interrupt();
 }
 
-static inline void start_dwell(uint16_t from, uint16_t length) {
+static inline void start_dwell() {
   // Fast pin clear - LOW to start dwell
-  
   Timing::state = Timing::DWELLING;
-  FIRE_PORT &= (uint8_t)~_BV(FIRE_BIT);
+  System::spark_pin_low8();
 
-
-  uint16_t t_off = (uint16_t)(from + length);
-
-  schedule_spark(t_off);
-
+  // Schedule spark to fire after dwell period
+  uint16_t spark_time = System::get_timer_count() + Timing::next_dwell_ticks;
+  schedule_spark(spark_time);
 }
 
-// Fire spark (called from COMPA ISR)
+// Fire spark (called from COMPB ISR)
 static inline void fire_spark() {
   // Fast pin set - HIGH to fire spark
-  FIRE_PORT |= _BV(FIRE_BIT);
+  System::spark_pin_high();
 
   Timing::state = Timing::WAITING;
 
@@ -345,7 +440,7 @@ static inline void fire_spark() {
 }
 // External interrupt: crank trigger
 ISR(INT0_vect) {
-  uint16_t tcnt_candidate = TCNT1;  // Snapshot Timer1 as early as possible
+  uint16_t tcnt_candidate = System::get_timer_count();  // Snapshot Timer1 as early as possible
 
  
 
@@ -380,9 +475,10 @@ ISR(INT0_vect) {
       uint16_t previous_time = Timing::last_trigger_tcnt;
       Timing::last_trigger_tcnt=tcnt_candidate;
 
-      uint16_t dwell_ticks = Timing::get_dwell(period_ticks_candidate);
-      uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks_candidate,dwell_ticks);
-      Timing::schedule_dwell(tcnt_candidate + dwell_delay_ticks, dwell_ticks);
+      uint16_t dwell_ticks = Timing::calculate_dwell(period_ticks_candidate);
+      uint16_t dwell_delay_ticks = Timing::calculate_dwell_delay(period_ticks_candidate,dwell_ticks);
+      Timing::next_dwell_ticks = dwell_ticks;  // Store dwell duration for later use
+      Timing::schedule_dwell(tcnt_candidate + dwell_delay_ticks);
 
 
  
@@ -398,16 +494,15 @@ ISR(INT0_vect) {
 
 
 
-// Timer1 COMPA interrupt
+// Timer1 COMPA interrupt (dwell start)
 ISR(TIMER1_COMPA_vect) {
-    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
-    Timing::start_dwell(TCNT1,Timing::next_dwell_ticks);
-
+    System::disable_dwell_interrupt(); // Disable dwell interrupt
+    Timing::start_dwell();
 }
 
-// Timer1 COMPB interrupt
+// Timer1 COMPB interrupt (spark fire)
 ISR(TIMER1_COMPB_vect) {
-    TIMSK1 &= ~_BV(OCIE1B); // Disable COMPB interrupt
+    System::disable_spark_interrupt(); // Disable spark interrupt
     Timing::fire_spark();
 
 
@@ -418,9 +513,9 @@ namespace SerialInterface {
   void print_status() {
     // Use new rpm_from_period_ticks to keep consistency
     uint16_t period_ticks = Timing::period_ticks;
-    uint16_t dwell_ticks = Timing::get_dwell(period_ticks);
-    uint16_t spark_delay_ticks = Timing::get_spark_delay(period_ticks);
-    uint16_t dwell_delay_ticks = Timing::get_dwell_delay(period_ticks,dwell_ticks);
+    uint16_t dwell_ticks = Timing::calculate_dwell(period_ticks);
+    uint16_t spark_delay_ticks = Timing::calculate_spark_delay(period_ticks);
+    uint16_t dwell_delay_ticks = Timing::calculate_dwell_delay(period_ticks,dwell_ticks);
     uint16_t rpm = Timing::rpm_from_period_ticks(period_ticks);
     uint8_t advance_angle_tenths = Timing::get_advance_angle_tenths(rpm);
   
@@ -448,25 +543,18 @@ void setup() {
   Serial.print(F("Minimum period ticks: ")); Serial.println(Timing::MIN_PERIOD_TICKS);
   Serial.print(F("Initialized at ")); Serial.print(Timing::TIMER_TICKS_PER_SEC); Serial.println(F(" ticks per second"));
 
-  // Replace pinMode/digitalWrite for FIRE_PIN with direct register setup
-  FIRE_DDR  |= _BV(FIRE_BIT);
-  FIRE_PORT |= _BV(FIRE_BIT);  // Initialize HIGH (safe state - no dwell)
+  // Initialize spark pin
+  System::set_spark_pin_output();
+  System::set_spark_pin_safe();  // Initialize HIGH (safe state - no dwell)
 
-  // Initialize relay control pin (D4 = PD4)
-  pinMode(System::RELAY_PIN, OUTPUT);
-  digitalWrite(System::RELAY_PIN, LOW);  // Start with relay closed (safe state - coil grounded)
+  // Initialize relay control
+  System::setup_relay();
 
-  // INT0 on falling edge (D2)
-  pinMode(2, INPUT_PULLUP);
-  EICRA = (1 << ISC01);    // falling edge
-  EIFR  = (1 << INTF0);    // clear stale
-  EIMSK = (1 << INT0);     // enable
+  // Setup external interrupt for crank trigger
+  System::setup_trigger_interrupt();
 
-  // Timer1: normal mode, prescaler /64 (4 us/tick)
-  TCCR1A = 0;
-  TCCR1B = Timing::PRESCALE_BITS;  
-  TCNT1  = 0;
-  TIFR1  = _BV(TOV1) | _BV(OCF1A) | _BV(OCF1B); // clear stale flags
+  // Setup Timer1 with prescaler /8 (0.5 us/tick)
+  System::setup_timer1(Timing::PRESCALE_BITS);
 
   sei();
 }
@@ -476,12 +564,12 @@ void setup() {
 
 
 void loop() {
-  // Arm relay when D2 is HIGH (with startup delay)
-  if (!System::relay_armed && digitalRead(2)) {
+  // Arm relay when trigger pin is HIGH (with startup delay)
+  if (!System::relay_armed && digitalRead(System::TRIGGER_PIN)) {
     if (System::startup_millis == 0) {
       System::startup_millis = millis();  // Record the time when trigger went HIGH
     } else if (millis() - System::startup_millis > 1000) {  // 1-second delay
-      digitalWrite(System::RELAY_PIN, HIGH);  // Open relay to arm coil
+      System::arm_relay();  // Open relay to arm coil
       System::relay_armed = true;
       Timing::ignition_on = true;
       Serial.println(F("Relay armed and ready")); 
