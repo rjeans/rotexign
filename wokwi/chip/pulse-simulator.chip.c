@@ -13,11 +13,11 @@ static const float DEGREES_PER_REVOLUTION = 360.0f;
 static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 
 // Timing constants  
-static const float IDLE_DURATION_S = 10.0f;
+static const float IDLE_DURATION_S = 1.0f;
 static const float IDLE_RPM = 1500.0f;
 static const float MAX_RPM = 6000.0f;
 static const float ACCELERATION_TIME_S = 5.0f;
-static const float MAX_RPM_DURATION_S = 10.0f;  // Stay at max RPM for 10 seconds
+static const float MAX_RPM_DURATION_S = 1.0f;  // Stay at max RPM for 1 second
 
 // State machine states
 typedef enum {
@@ -25,6 +25,8 @@ typedef enum {
     STATE_IDLING,
     STATE_ACCELERATING,
     STATE_AT_MAX_RPM,
+    STATE_DECELERATING,
+    STATE_FINAL_IDLE,
     STATE_STOPPED
 } SimulatorState;
 
@@ -211,13 +213,39 @@ static void monitoring_timer_event(void *user_data) {
             
         case STATE_AT_MAX_RPM:
             if (time_in_state >= MAX_RPM_DURATION_S) {
-                // Transition to stopped state
-                sim_state = STATE_STOPPED;
+                // Transition to deceleration
+                sim_state = STATE_DECELERATING;
                 state_start_time = current_time;
                 
-                printf("[PULSE_GEN] t=%.2fs Stopping triggers after %.1fs at max RPM\n", 
-                       current_time, MAX_RPM_DURATION_S);
+                // Set up angular motion for deceleration (same rate as acceleration but negative)
+                initial_omega = rpm_to_deg_per_sec(MAX_RPM);
+                float final_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                alpha = (final_omega - initial_omega) / ACCELERATION_TIME_S;
+                
+                printf("[PULSE_GEN] t=%.1fs Starting deceleration: %.0f to %.0f RPM over %.1fs\n",
+                       current_time, MAX_RPM, IDLE_RPM, ACCELERATION_TIME_S);
+                printf("[PULSE_GEN] t=%.1fs Angular: ω₀=%.1f°/s, α=%.1f°/s²\n",
+                       current_time, initial_omega, alpha);
             }
+            break;
+            
+        case STATE_DECELERATING:
+            if (time_in_state >= ACCELERATION_TIME_S) {
+                // Transition to final idle state
+                sim_state = STATE_FINAL_IDLE;
+                state_start_time = current_time;
+                
+                // Set up angular motion for final idle (constant RPM)
+                initial_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                alpha = 0;
+                
+                printf("[PULSE_GEN] t=%.2fs Reached final idle %.0f RPM at %.2fs\n", 
+                       current_time, IDLE_RPM, current_time);
+            }
+            break;
+            
+        case STATE_FINAL_IDLE:
+            // Stay in final idle state indefinitely
             break;
             
         case STATE_STOPPED:
@@ -229,7 +257,7 @@ static void monitoring_timer_event(void *user_data) {
     static float last_diagnostic = 0;
     if (current_time - last_diagnostic >= 2.0f && sim_state != STATE_WAITING_FOR_READY) {
         float current_rpm = (initial_omega + alpha * time_in_state) / 6.0f;
-        const char* state_names[] = {"WAITING", "IDLING", "ACCELERATING", "MAX_RPM"};
+        const char* state_names[] = {"WAITING", "IDLING", "ACCELERATING", "MAX_RPM", "DECELERATING", "FINAL_IDLE", "STOPPED"};
         
         printf("[PULSE_GEN] t=%.1fs State=%s RPM=%.0f Pulses=%u Revs=%u\n",
                current_time, state_names[sim_state], current_rpm, pulse_count, revolution_count);

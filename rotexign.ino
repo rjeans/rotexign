@@ -30,6 +30,9 @@ namespace System {
 constexpr uint8_t SPARK_PIN = 3;         // Output pin for spark pulse
 constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
 constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
+  // Set the prescaler bits for a prescaler of 8.
+  // The CS10 bit is NOT set.
+constexpr uint16_t PRESCALE_BITS = _BV(CS11); 
 
   // Low-level spark pin control
   static inline void spark_pin_high() {
@@ -40,9 +43,7 @@ constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
     SPARK_PORT &= ~_BV(SPARK_BIT);
   }
   
-  static inline void spark_pin_low8() {
-    SPARK_PORT &= (uint8_t)~_BV(SPARK_BIT);
-  }
+
   
   static inline void set_spark_pin_output() {
     SPARK_DDR |= _BV(SPARK_BIT);
@@ -101,9 +102,9 @@ constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
   }
   
   // Timer1 setup
-  static inline void setup_timer1(uint8_t prescale_bits) {
+  static inline void setup_timer() {
     TCCR1A = 0;  // Normal mode
-    TCCR1B = prescale_bits;
+    TCCR1B = PRESCALE_BITS;
     reset_timer_count();
     clear_all_timer_flags();
   }
@@ -144,19 +145,24 @@ constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
 namespace Timing {
 
     enum TimingState {
-    WAITING,
-    DWELL_SCHEDULED,
-    DWELLING
+    SPARK_FIRED,     // Spark has fired, waiting for next trigger
+    DWELL_SCHEDULED, // Dwell start scheduled via timer interrupt
+    DWELLING         // Currently dwelling (coil charging), spark scheduled
   };
 
   constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
 
-  volatile TimingState state = WAITING;
+  volatile TimingState state = SPARK_FIRED;
   volatile bool ignition_on = false;
   volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
   volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
-  volatile uint16_t last_trigger_tcnt=0;
-  volatile uint16_t next_dwell_ticks = 0;
+  volatile uint16_t last_trigger_tcnt = 0;
+  volatile uint16_t dwell_ticks = 0; // Dwell duration in ticks
+  volatile uint16_t dwell_delay_ticks = 0; // Delay from trigger to dwell start
+  volatile uint16_t spark_delay_ticks = 0; // Delay from trigger to spark
+  volatile uint16_t rpm = 0; // Current RPM
+  volatile uint16_t advance_tenths = 0; // Advance angle in tenths of degrees
+  volatile uint16_t delay_angle_tenths = 0; // Delay angle in tenths of degrees
 
 
 
@@ -188,9 +194,7 @@ struct TimingTriggerEvent {
 
 
   
-  // Set the prescaler bits for a prescaler of 8.
-  // The CS10 bit is NOT set.
-  constexpr uint16_t PRESCALE_BITS = _BV(CS11); 
+
 
   // Calculate the number of timer ticks per second with a prescaler of 8.
   // 16,000,000 Hz / 8 = 2,000,000 ticks/sec
@@ -221,9 +225,12 @@ struct TimingTriggerEvent {
 
 
 
-  static inline uint16_t rpm_from_period_ticks(uint16_t period_ticks) {
-    if (!period_ticks) return 0;
-    return (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(period_ticks)));
+  static inline void calculate_rpm() {
+    if (!period_ticks) {
+      rpm = 0;
+    } else {
+      rpm = (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(period_ticks)));
+    }
   }
 
  
@@ -266,16 +273,22 @@ struct TimingTriggerEvent {
   const uint8_t TIMING_RPM_POINTS = 201;
   const uint16_t MAX_TIMING_RPM = 8000;
 
-  // Get timing advance angle from RPM using linear interpolation (returns tenths of degrees)
-  static inline uint16_t get_advance_angle_tenths(uint16_t rpm) {
+  // Calculate timing advance angle from RPM using linear interpolation
+  static inline void calculate_advance_angle_tenths() {
     // Edge cases
     uint16_t rpm_min = pgm_read_word(&timing_rpm_curve[0][0]);
     uint16_t adv_min = pgm_read_word(&timing_rpm_curve[0][1]);
-    if (rpm <= rpm_min) return (uint16_t)(adv_min);
+    if (rpm <= rpm_min) {
+      advance_tenths = (uint16_t)(adv_min);
+      return;
+    }
 
     uint16_t rpm_max = pgm_read_word(&timing_rpm_curve[TIMING_RPM_POINTS - 1][0]);
     uint16_t adv_max = pgm_read_word(&timing_rpm_curve[TIMING_RPM_POINTS - 1][1]);
-    if (rpm >= rpm_max) return (uint16_t)(adv_max);
+    if (rpm >= rpm_max) {
+      advance_tenths = (uint16_t)(adv_max);
+      return;
+    }
 
     // Must avoid overflow
     uint16_t i = (uint32_t(rpm) * (TIMING_RPM_POINTS - 1) + MAX_TIMING_RPM - 1) / MAX_TIMING_RPM;
@@ -304,62 +317,39 @@ struct TimingTriggerEvent {
     int32_t  result_tenths = (int32_t)adv_low + frac_tenths;
     if (result_tenths < 0) result_tenths = 0;                 // optional clamp
     if (result_tenths > 1000) result_tenths = 1000;           // optional clamp
-    return (uint16_t)result_tenths;
+    advance_tenths = (uint16_t)result_tenths;
   }
 
-  // Calculate spark delay in microseconds from RPM using advance angle and 47° BTDC trigger
-  static inline uint16_t calculate_spark_delay(uint16_t period_ticks) {
-    // Get advance angle in tenths of degrees
-    uint16_t rpm = Timing::rpm_from_period_ticks(period_ticks);
-    uint16_t advance_tenths = get_advance_angle_tenths(rpm);
+  // Calculate spark delay from trigger to spark fire
+  static inline void calculate_spark_delay() {
+    // Calculate RPM and advance angle
+    calculate_rpm();
+    calculate_advance_angle_tenths();
 
     // Calculate delay angle: 47° - advance angle (in tenths)
-    uint16_t delay_angle_tenths = TRIGGER_BTDC_TENTHS - advance_tenths;
+    delay_angle_tenths = TRIGGER_BTDC_TENTHS - advance_tenths;
 
     // Calculate delay in ticks
     // Delay_ticks >= (delay_angle / 180°) * period_ticks
     // Using tenths: delay_ticks = (delay_angle_tenths * period_ticks) / 1800
     // Add 900 (which is half of 1800) to round the result to the nearest integer
-    uint16_t delay_ticks = ((uint32_t)delay_angle_tenths * (uint32_t)period_ticks + 900UL) / 1800UL;
-
-
-
-
-    // Return delay in timer ticks
-    return delay_ticks;
+    spark_delay_ticks = ((uint32_t)delay_angle_tenths * (uint32_t)period_ticks + 900UL) / 1800UL;
   }
 
-  // Calculate dwell delay in microseconds from RPM
-  static inline uint16_t calculate_dwell_delay(uint16_t period_ticks,uint16_t dwell_ticks) {
-    uint16_t spark_delay_ticks = calculate_spark_delay(period_ticks);
-
- 
-
-    uint16_t dwell_delay_ticks;
-
-  // Always force a period (previous lobe)
-
-  if (dwell_ticks > spark_delay_ticks) {
+  // Calculate dwell delay from trigger to dwell start
+  static inline void calculate_dwell_delay() {
+    // Always force a period (previous lobe)
+    if (dwell_ticks > spark_delay_ticks) {
       dwell_delay_ticks = (period_ticks + spark_delay_ticks) - dwell_ticks;
-
-  } else {
+    } else {
       dwell_delay_ticks = spark_delay_ticks - dwell_ticks;
-
+    }
   }
 
- 
-
-    return dwell_delay_ticks;
-  }
-
-  // Calculate dwell time in microseconds from RPM
-  static inline uint16_t calculate_dwell(uint16_t period_ticks) {
-
+  // Calculate dwell duration based on RPM and duty cycle limits
+  static inline void calculate_dwell() {
     uint16_t max_dwell_ticks = ((period_ticks + 50) / 100) * MAX_DUTY_CYCLE;
-    uint16_t dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
-
-
-    return dwell_ticks;
+    dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
   }
 
 
@@ -372,7 +362,14 @@ struct TimingTriggerEvent {
 constexpr uint16_t MIN_TIMER_LEAD_TICKS = 200;
 
 // Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
-static inline void schedule_dwell(uint16_t when) {
+static inline void schedule_dwell() {
+  // Calculate all timing values
+  calculate_dwell();
+  calculate_spark_delay();
+  calculate_dwell_delay();
+  
+  // Calculate when to start dwell
+  uint16_t when = last_trigger_tcnt + dwell_delay_ticks;
   uint16_t current_ticks = System::get_timer_count();
   
   // Calculate lead time, handling timer wraparound properly
@@ -387,14 +384,14 @@ static inline void schedule_dwell(uint16_t when) {
     Timing::state = Timing::DWELLING;
     
     // Calculate adjusted dwell length to maintain spark timing accuracy
-    // Original spark time = when + next_dwell_ticks
+    // Original spark time = when + dwell_ticks
     // Current time = current_ticks  
-    // Adjusted length = (when + next_dwell_ticks) - current_ticks
-    uint16_t original_spark_time = when + Timing::next_dwell_ticks;
+    // Adjusted length = (when + dwell_ticks) - current_ticks
+    uint16_t original_spark_time = when + Timing::dwell_ticks;
     uint16_t adjusted_length = original_spark_time - current_ticks;
     
-    // Update next_dwell_ticks for the ISR to use
-    Timing::next_dwell_ticks = adjusted_length;
+    // Update dwell_ticks for the ISR to use
+    Timing::dwell_ticks = adjusted_length;
 
     // Schedule spark timing using adjusted length
     System::clear_dwell_flag();
@@ -411,21 +408,21 @@ static inline void schedule_dwell(uint16_t when) {
   Timing::state = Timing::DWELL_SCHEDULED;
 }
 
-// Schedule a COMPB one-shot at absolute tick 'when' (for spark fire)
-static inline void schedule_spark(uint16_t when) {
+// Schedule a COMPB one-shot for spark fire (dwell duration from now)
+static inline void schedule_spark() {
+  uint16_t spark_time = System::get_timer_count() + dwell_ticks;
   System::clear_spark_flag();
-  System::set_spark_compare(when);
+  System::set_spark_compare(spark_time);
   System::enable_spark_interrupt();
 }
 
 static inline void start_dwell() {
   // Fast pin clear - LOW to start dwell
   Timing::state = Timing::DWELLING;
-  System::spark_pin_low8();
+  System::spark_pin_low();
 
   // Schedule spark to fire after dwell period
-  uint16_t spark_time = System::get_timer_count() + Timing::next_dwell_ticks;
-  schedule_spark(spark_time);
+  schedule_spark();
 }
 
 // Fire spark (called from COMPB ISR)
@@ -433,7 +430,7 @@ static inline void fire_spark() {
   // Fast pin set - HIGH to fire spark
   System::spark_pin_high();
 
-  Timing::state = Timing::WAITING;
+  Timing::state = Timing::SPARK_FIRED;
 
 }
 
@@ -475,10 +472,8 @@ ISR(INT0_vect) {
       uint16_t previous_time = Timing::last_trigger_tcnt;
       Timing::last_trigger_tcnt=tcnt_candidate;
 
-      uint16_t dwell_ticks = Timing::calculate_dwell(period_ticks_candidate);
-      uint16_t dwell_delay_ticks = Timing::calculate_dwell_delay(period_ticks_candidate,dwell_ticks);
-      Timing::next_dwell_ticks = dwell_ticks;  // Store dwell duration for later use
-      Timing::schedule_dwell(tcnt_candidate + dwell_delay_ticks);
+      // Schedule dwell start (calculations done inside)
+      Timing::schedule_dwell();
 
 
  
@@ -511,22 +506,14 @@ ISR(TIMER1_COMPB_vect) {
 namespace SerialInterface {
   // Print diagnostic status to Serial
   void print_status() {
-    // Use new rpm_from_period_ticks to keep consistency
-    uint16_t period_ticks = Timing::period_ticks;
-    uint16_t dwell_ticks = Timing::calculate_dwell(period_ticks);
-    uint16_t spark_delay_ticks = Timing::calculate_spark_delay(period_ticks);
-    uint16_t dwell_delay_ticks = Timing::calculate_dwell_delay(period_ticks,dwell_ticks);
-    uint16_t rpm = Timing::rpm_from_period_ticks(period_ticks);
-    uint8_t advance_angle_tenths = Timing::get_advance_angle_tenths(rpm);
-  
-
+    // Print current static timing values (no recalculation needed)
     Serial.print(F("Ignition ")); Serial.print(Timing::ignition_on ? F("on") : F("off"));
-    Serial.print(F(" RPM: ")); Serial.print(rpm);
-    Serial.print(F(" Period ticks: ")); Serial.print(period_ticks);
-    Serial.print(F(" Advance angle: ")); Serial.print(advance_angle_tenths);
-    Serial.print(F(" Spark delay (us): ")); Serial.print(Timing::ticks_to_us(spark_delay_ticks));
-    Serial.print(F(" Dwell (us): ")); Serial.print(Timing::ticks_to_us(dwell_ticks));
-    Serial.print(F(" Dwell delay (us): ")); Serial.print(Timing::ticks_to_us(dwell_delay_ticks));
+    Serial.print(F(" RPM: ")); Serial.print(Timing::rpm);
+    Serial.print(F(" Period ticks: ")); Serial.print(Timing::period_ticks);
+    Serial.print(F(" Advance angle: ")); Serial.print(Timing::advance_tenths);
+    Serial.print(F(" Spark delay (us): ")); Serial.print(Timing::ticks_to_us(Timing::spark_delay_ticks));
+    Serial.print(F(" Dwell (us): ")); Serial.print(Timing::ticks_to_us(Timing::dwell_ticks));
+    Serial.print(F(" Dwell delay (us): ")); Serial.print(Timing::ticks_to_us(Timing::dwell_delay_ticks));
 
     Serial.println();
 
@@ -554,7 +541,7 @@ void setup() {
   System::setup_trigger_interrupt();
 
   // Setup Timer1 with prescaler /8 (0.5 us/tick)
-  System::setup_timer1(Timing::PRESCALE_BITS);
+  System::setup_timer();
 
   sei();
 }

@@ -162,6 +162,9 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
     
     # Process each trigger (skip last one - no next trigger)  
     previous_valid_period_ns = None
+    last_valid_trigger_idx = None
+    last_valid_trigger_time = None
+    
     for idx in range(len(trigger_indices) - 1):
         T1_idx = trigger_indices[idx]
         T1_time = signal_changes[T1_idx][0]
@@ -171,24 +174,29 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
         is_noise = noise_flags[idx]
         noise_reason = "pattern detection" if is_noise else ""
         
-        # Find next non-noise trigger for period calculation
-        # Skip noise triggers to get accurate period measurement
-        next_valid_idx = None
-        for next_idx in range(idx + 1, len(trigger_indices)):
-            if not noise_flags[next_idx]:
-                next_valid_idx = next_idx
-                break
-        
-        # Calculate period to next valid trigger
-        if next_valid_idx is not None and not is_noise:
-            # For valid triggers, calculate period to next valid trigger
-            T2_time = signal_changes[trigger_indices[next_valid_idx]][0]
-            period_ns = T2_time - T1_time
+        # Calculate period based on whether this trigger is noise or not
+        if is_noise:
+            # For noise triggers, calculate period from last valid trigger (if exists)
+            if last_valid_trigger_time is not None:
+                period_ns = T1_time - last_valid_trigger_time
+            else:
+                # No previous valid trigger, use immediate previous
+                if idx > 0:
+                    prev_time = signal_changes[trigger_indices[idx-1]][0]
+                    period_ns = T1_time - prev_time
+                else:
+                    period_ns = 0
         else:
-            # For noise triggers or when no next valid trigger, use immediate next
-            T2_idx = trigger_indices[idx + 1]
-            T2_time = signal_changes[T2_idx][0]
-            period_ns = T2_time - T1_time
+            # For valid triggers, calculate period from last valid trigger
+            if last_valid_trigger_time is not None:
+                period_ns = T1_time - last_valid_trigger_time
+            else:
+                # This is the first valid trigger, use immediate previous
+                if idx > 0:
+                    prev_time = signal_changes[trigger_indices[idx-1]][0]
+                    period_ns = T1_time - prev_time
+                else:
+                    period_ns = 0
         
         period_us = period_ns / 1000.0
         
@@ -216,9 +224,12 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
         
         rpm = calculate_rpm_from_period(period_ns)
         
-        # Don't update previous_valid_period if this is noise
+        # Update tracking variables
         if not is_noise:
+            # Update tracking for next iteration
             previous_valid_period_ns = period_ns
+            last_valid_trigger_idx = idx
+            last_valid_trigger_time = T1_time
         
         # Find spark between T1 and T2_spark_search: spark > T1_time and spark <= T2_time_spark_search
         spark_time = None
