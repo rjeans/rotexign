@@ -85,10 +85,12 @@ constexpr uint16_t PRESCALE_BITS = _BV(CS11);
   
   // Timer1 compare register setters
   static inline void set_dwell_compare(uint16_t when) {
+
     OCR1A = when;
   }
   
   static inline void set_spark_compare(uint16_t when) {
+
     OCR1B = when;
   }
   
@@ -156,9 +158,12 @@ namespace Timing {
   volatile bool ignition_on = false;
   volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
   volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
+  volatile uint16_t period_ticks_prev = 0; // Previous period in ticks for comparison
   volatile uint16_t last_trigger_tcnt = 0;
   volatile uint16_t dwell_ticks = 0; // Dwell duration in ticks
   volatile uint16_t dwell_delay_ticks = 0; // Delay from trigger to dwell start
+  volatile uint16_t dwell_delay_ticks_0 = 0; // Timer count when dwell started
+  volatile uint16_t dwell_delay_ticks_1 = 0; // Timer count when dwell started
   volatile uint16_t spark_delay_ticks = 0; // Delay from trigger to spark
   volatile uint16_t rpm = 0; // Current RPM
   volatile uint16_t advance_tenths = 0; // Advance angle in tenths of degrees
@@ -339,10 +344,12 @@ struct TimingTriggerEvent {
   // Calculate dwell delay from trigger to dwell start
   static inline void calculate_dwell_delay() {
     // Always force a period (previous lobe)
+    dwell_delay_ticks_0 = spark_delay_ticks -  dwell_ticks;
+    dwell_delay_ticks_1 = dwell_delay_ticks_0 + period_ticks;
     if (dwell_ticks > spark_delay_ticks) {
-      dwell_delay_ticks = (period_ticks + spark_delay_ticks) - dwell_ticks;
+      dwell_delay_ticks = dwell_delay_ticks_1;
     } else {
-      dwell_delay_ticks = spark_delay_ticks - dwell_ticks;
+      dwell_delay_ticks = dwell_delay_ticks_0;
     }
   }
 
@@ -369,6 +376,8 @@ static inline void schedule_dwell() {
 
   if (Timing::state == Timing::DWELL_SCHEDULED) {
     Serial.println(F("Warning: scheduling dwell while another is scheduled"));
+    // Do not reschedule
+   // return;
   }
   
   // Calculate when to start dwell
@@ -381,7 +390,8 @@ static inline void schedule_dwell() {
   
   // Check if we have enough lead time or if the time has already passed
   // If lead_time > 32767, the target time is in the past (wrapped around)
-  if (lead_time > 32767) {
+  if (lead_time > 32767 ) {
+
     // Too close or already past - start dwell immediately
     System::spark_pin_low();  // Start dwell immediately (coil charging)
     Timing::state = Timing::DWELLING;
@@ -440,6 +450,7 @@ ISR(INT0_vect) {
 
   if (Timing::n_starting_triggers++ <= Timing::NUMBER_STARTUP_TRIGGERS) {
     // During startup phase, just count triggers to stabilize
+    Timing::period_ticks_prev = Timing::period_ticks;  // Capture previous during startup too
     Timing::period_ticks = tcnt_candidate - Timing::last_trigger_tcnt;
     Timing::last_trigger_tcnt = tcnt_candidate;
     return;
@@ -465,6 +476,7 @@ ISR(INT0_vect) {
     }
     // Update engine timing state
     if (Timing::ignition_on) {
+      Timing::period_ticks_prev = Timing::period_ticks;  // Capture previous period
       Timing::period_ticks = period_ticks_candidate;
       uint16_t previous_time = Timing::last_trigger_tcnt;
       Timing::last_trigger_tcnt=tcnt_candidate;
