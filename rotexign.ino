@@ -152,6 +152,8 @@ namespace Timing {
     DWELLING         // Currently dwelling (coil charging), spark scheduled
   };
 
+
+
   constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
 
   volatile TimingState state = SPARK_FIRED;
@@ -164,8 +166,10 @@ namespace Timing {
   volatile uint16_t dwell_delay_ticks = 0; // Delay from trigger to dwell start
   volatile uint16_t dwell_delay_ticks_0 = 0; // Timer count when dwell started
   volatile uint16_t dwell_delay_ticks_1 = 0; // Timer count when dwell started
-  volatile uint16_t spark_delay_ticks = 0; // Delay from trigger to spark
+  volatile uint16_t spark_delay_ticks_0 = 0; // Delay from trigger to spark
+  volatile uint16_t spark_delay_ticks_1 = 0; // Delay from trigger to spark plus 180 degrees
   volatile uint16_t rpm = 0; // Current RPM
+  volatile uint16_t rpm_prev = 0; // Previous RPM for comparison
   volatile uint16_t advance_tenths = 0; // Advance angle in tenths of degrees
   volatile uint16_t delay_angle_tenths = 0; // Delay angle in tenths of degrees
 
@@ -231,11 +235,15 @@ struct TimingTriggerEvent {
 
 
   static inline void calculate_rpm() {
+    rpm_prev = rpm;  // Capture previous RPM
     if (!period_ticks) {
       rpm = 0;
     } else {
       rpm = (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(period_ticks)));
     }
+
+  
+
   }
 
  
@@ -338,15 +346,19 @@ struct TimingTriggerEvent {
     // Delay_ticks >= (delay_angle / 180°) * period_ticks
     // Using tenths: delay_ticks = (delay_angle_tenths * period_ticks) / 1800
     // Add 900 (which is half of 1800) to round the result to the nearest integer
-    spark_delay_ticks = ((uint32_t)delay_angle_tenths * (uint32_t)period_ticks + 900UL) / 1800UL;
+    spark_delay_ticks_0 = ((uint32_t)delay_angle_tenths * (uint32_t)period_ticks + 900UL) / 1800UL;
+    spark_delay_ticks_1 = (((uint32_t)delay_angle_tenths + 1800UL) * (uint32_t)period_ticks + 900UL) / 1800UL;
+ 
+
+
   }
 
   // Calculate dwell delay from trigger to dwell start
   static inline void calculate_dwell_delay() {
     // Always force a period (previous lobe)
-    dwell_delay_ticks_0 = spark_delay_ticks -  dwell_ticks;
-    dwell_delay_ticks_1 = dwell_delay_ticks_0 + period_ticks;
-    if (dwell_ticks > spark_delay_ticks) {
+    dwell_delay_ticks_0 = spark_delay_ticks_0 -  dwell_ticks;
+    dwell_delay_ticks_1 = spark_delay_ticks_1 -  dwell_ticks;
+    if (dwell_ticks > spark_delay_ticks_0) {
       dwell_delay_ticks = dwell_delay_ticks_1;
     } else {
       dwell_delay_ticks = dwell_delay_ticks_0;
@@ -518,11 +530,11 @@ namespace SerialInterface {
     // Print current static timing values (no recalculation needed)
     Serial.print(F("Ignition ")); Serial.print(Timing::ignition_on ? F("on") : F("off"));
     Serial.print(F(" RPM: ")); Serial.print(Timing::rpm);
-    Serial.print(F(" Period ticks: ")); Serial.print(Timing::period_ticks);
-    Serial.print(F(" Advance angle: ")); Serial.print(Timing::advance_tenths);
-    Serial.print(F(" Spark delay (us): ")); Serial.print(Timing::ticks_to_us(Timing::spark_delay_ticks));
-    Serial.print(F(" Dwell (us): ")); Serial.print(Timing::ticks_to_us(Timing::dwell_ticks));
-    Serial.print(F(" Dwell delay (us): ")); Serial.print(Timing::ticks_to_us(Timing::dwell_delay_ticks));
+    Serial.print(F(" Period: ")); Serial.print(Timing::period_ticks);
+    Serial.print(F(" Advance: ")); Serial.print(Timing::advance_tenths);
+    Serial.print(F(" Spark: ")); Serial.print(Timing::ticks_to_us(Timing::spark_delay_ticks_0));
+    Serial.print(F(" Dwell: ")); Serial.print(Timing::ticks_to_us(Timing::dwell_ticks));
+    Serial.print(F(" Dwell delay: ")); Serial.print(Timing::ticks_to_us(Timing::dwell_delay_ticks));
 
     Serial.println();
 
@@ -570,7 +582,13 @@ void loop() {
       Timing::ignition_on = true;
       Serial.println(F("Relay armed and ready")); 
     }
-  } 
+  } else {
+    // Print diagnostics every one second
+    if (millis() - System::last_diagnostic_millis > 100 && 0) {
+      System::last_diagnostic_millis = millis();
+      SerialInterface::print_status();
+    }
+  }
 }
 
 
