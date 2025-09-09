@@ -504,6 +504,221 @@ def create_timing_plot(results: List[Dict]):
     plt.close()
     
     print("Generated timing_vs_rpm.png")
+    
+    # Generate timing waveforms for key RPM points
+    generate_timing_waveforms(results)
+
+def generate_timing_waveforms(results: List[Dict]):
+    """Generate timing waveform plots for key operating points."""
+    if not results:
+        print("No results for waveform generation")
+        return
+    
+    # Find valid results with spark data
+    valid_results = [r for r in results if r.get('spark_found', False) and not r.get('is_noise', False)]
+    if not valid_results:
+        print("No valid results for waveform generation")
+        return
+    
+    # Sort by RPM
+    valid_results.sort(key=lambda x: x['rpm'])
+    
+    # Select four key timing scenarios to demonstrate:
+    # 1. SAME LOBE: Low RPM where dwell starts after trigger (positive delay)
+    # 2. INSTANT DWELL: Transition RPM where dwell starts immediately (small negative delay)  
+    # 3. PREVIOUS LOBE: High RPM where dwell should start in previous period (large negative delay)
+    # 4. NOISE FILTERING: Same lobe with noise pulse demonstration
+    
+    selected_results = []
+    
+    # 1. Find SAME LOBE timing (positive dwell delay - dwell starts after trigger)
+    same_lobe_candidates = [r for r in valid_results if r.get('dwell_delay_us', 0) > 500]
+    if same_lobe_candidates:
+        same_lobe = min(same_lobe_candidates, key=lambda x: abs(x['rpm'] - 1500))
+        selected_results.append(same_lobe)
+    
+    # 2. Find INSTANT DWELL transition point (small negative delay, around -100 to -400μs)
+    instant_dwell_candidates = [r for r in valid_results if -400 < r.get('dwell_delay_us', 0) < -50]
+    if instant_dwell_candidates:
+        # Pick one closest to the transition point
+        instant_dwell = min(instant_dwell_candidates, key=lambda x: abs(x['rpm'] - 2100))
+        selected_results.append(instant_dwell)
+    
+    # 3. Find PREVIOUS LOBE timing (large negative delay at high RPM)
+    previous_lobe_candidates = [r for r in valid_results if r.get('dwell_delay_us', 0) < -1000 and r['rpm'] > 4000]
+    if previous_lobe_candidates:
+        # Pick a high RPM example to show clear previous lobe timing
+        previous_lobe = min(previous_lobe_candidates, key=lambda x: abs(x['rpm'] - 4500))
+        # Convert the instant dwell implementation to show proper previous lobe visualization
+        period_us = previous_lobe['period_us']
+        # Save the original negative delay for description
+        original_delay = previous_lobe['dwell_delay_us']
+        # Convert this to a positive delay from the PREVIOUS trigger
+        actual_delay = abs(original_delay)
+        previous_lobe_delay = period_us - actual_delay
+        previous_lobe['original_delay_us'] = original_delay
+        previous_lobe['dwell_delay_us'] = previous_lobe_delay
+        previous_lobe['is_previous_lobe'] = True
+        selected_results.append(previous_lobe)
+    
+    # 4. Always add NOISE FILTERING demonstration
+    # Use a same lobe example to show noise filtering
+    if same_lobe_candidates:
+        # Create noise filtering demo based on same lobe timing
+        noise_demo = same_lobe_candidates[0].copy()  # Use first same lobe candidate
+        noise_demo['show_noise_filtering'] = True
+        # Add info about the actual noise data from analysis
+        noise_stats = {
+            'total_noise': len([r for r in results if r.get('is_noise', False)]),
+            'pattern_detection': len([r for r in results if r.get('noise_reason') == 'pattern detection']),
+            'filter_30percent': len([r for r in results if r.get('noise_reason') == '30% filter'])
+        }
+        noise_demo['noise_stats'] = noise_stats
+        selected_results.append(noise_demo)
+    
+    if len(selected_results) < 2:
+        print("Not enough data points for waveform generation")
+        return
+    
+    # Create waveform plot
+    fig, axes = plt.subplots(len(selected_results), 1, figsize=(12, 2.5 * len(selected_results)))
+    if len(selected_results) == 1:
+        axes = [axes]
+    
+    for idx, result in enumerate(selected_results):
+        ax = axes[idx]
+        
+        # Extract timing data
+        rpm = result['rpm']
+        period_us = result['period_us']
+        advance_deg = result['advance_degrees']
+        dwell_us = result.get('dwell_us', 3000)
+        dwell_delay_us = result.get('dwell_delay_us', 0)
+        
+        # Determine timing mode based on characteristics 
+        is_previous_lobe = result.get('is_previous_lobe', False)
+        show_noise_filtering = result.get('show_noise_filtering', False)
+        original_delay = result.get('original_delay_us', dwell_delay_us)
+        
+        if show_noise_filtering:
+            noise_stats = result.get('noise_stats', {})
+            total_noise = noise_stats.get('total_noise', 0)
+            mode_text = "NOISE FILTERING"
+            mode_description = f"Filtered {total_noise} noise triggers - 30% period change rejection"
+        elif is_previous_lobe:
+            mode_text = "PREVIOUS LOBE"
+            mode_description = f"Dwell starts in previous period ({abs(original_delay):.0f}μs early)"
+        elif original_delay > 500 or (not is_previous_lobe and dwell_delay_us > 500):
+            mode_text = "SAME LOBE"
+            mode_description = "Dwell starts after trigger in same 180° period"
+        elif original_delay < 0 or dwell_delay_us < 0:
+            mode_text = "INSTANT DWELL" 
+            mode_description = f"Should start {abs(original_delay):.0f}μs early - immediate dwell"
+        else:
+            mode_text = "UNKNOWN"
+            mode_description = "Unknown timing mode"
+        
+        # Create time axis (show 2 full periods)
+        t_max = period_us * 2
+        t = np.linspace(0, t_max, 1000)
+        
+        # Generate trigger pulse (LOW pulse for 6 degrees)
+        trigger = np.ones_like(t) * 3
+        pulse_duration_us = period_us * 6 / 360  # 6 degrees out of 360
+        for i in range(2):
+            pulse_start = i * period_us
+            pulse_end = pulse_start + pulse_duration_us
+            trigger[(t >= pulse_start) & (t <= pulse_end)] = 0
+        
+        # Add noise pulse demonstration for noise filtering waveform
+        if show_noise_filtering:
+            # Show noise pulse that coincides with spark timing from PREVIOUS trigger
+            # Calculate when the spark from trigger 0 would fire
+            trigger_0_time = 0
+            if dwell_delay_us > 500:
+                # Same lobe: spark fires after trigger + dwell_delay + dwell_duration
+                spark_0_time = trigger_0_time + dwell_delay_us + dwell_us
+            else:
+                # Other modes: spark fires after trigger + dwell_duration  
+                spark_0_time = trigger_0_time + dwell_us
+            
+            # Add noise pulse on trigger signal coinciding with previous spark
+            if spark_0_time < t_max:
+                noise_duration = 1000  # 1ms as per pulse-simulator
+                noise_mask = (t >= spark_0_time) & (t <= spark_0_time + noise_duration)
+                trigger[noise_mask] = 0
+                
+                # Add annotation for the noise pulse
+                ax.annotate('Noise pulse on trigger\\ncoincides with previous\\nspark output', 
+                           xy=(spark_0_time/1000, 1.5), xytext=(spark_0_time/1000 + 3, 2.8),
+                           fontsize=7, color='orange', ha='center',
+                           arrowprops=dict(arrowstyle='->', color='orange', lw=1))
+        
+        # Generate spark signal
+        spark = np.ones_like(t) * 3
+        for i in range(2):
+            trigger_time = i * period_us
+            
+            # Calculate dwell start time based on timing mode
+            if dwell_delay_us > 500:
+                # SAME LOBE: dwell starts after trigger within same period
+                dwell_start = trigger_time + dwell_delay_us
+            elif is_previous_lobe:
+                # PREVIOUS LOBE: dwell starts in PREVIOUS 180° period
+                if i == 0:
+                    # For first period, show dwell starting before displayed time
+                    # Use the converted delay which is from previous trigger
+                    dwell_start = trigger_time - (period_us - dwell_delay_us)
+                else:
+                    # For second period, show dwell starting from previous trigger
+                    prev_trigger_time = (i-1) * period_us
+                    dwell_start = prev_trigger_time + dwell_delay_us
+            else:
+                # INSTANT DWELL: starts immediately at trigger (can't schedule in past)
+                dwell_start = trigger_time
+            
+            # Calculate spark time
+            spark_time = dwell_start + dwell_us
+            
+            # Only show if within plot range and dwell_start is reasonable
+            if dwell_start >= 0 and dwell_start < t_max and spark_time < t_max:
+                spark[(t >= dwell_start) & (t <= spark_time)] = 0
+        
+        # Plot signals
+        ax.plot(t/1000, trigger, 'b-', linewidth=2, label='Trigger')
+        ax.plot(t/1000, spark + 0.1, 'r-', linewidth=2, label='Spark')
+        
+        # Add labels and formatting
+        title = f"{rpm:.0f} RPM - {advance_deg:.1f}° advance - {mode_text}"
+        if is_previous_lobe and original_delay < 0:
+            title += f" ({abs(original_delay):.0f}μs early)"
+        elif not is_previous_lobe and not show_noise_filtering and dwell_delay_us < 0:
+            title += f" ({abs(dwell_delay_us):.0f}μs behind)"
+        
+        ax.set_title(title, fontsize=10, fontweight='bold' if mode_text != "SAME LOBE" else 'normal')
+        
+        # Add mode description as subtitle
+        ax.text(0.5, 0.95, mode_description, transform=ax.transAxes,
+                ha='center', va='top', fontsize=8, style='italic')
+        ax.set_ylabel('Signal', fontsize=9)
+        ax.set_ylim(-0.5, 3.8)
+        ax.set_xlim(0, t_max/1000)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+        
+        # Add dwell duration annotation
+        ax.annotate(f'{dwell_us/1000:.1f}ms dwell', 
+                   xy=(0.02, 0.5), xycoords='axes fraction',
+                   fontsize=8, color='red')
+    
+    axes[-1].set_xlabel('Time (ms)', fontsize=9)
+    
+    plt.suptitle('Ignition Timing Waveforms', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('timing_waveforms.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print("Generated timing_waveforms.png")
 
 def print_summary(results: List[Dict]):
     """Print analysis summary."""

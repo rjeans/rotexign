@@ -93,6 +93,11 @@ constexpr uint16_t PRESCALE_BITS = _BV(CS11);
 
     OCR1B = when;
   }
+
+  static inline uint16_t get_spark_compare() {
+
+    return OCR1B;
+  }
   
   // Timer1 counter getter/setter
   static inline uint16_t get_timer_count() {
@@ -161,6 +166,7 @@ namespace Timing {
   volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
   volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
   volatile uint16_t predicted_period_ticks = 0; // Predicted next period using Holt's Method
+  volatile uint16_t predicted_rpm = 0; // Candidate period from most recent trigger
   volatile uint16_t last_trigger_tcnt = 0;
   volatile uint16_t dwell_ticks = 0; // Dwell duration in ticks
   
@@ -177,8 +183,11 @@ namespace Timing {
   volatile uint16_t spark_delay_ticks_0 = 0; // Delay from trigger to spark
   volatile uint16_t spark_delay_ticks_1 = 0; // Delay from trigger to spark plus 180 degrees
   volatile uint16_t rpm = 0; // Current RPM
-  volatile uint16_t advance_tenths = 0; // Advance angle in tenths of degrees
-  volatile uint16_t delay_angle_tenths = 0; // Delay angle in tenths of degrees
+  volatile uint16_t advance_tenths_0 = 0; // Advance angle in tenths of degrees
+  volatile uint16_t advance_tenths_1 = 0; // Advance angle in tenths of degrees
+  volatile uint16_t delay_angle_tenths_0 = 0; // Delay angle in tenths of degrees
+  volatile uint16_t delay_angle_tenths_1 = 0; // Delay angle in tenths of degrees
+  volatile uint16_t dwell_actual_started_tcnt = 0; // Timer count when dwell actually started
 
 
 
@@ -224,8 +233,9 @@ struct TimingTriggerEvent {
   constexpr uint32_t RPM_NUMERATOR_TICKS = TIMER_TICKS_PER_SEC * 60UL / PULSES_PER_REVOLUTION;
 
   const uint16_t MAX_DUTY_CYCLE = 40; 
-  const uint16_t NOMINAL_DWELL_MS = 3;
-  constexpr uint16_t NOMINAL_DWELL_TICKS = (uint16_t)(( (uint32_t)NOMINAL_DWELL_MS * TIMER_TICKS_PER_SEC) / 1000UL);
+  const uint16_t NOMINAL_DWELL_TS = 30;
+  const uint16_t MAX_DWELL_TS = 32;
+  constexpr uint16_t NOMINAL_DWELL_TICKS = (uint16_t)(( (uint32_t)NOMINAL_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
   const uint16_t MAX_RPM = 8000;
   const uint16_t MIN_PERIOD_TICKS =  (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(MAX_RPM)));
   const uint16_t CUTOFF_RPM = 7000;
@@ -244,54 +254,58 @@ struct TimingTriggerEvent {
 
   // Initialize Holt's Method with first few samples
   // Keep it simple: just use first sample for level, zero trend
-  static inline void holt_initialize(uint16_t new_period) {
+  static inline void holt_initialize(uint16_t new_value) {
     if (holt_init_count < HOLT_INIT_SAMPLES) {
       if (holt_init_count == 0) {
         // First sample: set initial level, zero trend
-        holt_level = (float)new_period;
+        holt_level = (float)new_value;
       } else  {
-        holt_trend=(float)(new_period - holt_level);
-        holt_level = (float)new_period;
+        holt_trend=(float)(new_value - holt_level);
+        holt_level = (float)new_value;
       } 
       holt_init_count++;
     }
   }
 
 
-  static inline void holt_update_and_predict(uint16_t new_period) {
+  static inline uint16_t holt_update_and_predict(uint16_t new_value) {
     if (holt_init_count < HOLT_INIT_SAMPLES) {
-      holt_initialize(new_period);
-      predicted_period_ticks = new_period; // Not enough data yet
+      holt_initialize(new_value);
+      predicted_period_ticks = new_value; // Not enough data yet
     } else {
 
     float level_prev = holt_level;
-    holt_level = holt_alpha * (float)new_period + (1.0f - holt_alpha) * (level_prev + holt_trend);
+    holt_level = holt_alpha * (float)new_value + (1.0f - holt_alpha) * (level_prev + holt_trend);
     holt_trend = holt_beta * (holt_level - level_prev) + (1.0f - holt_beta) * holt_trend;
     float forecast = holt_level + holt_trend;
 
-   
-    
-    predicted_period_ticks = (uint16_t)constrain(forecast, 0,65535); // Clamp to valid range
+
+
+    uint16_t predicted_uint = (uint16_t)constrain(forecast, 0,65535); // Clamp to valid range
+
+    return predicted_uint;
   }
 
   }
 
 
 
-  // Calculate RPM using predicted period for better accuracy during RPM changes
-  // Falls back to measured period if prediction not yet available
   static inline void calculate_rpm() {
-    uint16_t period_for_rpm = period_ticks;
-    
-    // Fallback to measured period if prediction not yet available
-    if (!period_for_rpm) {
-      period_for_rpm = period_ticks;
-    }
-    
-    if (!period_for_rpm) {
+
+
+    if (!period_ticks) {
       rpm = 0;
     } else {
-      rpm = (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(period_for_rpm)));
+      rpm = (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(period_ticks)));
+    }
+
+    predicted_rpm=holt_update_and_predict(rpm);
+
+    if (!predicted_rpm) {
+      predicted_period_ticks = period_ticks;
+      predicted_rpm = rpm;
+    } else {
+      predicted_period_ticks = (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(predicted_rpm)));
     }
   }
 
@@ -336,24 +350,24 @@ struct TimingTriggerEvent {
   const uint16_t MAX_TIMING_RPM = 8000;
 
   // Calculate timing advance angle from RPM using linear interpolation
-  static inline void calculate_advance_angle_tenths() {
+  static inline uint16_t calculate_advance_angle_tenths(uint16_t therpm) {
+
+
     // Edge cases
     uint16_t rpm_min = pgm_read_word(&timing_rpm_curve[0][0]);
     uint16_t adv_min = pgm_read_word(&timing_rpm_curve[0][1]);
-    if (rpm <= rpm_min) {
-      advance_tenths = (uint16_t)(adv_min);
-      return;
+    if (therpm <= rpm_min) {
+      return (uint16_t)(adv_min);
     }
 
     uint16_t rpm_max = pgm_read_word(&timing_rpm_curve[TIMING_RPM_POINTS - 1][0]);
     uint16_t adv_max = pgm_read_word(&timing_rpm_curve[TIMING_RPM_POINTS - 1][1]);
-    if (rpm >= rpm_max) {
-      advance_tenths = (uint16_t)(adv_max);
-      return;
+    if (therpm >= rpm_max) {
+      return (uint16_t)(adv_max);
     }
 
     // Must avoid overflow
-    uint16_t i = (uint32_t(rpm) * (TIMING_RPM_POINTS - 1) + MAX_TIMING_RPM - 1) / MAX_TIMING_RPM;
+    uint16_t i = (uint32_t(therpm) * (TIMING_RPM_POINTS - 1) + MAX_TIMING_RPM - 1) / MAX_TIMING_RPM;
 
     uint16_t rpm_low  = pgm_read_word(&timing_rpm_curve[i - 1][0]);
     uint16_t rpm_high = pgm_read_word(&timing_rpm_curve[i][0]);
@@ -366,7 +380,7 @@ struct TimingTriggerEvent {
     int16_t  adv_high = (int16_t)adv_high_u;
     int16_t  d_adv    = (int16_t)(adv_high - adv_low);
 
-    int32_t  d_rpm    = (int32_t)(rpm - rpm_low);
+    int32_t  d_rpm    = (int32_t)(therpm - rpm_low);
     int32_t  den      = (int32_t)(rpm_high - rpm_low);
 
     // numerator = d_adv * d_rpm * 10   (tenths of a degree)
@@ -379,25 +393,26 @@ struct TimingTriggerEvent {
     int32_t  result_tenths = (int32_t)adv_low + frac_tenths;
     if (result_tenths < 0) result_tenths = 0;                 // optional clamp
     if (result_tenths > 1000) result_tenths = 1000;           // optional clamp
-    advance_tenths = (uint16_t)result_tenths;
+    return (uint16_t)result_tenths;
   }
 
   // Calculate spark delay from trigger to spark fire
   static inline void calculate_spark_delay() {
     // Calculate RPM and advance angle
-    calculate_rpm();
-    calculate_advance_angle_tenths();
+    advance_tenths_0 = calculate_advance_angle_tenths(rpm);
+    advance_tenths_1 = calculate_advance_angle_tenths(predicted_rpm);
 
     // Calculate delay angle: 47° - advance angle (in tenths)
-    delay_angle_tenths = TRIGGER_BTDC_TENTHS - advance_tenths;
+    delay_angle_tenths_0 = TRIGGER_BTDC_TENTHS - advance_tenths_0;
+    delay_angle_tenths_1 = TRIGGER_BTDC_TENTHS - advance_tenths_1;
 
     // Calculate delay in ticks using predicted period for next cycle accuracy
     // Delay_ticks = (delay_angle / 180°) * predicted_period_ticks
     // Using tenths: delay_ticks = (delay_angle_tenths * predicted_period_ticks) / 1800
     // Add 900 (which is half of 1800) to round the result to the nearest integer
-    spark_delay_ticks_0 = ((uint32_t)delay_angle_tenths * (uint32_t)period_ticks + 900UL) / 1800UL;
-    spark_delay_ticks_1 = (((uint32_t)delay_angle_tenths + 1800UL) * (uint32_t)predicted_period_ticks + 900UL) / 1800UL;
- 
+    spark_delay_ticks_0 = ((uint32_t)delay_angle_tenths_0 * (uint32_t)period_ticks + 900UL) / 1800UL;
+    spark_delay_ticks_1 = (((uint32_t)delay_angle_tenths_1 + 1800UL) * (uint32_t)predicted_period_ticks + 900UL) / 1800UL;
+
 
 
   }
@@ -417,8 +432,9 @@ struct TimingTriggerEvent {
   // Calculate dwell duration based on predicted period and duty cycle limits  
   // Using predicted period provides better dwell control during RPM changes
   static inline void calculate_dwell() {
-    uint16_t max_dwell_ticks = ((predicted_period_ticks + 50) / 100) * MAX_DUTY_CYCLE;
+    uint16_t max_dwell_ticks = ((predicted_period_ticks + 50) / 100) * MAX_DUTY_CYCLE; // 40% max duty cycle with rounding
     dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
+  
   }
 
 
@@ -432,16 +448,19 @@ struct TimingTriggerEvent {
 // Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
 static inline void schedule_dwell() {
   // Calculate all timing values
+  calculate_rpm();
   calculate_dwell();
   calculate_spark_delay();
   calculate_dwell_delay();
 
   if (Timing::state == Timing::DWELL_SCHEDULED) {
-    Serial.println(F("Warning: scheduling dwell while another is scheduled"));
     // Do not reschedule
-   // return;
-  }
-  
+      return;
+  } else if (Timing::state == Timing::DWELLING  && ((System::get_timer_count() - Timing::dwell_actual_started_tcnt)<NOMINAL_DWELL_TICKS)) {
+    System::set_spark_compare(spark_delay_ticks_0 + last_trigger_tcnt);
+
+  } 
+
   // Calculate when to start dwell
   uint16_t when = last_trigger_tcnt + dwell_delay_ticks;
   uint16_t current_ticks = System::get_timer_count();
@@ -452,10 +471,11 @@ static inline void schedule_dwell() {
   
   // Check if we have enough lead time or if the time has already passed
   // If lead_time > 32767, the target time is in the past (wrapped around)
-  if (lead_time > 32767 ) {
+  if (lead_time > 32767) {
 
     // Too close or already past - start dwell immediately
     System::spark_pin_low();  // Start dwell immediately (coil charging)
+    Timing::dwell_actual_started_tcnt = System::get_timer_count();
     Timing::state = Timing::DWELLING;
     
     // Calculate the original planned spark time to maintain timing accuracy
@@ -498,7 +518,6 @@ static inline void start_dwell() {
 static inline void fire_spark() {
   // Fast pin set - HIGH to fire spark
   System::spark_pin_high();
-
   Timing::state = Timing::SPARK_FIRED;
 
 }
@@ -541,8 +560,8 @@ ISR(INT0_vect) {
     if (Timing::ignition_on) {
       Timing::period_ticks = period_ticks_candidate;
       Timing::add_event(Timing::period_ticks);  // Store period in ring buffer
-      Timing::holt_update_and_predict(Timing::period_ticks);  // Update Holt's prediction
-      //Timing::predicted_period_ticks = Timing::period_ticks; // Temporary: use measured period
+    
+      Timing::predicted_period_ticks = Timing::period_ticks; 
       Timing::last_trigger_tcnt=tcnt_candidate;
 
       // Schedule dwell start (calculations done inside using predicted period)
@@ -564,6 +583,7 @@ ISR(INT0_vect) {
 
 // Timer1 COMPA interrupt (dwell start)
 ISR(TIMER1_COMPA_vect) {
+    Timing::dwell_actual_started_tcnt = System::get_timer_count();
     System::disable_dwell_interrupt(); // Disable dwell interrupt
     Timing::start_dwell();
 }
@@ -576,24 +596,7 @@ ISR(TIMER1_COMPB_vect) {
 
 }
 
-namespace SerialInterface {
-  // Print diagnostic status to Serial
-  void print_status() {
-    // Print current static timing values (no recalculation needed)
-    Serial.print(F("Ignition ")); Serial.print(Timing::ignition_on ? F("on") : F("off"));
-    Serial.print(F(" RPM: ")); Serial.print(Timing::rpm);
-    Serial.print(F(" Period: ")); Serial.print(Timing::period_ticks);
-    Serial.print(F(" Predicted: ")); Serial.print(Timing::predicted_period_ticks);
-    Serial.print(F(" Level: ")); Serial.print(Timing::holt_level);
-    Serial.print(F(" Trend: ")); Serial.print(Timing::holt_trend);
-    Serial.print(F(" Advance: ")); Serial.print(Timing::advance_tenths);
-    Serial.print(F(" Spark: ")); Serial.print(Timing::ticks_to_us(Timing::spark_delay_ticks_0));
-    Serial.print(F(" Dwell: ")); Serial.print(Timing::ticks_to_us(Timing::dwell_ticks));
-    Serial.print(F(" Dwell delay: ")); Serial.print(Timing::ticks_to_us(Timing::dwell_delay_ticks));
 
-    Serial.println();
-  }
-}
 
 
 
@@ -602,6 +605,7 @@ void setup() {
   Serial.println(F("Rotax 787 Ignition Controller with timing curve"));
   Serial.print(F("Minimum period ticks: ")); Serial.println(Timing::MIN_PERIOD_TICKS);
   Serial.print(F("Initialized at ")); Serial.print(Timing::TIMER_TICKS_PER_SEC); Serial.println(F(" ticks per second"));
+  Serial.print(F("Nominal dwell ticks: ")); Serial.println(Timing::NOMINAL_DWELL_TICKS);
 
   // Initialize spark pin
   System::set_spark_pin_output();
@@ -634,13 +638,7 @@ void loop() {
       Timing::ignition_on = true;
       Serial.println(F("Relay armed and ready")); 
     }
-  } else {
-    // Print diagnostics every one second
-    if (millis() - System::last_diagnostic_millis > 100 && 0) {
-      System::last_diagnostic_millis = millis();
-      SerialInterface::print_status();
-    }
-  }
+  } 
 }
 
 
