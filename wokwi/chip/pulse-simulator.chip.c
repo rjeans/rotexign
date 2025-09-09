@@ -13,11 +13,11 @@ static const float DEGREES_PER_REVOLUTION = 360.0f;
 static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 
 // Timing constants  
-static const float IDLE_DURATION_S = 0.1f;
-static const float IDLE_RPM = 1900.0f;
-static const float MAX_RPM = 2000.0f;
-static const float ACCELERATION_TIME_S = 0.1f;
-static const float MAX_RPM_DURATION_S = 1.0f;  // Stay at max RPM for 1 second
+static const float IDLE_DURATION_S = 0.5f;
+static const float IDLE_RPM = 1500.0f;
+static const float MAX_RPM = 6000.0f;
+static const float ACCELERATION_TIME_S = 0.5f;
+static const float MAX_RPM_DURATION_S = 0.5f;  // Stay at max RPM for 1 second
 
 // State machine states
 typedef enum {

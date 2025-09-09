@@ -157,7 +157,12 @@ namespace Timing {
     DWELLING         // Currently dwelling (coil charging), spark scheduled
   };
 
-
+  enum TimingMode {
+    TIMING_SAME_LOBE = 0,      // Using spark_delay_ticks_0 (same 180° period)
+    TIMING_PREVIOUS_LOBE = 1,   // Using spark_delay_ticks_1 (previous 180° period)
+    TIMING_IMMEDIATE = 2,       // Immediate dwell (no scheduling possible)
+    TIMING_STARTUP = 3          // Startup triggers (no ignition yet)
+  };
 
   constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
 
@@ -167,7 +172,7 @@ namespace Timing {
   volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
   volatile uint16_t predicted_period_ticks = 0; // Predicted next period using Holt's Method
   volatile uint16_t predicted_rpm = 0; // Candidate period from most recent trigger
-  volatile uint16_t last_trigger_tcnt = 0;
+  volatile uint16_t trigger_tcnt = 0;
   volatile uint16_t dwell_ticks = 0; // Dwell duration in ticks
   
   // Holt's Method (Double Exponential Smoothing) variables
@@ -188,26 +193,37 @@ namespace Timing {
   volatile uint16_t delay_angle_tenths_0 = 0; // Delay angle in tenths of degrees
   volatile uint16_t delay_angle_tenths_1 = 0; // Delay angle in tenths of degrees
   volatile uint16_t dwell_actual_started_tcnt = 0; // Timer count when dwell actually started
+  volatile uint16_t dwell_actual_ended_tcnt = 0;   // Timer count when dwell actually ended
+  volatile uint8_t current_timing_mode = TIMING_SAME_LOBE; // Track which timing mode is being used
+
+
 
 
 
 struct TimingTriggerEvent {
     volatile uint16_t period_ticks;
-
+    volatile uint16_t trigger_tcnt;
+    volatile uint16_t dwell_started_tcnt;
+    volatile uint16_t dwell_ended_tcnt;
+    volatile uint8_t timing_mode;  // Which timing mode was used
   };
 
   
     static constexpr uint8_t BUFFER_SIZE = 128; // Size of the ring buffer
     TimingTriggerEvent buffer[BUFFER_SIZE];
-    uint8_t head = 0;
-    uint8_t tail = 0;
+    volatile uint8_t head = 0;
+    volatile uint8_t tail = 0;
 
     // Add an event to the buffer
-    static inline void add_event(uint16_t period_ticks) {
-      buffer[head] = {period_ticks};
+    static inline void add_event(uint16_t period_ticks, uint16_t trigger_tcnt, 
+                                uint16_t dwell_started_tcnt, uint16_t dwell_ended_tcnt,
+                                uint8_t timing_mode) {
+      buffer[head] = {period_ticks, trigger_tcnt, dwell_started_tcnt, dwell_ended_tcnt, timing_mode};
       head = (head + 1) % BUFFER_SIZE;
+      
+      // If buffer is full, advance tail to overwrite oldest entry
       if (head == tail) {
-        tail = (tail + 1) % BUFFER_SIZE; // Overwrite oldest event
+        tail = (tail + 1) % BUFFER_SIZE;
       }
     }
 
@@ -424,8 +440,10 @@ struct TimingTriggerEvent {
     dwell_delay_ticks_1 = spark_delay_ticks_1 -  dwell_ticks;
     if (dwell_ticks > spark_delay_ticks_0) {
       dwell_delay_ticks = dwell_delay_ticks_1;
+      current_timing_mode = TIMING_PREVIOUS_LOBE;  // Using previous lobe timing
     } else {
       dwell_delay_ticks = dwell_delay_ticks_0;
+      current_timing_mode = TIMING_SAME_LOBE;  // Using same lobe timing
     }
   }
 
@@ -457,12 +475,12 @@ static inline void schedule_dwell() {
     // Do not reschedule
       return;
   } else if (Timing::state == Timing::DWELLING  && ((System::get_timer_count() - Timing::dwell_actual_started_tcnt)<NOMINAL_DWELL_TICKS)) {
-    System::set_spark_compare(spark_delay_ticks_0 + last_trigger_tcnt);
+    System::set_spark_compare(spark_delay_ticks_0 + trigger_tcnt);
 
   } 
 
   // Calculate when to start dwell
-  uint16_t when = last_trigger_tcnt + dwell_delay_ticks;
+  uint16_t when = trigger_tcnt + dwell_delay_ticks;
   uint16_t current_ticks = System::get_timer_count();
   
   // Calculate lead time, handling timer wraparound properly
@@ -474,6 +492,7 @@ static inline void schedule_dwell() {
   if (lead_time > 32767) {
 
     // Too close or already past - start dwell immediately
+    Timing::current_timing_mode = TIMING_IMMEDIATE;  // Mark as immediate dwell
     System::spark_pin_low();  // Start dwell immediately (coil charging)
     Timing::dwell_actual_started_tcnt = System::get_timer_count();
     Timing::state = Timing::DWELLING;
@@ -519,6 +538,7 @@ static inline void fire_spark() {
   // Fast pin set - HIGH to fire spark
   System::spark_pin_high();
   Timing::state = Timing::SPARK_FIRED;
+  Timing::dwell_actual_ended_tcnt = System::get_timer_count();
 
 }
 
@@ -527,19 +547,22 @@ static inline void fire_spark() {
 ISR(INT0_vect) {
   uint16_t tcnt_candidate = System::get_timer_count();  // Snapshot Timer1 as early as possible
 
- 
+       // Store event with current timing data (dwell values from previous cycle)
+  Timing::add_event(Timing::period_ticks, tcnt_candidate, 
+                       Timing::dwell_actual_started_tcnt, Timing::dwell_actual_ended_tcnt,
+                       Timing::current_timing_mode);
 
   if (Timing::n_starting_triggers++ <= Timing::NUMBER_STARTUP_TRIGGERS) {
     // During startup phase, just count triggers to stabilize
-    Timing::period_ticks = tcnt_candidate - Timing::last_trigger_tcnt;
-    Timing::add_event(Timing::period_ticks);  // Store period in ring buffer
+    Timing::period_ticks = tcnt_candidate - Timing::trigger_tcnt;
+    Timing::current_timing_mode = Timing::TIMING_STARTUP;
     Timing::predicted_period_ticks = Timing::period_ticks;
-    Timing::last_trigger_tcnt = tcnt_candidate;
+    Timing::trigger_tcnt = tcnt_candidate;
     return;
   } 
 
     // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
-  uint16_t period_ticks_candidate = (uint16_t)(tcnt_candidate - Timing::last_trigger_tcnt);
+  uint16_t period_ticks_candidate = (uint16_t)(tcnt_candidate - Timing::trigger_tcnt);
 
   
 
@@ -559,10 +582,10 @@ ISR(INT0_vect) {
     // Update engine timing state
     if (Timing::ignition_on) {
       Timing::period_ticks = period_ticks_candidate;
-      Timing::add_event(Timing::period_ticks);  // Store period in ring buffer
+
     
       Timing::predicted_period_ticks = Timing::period_ticks; 
-      Timing::last_trigger_tcnt=tcnt_candidate;
+      Timing::trigger_tcnt=tcnt_candidate;
 
       // Schedule dwell start (calculations done inside using predicted period)
       Timing::schedule_dwell();
@@ -628,6 +651,7 @@ void setup() {
 
 
 void loop() {
+  
   // Arm relay when trigger pin is HIGH (with startup delay)
   if (!System::relay_armed && digitalRead(System::TRIGGER_PIN)) {
     if (System::startup_millis == 0) {

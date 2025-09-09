@@ -532,20 +532,27 @@ def generate_timing_waveforms(results: List[Dict]):
     selected_results = []
     
     # 1. Find SAME LOBE timing (positive dwell delay - dwell starts after trigger)
-    same_lobe_candidates = [r for r in valid_results if r.get('dwell_delay_us', 0) > 500]
+    same_lobe_candidates = [r for r in valid_results 
+                           if r.get('dwell_delay_us') is not None 
+                           and float(r.get('dwell_delay_us', 0)) > 500]
     if same_lobe_candidates:
         same_lobe = min(same_lobe_candidates, key=lambda x: abs(x['rpm'] - 1500))
         selected_results.append(same_lobe)
     
     # 2. Find INSTANT DWELL transition point (small negative delay, around -100 to -400μs)
-    instant_dwell_candidates = [r for r in valid_results if -400 < r.get('dwell_delay_us', 0) < -50]
+    instant_dwell_candidates = [r for r in valid_results 
+                               if r.get('dwell_delay_us') is not None 
+                               and -400 < float(r.get('dwell_delay_us', 0)) < -50]
     if instant_dwell_candidates:
         # Pick one closest to the transition point
         instant_dwell = min(instant_dwell_candidates, key=lambda x: abs(x['rpm'] - 2100))
         selected_results.append(instant_dwell)
     
     # 3. Find PREVIOUS LOBE timing (large negative delay at high RPM)
-    previous_lobe_candidates = [r for r in valid_results if r.get('dwell_delay_us', 0) < -1000 and r['rpm'] > 4000]
+    previous_lobe_candidates = [r for r in valid_results 
+                               if r.get('dwell_delay_us') is not None 
+                               and float(r.get('dwell_delay_us', 0)) < -1000 
+                               and r['rpm'] > 4000]
     if previous_lobe_candidates:
         # Pick a high RPM example to show clear previous lobe timing
         previous_lobe = min(previous_lobe_candidates, key=lambda x: abs(x['rpm'] - 4500))
@@ -593,7 +600,12 @@ def generate_timing_waveforms(results: List[Dict]):
         period_us = result['period_us']
         advance_deg = result['advance_degrees']
         dwell_us = result.get('dwell_us', 3000)
-        dwell_delay_us = result.get('dwell_delay_us', 0)
+        # Handle dwell_delay_us that might be None or string
+        dwell_delay_raw = result.get('dwell_delay_us', 0)
+        if dwell_delay_raw is None or dwell_delay_raw == 'MISSING':
+            dwell_delay_us = 0
+        else:
+            dwell_delay_us = float(dwell_delay_raw)
         
         # Determine timing mode based on characteristics 
         is_previous_lobe = result.get('is_previous_lobe', False)
