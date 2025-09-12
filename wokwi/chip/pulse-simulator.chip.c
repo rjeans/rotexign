@@ -13,7 +13,7 @@ static const float DEGREES_PER_REVOLUTION = 360.0f;
 static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 
 // Timing constants  
-static const float IDLE_DURATION_S = 0.5f;
+static const float IDLE_DURATION_S = .5f;
 static const float IDLE_RPM = 1500.0f;
 static const float MAX_RPM = 6000.0f;
 static const float ACCELERATION_TIME_S = 0.5f;
@@ -117,6 +117,15 @@ static void schedule_next_pulse(void) {
     // Calculate current angular velocity
     float current_omega = initial_omega + alpha * time_in_state;
     
+    // SAFETY: Clamp omega to never exceed MAX_RPM during acceleration
+    // This prevents overshoot due to timing granularity
+    if (sim_state == STATE_ACCELERATING) {
+        float max_omega = rpm_to_deg_per_sec(MAX_RPM);
+        if (current_omega > max_omega) {
+            current_omega = max_omega;
+        }
+    }
+    
     // We need to travel 180 degrees to next pulse (half revolution)
     float degrees_to_next_pulse = 180.0f;
     
@@ -130,6 +139,14 @@ static void schedule_next_pulse(void) {
         
         // Calculate angular velocity at pulse start time
         float omega_at_pulse = current_omega + alpha * time_to_pulse_start;
+        
+        // SAFETY: Also clamp omega at pulse time to never exceed MAX_RPM
+        if (sim_state == STATE_ACCELERATING) {
+            float max_omega = rpm_to_deg_per_sec(MAX_RPM);
+            if (omega_at_pulse > max_omega) {
+                omega_at_pulse = max_omega;
+            }
+        }
         
         // Calculate time for pulse width (6 degrees)
         float pulse_duration = time_to_angle(PULSE_WIDTH_DEGREES, omega_at_pulse, alpha);
@@ -202,28 +219,45 @@ static void monitoring_timer_event(void *user_data) {
             if (time_in_state >= ACCELERATION_TIME_S) {
                 // Transition to max RPM
                 sim_state = STATE_AT_MAX_RPM;
+                
+                // Calculate the target angular velocity (what we wanted to reach)
+                float target_omega = rpm_to_deg_per_sec(MAX_RPM);
+                
+                // Calculate what the actual angular velocity would be at current time
+                float actual_omega = initial_omega + alpha * time_in_state;
+                
+                // IMPORTANT: Clamp to never exceed target MAX_RPM
+                if (actual_omega > target_omega) {
+                    actual_omega = target_omega;
+                }
+                
+                float actual_rpm = actual_omega / 6.0f;
+                
+                // Set up angular motion for constant RPM at the clamped velocity
                 state_start_time = current_time;
+                initial_omega = actual_omega;  // Use clamped velocity
+                alpha = 0;  // No more acceleration
                 
-                // Set up angular motion for constant max RPM
-                initial_omega = rpm_to_deg_per_sec(MAX_RPM);
-                alpha = 0;
-                
-                printf("[PULSE_GEN] t=%.2fs Reached MAX RPM %.0f at %.2fs\n", current_time, MAX_RPM, current_time);}
+                printf("[PULSE_GEN] t=%.2fs Reached MAX RPM %.0f (clamped to %.0f) at %.2fs\n", 
+                       current_time, MAX_RPM, actual_rpm, current_time);}
             break;
             
         case STATE_AT_MAX_RPM:
             if (time_in_state >= MAX_RPM_DURATION_S) {
                 // Transition to deceleration
                 sim_state = STATE_DECELERATING;
-                state_start_time = current_time;
                 
-                // Set up angular motion for deceleration (same rate as acceleration but negative)
-                initial_omega = rpm_to_deg_per_sec(MAX_RPM);
-                float final_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                // Use the current actual angular velocity (which should be constant in this state)
+                float current_omega = initial_omega;  // No acceleration in MAX_RPM state
+                
+                // Set up angular motion for deceleration to 0 RPM (simulating ignition off)
+                state_start_time = current_time;
+                initial_omega = current_omega;  // Start from actual current velocity
+                float final_omega = 0;  // Decelerate to 0 RPM
                 alpha = (final_omega - initial_omega) / ACCELERATION_TIME_S;
                 
-                printf("[PULSE_GEN] t=%.1fs Starting deceleration: %.0f to %.0f RPM over %.1fs\n",
-                       current_time, MAX_RPM, IDLE_RPM, ACCELERATION_TIME_S);
+                printf("[PULSE_GEN] t=%.1fs Starting deceleration: %.0f to 0 RPM over %.1fs (ignition off)\n",
+                       current_time, MAX_RPM, ACCELERATION_TIME_S);
                 printf("[PULSE_GEN] t=%.1fs Angular: ω₀=%.1f°/s, α=%.1f°/s²\n",
                        current_time, initial_omega, alpha);
             }
@@ -231,16 +265,29 @@ static void monitoring_timer_event(void *user_data) {
             
         case STATE_DECELERATING:
             if (time_in_state >= ACCELERATION_TIME_S) {
-                // Transition to final idle state
-                sim_state = STATE_FINAL_IDLE;
-                state_start_time = current_time;
+                // Transition to stopped state (0 RPM) to simulate turning ignition off
+                sim_state = STATE_STOPPED;
                 
-                // Set up angular motion for final idle (constant RPM)
-                initial_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                // Calculate actual velocity at end of deceleration (should be ~0)
+                float actual_omega = initial_omega + alpha * ACCELERATION_TIME_S;
+                float actual_rpm = actual_omega / 6.0f;
+                
+                // Stop all angular motion
+                state_start_time = current_time;
+                initial_omega = 0;  // Force to exactly 0 for stopped state
                 alpha = 0;
                 
-                printf("[PULSE_GEN] t=%.2fs Reached final idle %.0f RPM at %.2fs\n", 
-                       current_time, IDLE_RPM, current_time);
+                // Cancel any pending pulse timers
+                timer_stop(pulse_start_timer_id);
+                timer_stop(pulse_end_timer_id);
+                
+                // Ensure output is HIGH (no pulse)
+                if (global_chip) {
+                    pin_write(global_chip->pin_out_pulse, HIGH);
+                }
+                
+                printf("[PULSE_GEN] t=%.2fs Engine stopped (0 RPM) - simulating ignition off at %.2fs\n", 
+                       current_time, current_time);
             }
             break;
             
@@ -360,6 +407,6 @@ void chip_init(void) {
     pin_watch(chip->pin_ready, &ready_config);
     
     printf("[PULSE_GEN] Initialized - Physics-based timing with one-shot timers\n");
-    printf("[PULSE_GEN] Settings: Idle %.0f RPM for %.1fs, accelerate to %.0f RPM in %.1fs\n",
+    printf("[PULSE_GEN] Settings: Idle %.0f RPM for %.1fs, accelerate to %.0f RPM in %.1fs, then decelerate to 0\n",
            IDLE_RPM, IDLE_DURATION_S, MAX_RPM, ACCELERATION_TIME_S);
 }

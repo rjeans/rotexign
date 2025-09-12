@@ -167,7 +167,9 @@ namespace Timing {
   constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
 
   volatile TimingState state = SPARK_FIRED;
-  volatile bool ignition_on = false;
+  volatile bool engine_running = false;
+  volatile uint32_t last_trigger_millis = 0; // Time of last trigger in milliseconds
+  volatile bool spark_enabled = false; // Set true to enable spark output
   volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
   volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
   volatile uint16_t predicted_period_ticks = 0; // Predicted next period using Holt's Method
@@ -199,42 +201,6 @@ namespace Timing {
 
 
 
-
-struct TimingTriggerEvent {
-    volatile uint16_t period_ticks;
-    volatile uint16_t trigger_tcnt;
-    volatile uint16_t dwell_started_tcnt;
-    volatile uint16_t dwell_ended_tcnt;
-    volatile uint8_t timing_mode;  // Which timing mode was used
-  };
-
-  
-    static constexpr uint8_t BUFFER_SIZE = 128; // Size of the ring buffer
-    TimingTriggerEvent buffer[BUFFER_SIZE];
-    volatile uint8_t head = 0;
-    volatile uint8_t tail = 0;
-
-    // Add an event to the buffer
-    static inline void add_event(uint16_t period_ticks, uint16_t trigger_tcnt, 
-                                uint16_t dwell_started_tcnt, uint16_t dwell_ended_tcnt,
-                                uint8_t timing_mode) {
-      buffer[head] = {period_ticks, trigger_tcnt, dwell_started_tcnt, dwell_ended_tcnt, timing_mode};
-      head = (head + 1) % BUFFER_SIZE;
-      
-      // If buffer is full, advance tail to overwrite oldest entry
-      if (head == tail) {
-        tail = (tail + 1) % BUFFER_SIZE;
-      }
-    }
-
-
-
-
-
-
-
-
-  
 
 
   // Calculate the number of timer ticks per second with a prescaler of 8.
@@ -455,6 +421,52 @@ struct TimingTriggerEvent {
   
   }
 
+  // Reset all timing variables when engine stops
+  static inline void set_engine_stopped() {
+    // Disable all timer interrupts
+    System::disable_dwell_interrupt();
+    System::disable_spark_interrupt();
+    
+    // Set spark pin to safe state
+    System::set_spark_pin_safe();
+    
+    // Reset all timing state variables
+    state = SPARK_FIRED;
+    engine_running = false;
+    spark_enabled = false;
+    n_starting_triggers = 0;
+    period_ticks = 0;
+    predicted_period_ticks = 0;
+    predicted_rpm = 0;
+    trigger_tcnt = 0;
+    dwell_ticks = 0;
+    
+    // Reset Holt's Method variables
+    holt_trend = 0.0f;
+    holt_level = 0.0f;
+    holt_init_count = 0;
+    
+    // Reset timing calculation variables
+    dwell_delay_ticks = 0;
+    dwell_delay_ticks_0 = 0;
+    dwell_delay_ticks_1 = 0;
+    spark_delay_ticks_0 = 0;
+    spark_delay_ticks_1 = 0;
+    rpm = 0;
+    advance_tenths_0 = 0;
+    advance_tenths_1 = 0;
+    delay_angle_tenths_0 = 0;
+    delay_angle_tenths_1 = 0;
+    dwell_actual_started_tcnt = 0;
+    dwell_actual_ended_tcnt = 0;
+    current_timing_mode = TIMING_SAME_LOBE;
+    last_trigger_millis = 0;
+    
+    // Clear all timer flags
+    System::clear_all_timer_flags();
+    
+    Serial.println(F("Engine stopped - all timing variables reset"));
+  }
 
 
 
@@ -547,11 +559,7 @@ static inline void fire_spark() {
 ISR(INT0_vect) {
   uint16_t tcnt_candidate = System::get_timer_count();  // Snapshot Timer1 as early as possible
 
-       // Store event with current timing data (dwell values from previous cycle)
-  Timing::add_event(Timing::period_ticks, tcnt_candidate, 
-                       Timing::dwell_actual_started_tcnt, Timing::dwell_actual_ended_tcnt,
-                       Timing::current_timing_mode);
-
+  Timing::last_trigger_millis = millis();  // Update last trigger time
   if (Timing::n_starting_triggers++ <= Timing::NUMBER_STARTUP_TRIGGERS) {
     // During startup phase, just count triggers to stabilize
     Timing::period_ticks = tcnt_candidate - Timing::trigger_tcnt;
@@ -560,6 +568,8 @@ ISR(INT0_vect) {
     Timing::trigger_tcnt = tcnt_candidate;
     return;
   } 
+
+  Timing::engine_running = true;
 
     // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
   uint16_t period_ticks_candidate = (uint16_t)(tcnt_candidate - Timing::trigger_tcnt);
@@ -571,20 +581,19 @@ ISR(INT0_vect) {
 
   // 30% window filter: ignore triggers that are less than 30% of the previous period
   // Only apply if we have a valid previous period (after first pulse)
-  if (period_ticks_candidate < min_valid_ticks && Timing::ignition_on) {
+  if (period_ticks_candidate < min_valid_ticks ) {
 
     return;
   }
 
     if (period_ticks_candidate < Timing::CUTOFF_PERIOD_TICKS) {
-      Timing::ignition_on = false;
+      Timing::spark_enabled = false;
     }
     // Update engine timing state
-    if (Timing::ignition_on) {
+    if (Timing::spark_enabled) {
       Timing::period_ticks = period_ticks_candidate;
 
-    
-      Timing::predicted_period_ticks = Timing::period_ticks; 
+      Timing::predicted_period_ticks = Timing::period_ticks;
       Timing::trigger_tcnt=tcnt_candidate;
 
       // Schedule dwell start (calculations done inside using predicted period)
@@ -651,6 +660,13 @@ void setup() {
 
 
 void loop() {
+
+  int32_t time_since_last_trigger = (int32_t)(millis() - Timing::last_trigger_millis);
+  
+  // If no trigger for 500 ms, consider engine stopped
+  if (Timing::engine_running && time_since_last_trigger > 500) {
+    Timing::set_engine_stopped();
+  }
   
   // Arm relay when trigger pin is HIGH (with startup delay)
   if (!System::relay_armed && digitalRead(System::TRIGGER_PIN)) {
@@ -659,7 +675,7 @@ void loop() {
     } else if (millis() - System::startup_millis > 1000) {  // 1-second delay
       System::arm_relay();  // Open relay to arm coil
       System::relay_armed = true;
-      Timing::ignition_on = true;
+      Timing::spark_enabled = true;
       Serial.println(F("Relay armed and ready")); 
     }
   } 
