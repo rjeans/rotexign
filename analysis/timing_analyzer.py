@@ -164,10 +164,12 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
     previous_valid_period_ns = None
     last_valid_trigger_idx = None
     last_valid_trigger_time = None
+    T0_time = None  # Time of previous trigger (for first trigger handling)
     
     for idx in range(len(trigger_indices) - 1):
         T1_idx = trigger_indices[idx]
         T1_time = signal_changes[T1_idx][0]
+        T0_time = T1_time if T0_time is None else T0_time
         trigger_num = idx + 1
         
         # Check if this trigger was pre-identified as noise
@@ -300,6 +302,7 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
             'trigger_num': trigger_num,
             'trigger_time_ns': T1_time,
             'trigger_time_ms': T1_time / 1_000_000,
+            'diagnostics_time_ms': (T1_time - T0_time)/1_000_000 if T0_time is not None else 0,
             'period_us': period_us,
             'rpm': rpm,
             'spark_found': spark_found,
@@ -324,7 +327,7 @@ def generate_csv_output(results: List[Dict]):
         
         # Header
         writer.writerow([
-            'trigger_num', 'time_ms', 'period_us', 'rpm', 
+            'trigger_num', 'time_ms', 'diagnostics_time_ms', 'period_us', 'rpm', 
             'spark_found', 'delay_us', 'delay_degrees', 
             'advance_degrees', 'dwell_us', 'dwell_delay_us', 'theoretical_advance', 
             'theoretical_delay_us', 'error_degrees', 'is_noise', 'noise_reason'
@@ -335,6 +338,7 @@ def generate_csv_output(results: List[Dict]):
             writer.writerow([
                 r['trigger_num'],
                 f"{r['trigger_time_ms']:.3f}",
+                f"{r['diagnostics_time_ms']:.3f}",
                 f"{r['period_us']:.1f}",
                 f"{r['rpm']:.0f}",
                 r['spark_found'],

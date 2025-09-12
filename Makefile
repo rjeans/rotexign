@@ -30,9 +30,9 @@ CLANG_CHIP ?= clang
 CLANG_OPTIONS := --target=wasm32-unknown-wasi -nostartfiles -Wl,--import-memory -Wl,--export-table -Wl,--no-entry -Werror
 
 # --- Phonies ---
-.PHONY: all clean 
+.PHONY: all clean diagnostic 
 
-all: $(TARGET_JSON) $(TARGET_HEX) $(TARGET_WASM) $(CHIP_WASM) $(BUILD_DIR)/pulse-simulator.chip.json
+all: $(TARGET_HEX) $(CHIP_WASM) $(BUILD_DIR)/pulse-simulator.chip.json
 
 # -------- Firmware (Arduino CLI) --------
 $(TARGET_HEX): $(SKETCH_SRC) | $(BUILD_DIR)
@@ -40,6 +40,17 @@ $(TARGET_HEX): $(SKETCH_SRC) | $(BUILD_DIR)
 	arduino-cli compile --fqbn "$(FQBN)" --output-dir "$(BUILD_DIR)" --warnings default "$(SKETCH_DIR)"
 	@test -f "$(TARGET_HEX)" || (echo "ERROR: HEX file $(TARGET_HEX) not generated" && exit 1)
 	@echo "Arduino compilation successful"
+
+# -------- Diagnostic build --------
+diagnostic: $(TARGET_HEX).diagnostic $(CHIP_WASM) $(BUILD_DIR)/pulse-simulator.chip.json
+	@echo "Diagnostic build complete"
+
+$(TARGET_HEX).diagnostic: $(SKETCH_SRC) | $(BUILD_DIR)
+	@echo "Compiling Arduino sketch with diagnostic logging..."
+	arduino-cli compile --fqbn "$(FQBN)" --output-dir "$(BUILD_DIR)" --warnings default --build-property "compiler.cpp.extra_flags=-DENABLE_DIAGNOSTIC_LOGGING" "$(SKETCH_DIR)"
+	@test -f "$(TARGET_HEX)" || (echo "ERROR: HEX file $(TARGET_HEX) not generated" && exit 1)
+	@touch "$(TARGET_HEX).diagnostic"
+	@echo "Arduino diagnostic compilation successful"
 
 $(CHIP_WASM): $(CHIP_SRC) | $(BUILD_DIR)
 	@echo "Compiling chip code to WASM..."
