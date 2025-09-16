@@ -164,27 +164,28 @@ namespace Timing {
     TIMING_STARTUP = 3          // Startup triggers (no ignition yet)
   };
 
-  constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 3; // Number of initial ticks to ignore for stable state
+  constexpr uint8_t NUMBER_STARTUP_TRIGGERS = 2; // Number of initial ticks to ignore for stable state
 
-  volatile TimingState state = SPARK_FIRED;
+  // State is now determined from hardware conditions - no state variable needed
   volatile bool engine_running = false;
   volatile uint32_t last_trigger_millis = 0; // Time of last trigger in milliseconds
   volatile bool spark_enabled = false; // Set true to enable spark output
   volatile uint8_t n_starting_triggers = 0; // Number of initial ticks collected before stable
-  volatile uint16_t period_ticks = 0; // Period in ticks between last two triggers
-  volatile uint16_t predicted_period_ticks = 0; // Predicted next period using Holt's Method
+  volatile uint32_t period_ticks = 0; // Period in ticks between last two triggers
+  volatile uint32_t period_millis = 0; // Period in milliseconds between last two triggers
+  volatile uint32_t predicted_period_ticks = 0; // Predicted next period using Holt's Method
   volatile uint16_t predicted_rpm = 0; // Candidate period from most recent trigger
   volatile uint16_t trigger_tcnt = 0;
   volatile uint16_t dwell_ticks = 0; // Dwell duration in ticks
   
   // Holt's Method (Double Exponential Smoothing) variables
   // Using simple integer arithmetic with minimal scaling  
-  volatile float holt_alpha = 0.4f;         
-  volatile float holt_beta = 0.1f;           
+  volatile float holt_alpha = 0.7f;         
+  volatile float holt_beta = 0.4f;           
   volatile float holt_trend = 0.0f;           
   volatile float holt_level = 0.0f;          
   volatile uint8_t holt_init_count = 0;      // Counter for initialization samples
-  volatile uint16_t dwell_delay_ticks = 0; // Delay from trigger to dwell start
+ volatile uint16_t current_ticks_after_calculation = 0; 
   volatile uint16_t dwell_delay_ticks_0 = 0; // Timer count when dwell started
   volatile uint16_t dwell_delay_ticks_1 = 0; // Timer count when dwell started
   volatile uint16_t spark_delay_ticks_0 = 0; // Delay from trigger to spark
@@ -196,7 +197,61 @@ namespace Timing {
   volatile uint16_t delay_angle_tenths_1 = 0; // Delay angle in tenths of degrees
   volatile uint16_t dwell_actual_started_tcnt = 0; // Timer count when dwell actually started
   volatile uint16_t dwell_actual_ended_tcnt = 0;   // Timer count when dwell actually ended
-  volatile uint8_t current_timing_mode = TIMING_SAME_LOBE; // Track which timing mode is being used
+  volatile uint8_t current_timing_mode = TIMING_STARTUP; // Track which timing mode is being used
+
+  // Trigger ring buffer for debugging
+  struct TriggerEvent {
+    uint32_t trigger_id;
+    uint32_t trigger_millis;
+    uint16_t trigger_ticks;      // trigger_tcnt value
+    bool dwelling_entry;
+    bool dwell_scheduled_entry;
+    bool dwelling_exit;
+    bool dwell_scheduled_exit;
+    uint8_t timing_mode_entry;   // timing mode at entry to schedule_dwell
+    uint8_t timing_mode_exit;    // timing mode at exit from schedule_dwell
+    uint16_t rpm;
+    uint32_t period_millis;      // period in milliseconds
+    uint32_t period_ticks;       // actual period measured
+    uint32_t predicted_period_ticks; // predicted period (from Holt's method)
+    uint16_t spark_delay_ticks_0; // delay from trigger to spark (same lobe)
+    uint16_t spark_delay_ticks_1; // delay from trigger to spark (previous lobe)
+    uint16_t dwell_ticks;        // dwell duration in ticks
+    uint16_t dwell_time_0;     // trigger_tcnt + dwell_delay_ticks_0
+    uint16_t dwell_time_1;     // trigger_tcnt + dwell_delay_ticks_1
+    uint16_t current_time;     // current_ticks_after_calculation
+  };
+
+  static constexpr uint16_t TRIGGER_BUFFER_SIZE = 16;
+  volatile TriggerEvent trigger_buffer[TRIGGER_BUFFER_SIZE];
+  volatile uint16_t trigger_head = 0;
+  volatile uint16_t trigger_tail = 0;
+  volatile bool trigger_buffer_full = false;
+  volatile uint32_t next_trigger_id = 1;
+  
+  // Capture control
+  volatile uint32_t capture_start_trigger = 1780;  // Start capturing after trigger N
+  volatile bool capture_active = false;
+  volatile bool capture_complete = false;
+
+  // Inline state detection functions
+  static inline bool is_dwelling() {
+    // Dwelling when spark pin is LOW (coil charging)
+    return (SPARK_PORT & _BV(SPARK_BIT)) == 0;
+  }
+  
+  static inline bool is_dwell_scheduled() {
+    // Dwell scheduled when COMPA interrupt is enabled
+    return (TIMSK1 & _BV(OCIE1A)) != 0;
+  }
+  
+  // is_spark_scheduled removed - redundant with is_dwelling
+  
+  // No get_current_state needed - use individual boolean functions directly
+
+  // Forward declarations
+  static void dump_trigger_buffer();
+  static const char* get_timing_mode_name(uint8_t mode);
 
 
 
@@ -216,8 +271,11 @@ namespace Timing {
 
   const uint16_t MAX_DUTY_CYCLE = 40; 
   const uint16_t NOMINAL_DWELL_TS = 30;
-  const uint16_t MAX_DWELL_TS = 32;
+  const uint16_t MAX_DWELL_TS = 31;
+  const uint16_t MIN_DWELL_TS = 29;
   constexpr uint16_t NOMINAL_DWELL_TICKS = (uint16_t)(( (uint32_t)NOMINAL_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
+  constexpr uint16_t MAX_DWELL_TICKS = (uint16_t)(( (uint32_t)MAX_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
+  constexpr uint16_t MIN_DWELL_TICKS = (uint16_t)(( (uint32_t)MIN_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
   const uint16_t MAX_RPM = 8000;
   const uint16_t MIN_PERIOD_TICKS =  (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(MAX_RPM)));
   const uint16_t CUTOFF_RPM = 7000;
@@ -404,19 +462,12 @@ namespace Timing {
     // Always force a period (previous lobe)
     dwell_delay_ticks_0 = spark_delay_ticks_0 -  dwell_ticks;
     dwell_delay_ticks_1 = spark_delay_ticks_1 -  dwell_ticks;
-    if (dwell_ticks > spark_delay_ticks_0) {
-      dwell_delay_ticks = dwell_delay_ticks_1;
-      current_timing_mode = TIMING_PREVIOUS_LOBE;  // Using previous lobe timing
-    } else {
-      dwell_delay_ticks = dwell_delay_ticks_0;
-      current_timing_mode = TIMING_SAME_LOBE;  // Using same lobe timing
-    }
   }
 
   // Calculate dwell duration based on predicted period and duty cycle limits  
   // Using predicted period provides better dwell control during RPM changes
   static inline void calculate_dwell() {
-    uint16_t max_dwell_ticks = ((predicted_period_ticks + 50) / 100) * MAX_DUTY_CYCLE; // 40% max duty cycle with rounding
+    uint16_t max_dwell_ticks = ((period_ticks + 50) / 100) * MAX_DUTY_CYCLE; // 40% max duty cycle with rounding
     dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
   
   }
@@ -431,12 +482,13 @@ namespace Timing {
     System::set_spark_pin_safe();
     
     // Reset all timing state variables
-    state = SPARK_FIRED;
+    // State is now determined by hardware conditions - no variable to reset
     engine_running = false;
     spark_enabled = false;
     n_starting_triggers = 0;
     period_ticks = 0;
     predicted_period_ticks = 0;
+    period_millis = 0;
     predicted_rpm = 0;
     trigger_tcnt = 0;
     dwell_ticks = 0;
@@ -447,11 +499,11 @@ namespace Timing {
     holt_init_count = 0;
     
     // Reset timing calculation variables
-    dwell_delay_ticks = 0;
     dwell_delay_ticks_0 = 0;
     dwell_delay_ticks_1 = 0;
     spark_delay_ticks_0 = 0;
     spark_delay_ticks_1 = 0;
+    current_ticks_after_calculation = 0;
     rpm = 0;
     advance_tenths_0 = 0;
     advance_tenths_1 = 0;
@@ -459,20 +511,168 @@ namespace Timing {
     delay_angle_tenths_1 = 0;
     dwell_actual_started_tcnt = 0;
     dwell_actual_ended_tcnt = 0;
-    current_timing_mode = TIMING_SAME_LOBE;
+    current_timing_mode = TIMING_STARTUP;
     last_trigger_millis = 0;
     
     // Clear all timer flags
     System::clear_all_timer_flags();
     
+    // Dump trigger buffer if capture was active or we have data
+    if (capture_complete || trigger_head != trigger_tail) {
+      Serial.println(F("Engine stopped - dumping trigger buffer"));
+      dump_trigger_buffer();
+    } else{
+
+      Serial.print(" Number of triggers: "); Serial.print(next_trigger_id - 1);
+      Serial.println(F(" Engine stopped - no trigger data to dump"));
+    }
+    
+    // Reset trigger buffer
+    trigger_head = 0;
+    trigger_tail = 0;
+    trigger_buffer_full = false;
+    next_trigger_id = 1;
+    capture_active = false;
+    capture_complete = false;
+    
     Serial.println(F("Engine stopped - all timing variables reset"));
+  }
+
+  // Store trigger event in ring buffer (with capture control)
+  static inline void store_trigger_event(bool dwelling_entry, bool dwell_scheduled_entry, 
+                                         uint16_t trigger_ticks, uint8_t timing_mode_entry) {
+    uint32_t current_trigger_id = next_trigger_id++;
+    
+    // Check if we should start capturing
+    if (current_trigger_id >= capture_start_trigger && !capture_complete) {
+      
+      if (!capture_active) {
+        capture_active = true;
+        Serial.print(F("Trigger buffer capture started at trigger "));
+        Serial.println(current_trigger_id);
+      }
+      
+      // Store trigger event
+      trigger_buffer[trigger_head].trigger_id = current_trigger_id;
+      trigger_buffer[trigger_head].trigger_millis = last_trigger_millis;
+      trigger_buffer[trigger_head].trigger_ticks = trigger_ticks;
+      trigger_buffer[trigger_head].dwelling_entry = dwelling_entry;
+      trigger_buffer[trigger_head].dwell_scheduled_entry = dwell_scheduled_entry;
+      trigger_buffer[trigger_head].dwelling_exit = is_dwelling();
+      trigger_buffer[trigger_head].dwell_scheduled_exit = is_dwell_scheduled();
+      trigger_buffer[trigger_head].timing_mode_entry = timing_mode_entry;
+      trigger_buffer[trigger_head].timing_mode_exit = current_timing_mode;  // current mode after schedule_dwell
+      trigger_buffer[trigger_head].rpm = rpm;
+      trigger_buffer[trigger_head].period_millis = period_millis;
+      trigger_buffer[trigger_head].period_ticks = period_ticks;
+      trigger_buffer[trigger_head].predicted_period_ticks = predicted_period_ticks;
+      trigger_buffer[trigger_head].spark_delay_ticks_0 = spark_delay_ticks_0;
+      trigger_buffer[trigger_head].spark_delay_ticks_1 = spark_delay_ticks_1;
+      trigger_buffer[trigger_head].dwell_ticks = dwell_ticks;
+      trigger_buffer[trigger_head].dwell_time_0 = trigger_tcnt + dwell_delay_ticks_0;
+      trigger_buffer[trigger_head].dwell_time_1 = trigger_tcnt + dwell_delay_ticks_1;
+      trigger_buffer[trigger_head].current_time = current_ticks_after_calculation;
+      
+      // Advance head
+      trigger_head = (trigger_head + 1) % TRIGGER_BUFFER_SIZE;
+      
+      // Check if buffer is full
+      if (trigger_head == trigger_tail) {
+        trigger_buffer_full = true;
+        trigger_tail = (trigger_tail + 1) % TRIGGER_BUFFER_SIZE;
+        
+        // Buffer is full, stop capturing
+        capture_complete = true;
+        capture_active = false;
+        Serial.print(F("Trigger buffer capture complete (full) at trigger "));
+        Serial.println(current_trigger_id);
+      }
+    }
+  }
+
+  // Helper function to print boolean as string
+  static const char* bool_to_string(bool value) {
+    return value ? "true" : "false";
+  }
+  
+  // Get timing mode name from enum value
+  static const char* get_timing_mode_name(uint8_t mode) {
+    switch (mode) {
+      case TIMING_SAME_LOBE: return "TIMING_SAME_LOBE";
+      case TIMING_PREVIOUS_LOBE: return "TIMING_PREVIOUS_LOBE";
+      case TIMING_IMMEDIATE: return "TIMING_IMMEDIATE";
+      case TIMING_STARTUP: return "TIMING_STARTUP";
+      default: return "UNKNOWN";
+    }
+  }
+
+  // Dump trigger buffer in JSON format
+  static void dump_trigger_buffer() {
+    Serial.println(F("{"));
+    Serial.println(F("  \"trigger_events\": ["));
+    
+    uint16_t count = 0;
+    uint16_t idx = trigger_tail;
+    
+    // Calculate number of entries
+    if (trigger_buffer_full) {
+      count = TRIGGER_BUFFER_SIZE;
+    } else {
+      count = (trigger_head >= trigger_tail) ? (trigger_head - trigger_tail) : 
+              (TRIGGER_BUFFER_SIZE - trigger_tail + trigger_head);
+    }
+    
+    for (uint16_t i = 0; i < count; i++) {
+      volatile const TriggerEvent& event = trigger_buffer[idx];
+      
+      Serial.println(F("        {"));
+      Serial.print(F("            \"trigger_id\": "));     Serial.print(event.trigger_id); Serial.println(F(","));
+      Serial.print(F("            \"millis\": "));          Serial.print(event.trigger_millis); Serial.println(F(","));
+      Serial.print(F("            \"trigger_ticks\": "));  Serial.print(event.trigger_ticks); Serial.println(F(","));
+      Serial.print(F("            \"dwelling_entry\": "));  Serial.print(bool_to_string(event.dwelling_entry)); Serial.println(F(","));
+      Serial.print(F("            \"dwell_scheduled_entry\": ")); Serial.print(bool_to_string(event.dwell_scheduled_entry)); Serial.println(F(","));
+      Serial.print(F("            \"dwelling_exit\": "));   Serial.print(bool_to_string(event.dwelling_exit)); Serial.println(F(","));
+      Serial.print(F("            \"dwell_scheduled_exit\": ")); Serial.print(bool_to_string(event.dwell_scheduled_exit)); Serial.println(F(","));
+      Serial.print(F("            \"timing_mode_entry\": \"")); Serial.print(get_timing_mode_name(event.timing_mode_entry)); Serial.println(F("\","));
+      Serial.print(F("            \"timing_mode_exit\": \"")); Serial.print(get_timing_mode_name(event.timing_mode_exit)); Serial.println(F("\","));
+      Serial.print(F("            \"rpm\": "));          Serial.print(event.rpm); Serial.println(F(","));
+      Serial.print(F("            \"period_millis\": ")); Serial.print(event.period_millis); Serial.println(F(","));
+      Serial.print(F("            \"period_ticks\": "));  Serial.print(event.period_ticks); Serial.println(F(","));
+      Serial.print(F("            \"predicted_period_ticks\": ")); Serial.print(event.predicted_period_ticks); Serial.println(F(","));
+      Serial.print(F("            \"spark_delay_ticks_0\": ")); Serial.print(event.spark_delay_ticks_0); Serial.println(F(","));
+      Serial.print(F("            \"spark_delay_ticks_1\": ")); Serial.print(event.spark_delay_ticks_1); Serial.println(F(","));
+      Serial.print(F("            \"dwell_ticks\": "));  Serial.print(event.dwell_ticks); Serial.println(F(","));
+      Serial.print(F("            \"dwell_time_0\": "));  Serial.print(event.dwell_time_0); Serial.println(F(","));
+      Serial.print(F("            \"dwell_time_1\": "));  Serial.print(event.dwell_time_1); Serial.println(F(","));
+      Serial.print(F("            \"current_time\": "));  Serial.print(event.current_time); Serial.println();
+      Serial.print(F("        }"));
+      
+      if (i < count - 1) {
+        Serial.println(F(","));
+      } else {
+        Serial.println();
+      }
+      
+      idx = (idx + 1) % TRIGGER_BUFFER_SIZE;
+    }
+    
+    Serial.println(F("  ],"));
+    Serial.print(F("  \"total_triggers\": ")); Serial.print(count);
+    Serial.println();
+    Serial.println(F("}"));
   }
 
 
 
 
 
+// Fire spark (called from COMPB ISR)
+static inline void fire_spark() {
+  // Fast pin set - HIGH to fire spark
+  System::spark_pin_high();  // State becomes SPARK_FIRED when pin goes HIGH
+  Timing::dwell_actual_ended_tcnt = System::get_timer_count();
 
+}
 
 
 // Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
@@ -483,31 +683,62 @@ static inline void schedule_dwell() {
   calculate_spark_delay();
   calculate_dwell_delay();
 
-  if (Timing::state == Timing::DWELL_SCHEDULED) {
-    // Do not reschedule
-      return;
-  } else if (Timing::state == Timing::DWELLING  && ((System::get_timer_count() - Timing::dwell_actual_started_tcnt)<NOMINAL_DWELL_TICKS)) {
-    System::set_spark_compare(spark_delay_ticks_0 + trigger_tcnt);
-
+  if (is_dwell_scheduled()) {
+    // if the dwell is already scheduled then it has overshot - need to reschedule
+    System::disable_dwell_interrupt();
+    Timing::current_timing_mode = TIMING_IMMEDIATE; // Force immediate dwell
+  } else if (is_dwelling()) {
+      System::set_spark_compare(spark_delay_ticks_0 + trigger_tcnt);
   } 
 
-  // Calculate when to start dwell
-  uint16_t when = trigger_tcnt + dwell_delay_ticks;
-  uint16_t current_ticks = System::get_timer_count();
+  uint16_t when;
+  current_ticks_after_calculation = System::get_timer_count();
+  //lead_time_after_calculation = trigger_tcnt + dwell_delay_ticks_0 - current_ticks_after_calculation;  // Unsigned subtraction handles wraparound
+
+  if (Timing::current_timing_mode == TIMING_STARTUP) {
+     if (spark_delay_ticks_0 < dwell_ticks) {
+       Timing::current_timing_mode = TIMING_PREVIOUS_LOBE;
+       when = trigger_tcnt + dwell_delay_ticks_1;
+     } else {
+       Timing::current_timing_mode = TIMING_SAME_LOBE;
+       when = trigger_tcnt + dwell_delay_ticks_0;
+     }
+
+
+  } else if (Timing::current_timing_mode == TIMING_SAME_LOBE) {
+    when = trigger_tcnt + dwell_delay_ticks_0;
+    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
+     // Check if we are too close to the dwell time
+    if (immediate_dwell_ticks < MAX_DWELL_TICKS && immediate_dwell_ticks > MIN_DWELL_TICKS) {
+      // Too close or already past - switch to previous lobe timing
+      Timing::current_timing_mode = TIMING_IMMEDIATE;
+
+    }
+  } else if (Timing::current_timing_mode == TIMING_PREVIOUS_LOBE) {
+    when = trigger_tcnt + dwell_delay_ticks_0;
+    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
+     // Check if the next dwell time is likely to be a candidate for immediate dwell
+    if (immediate_dwell_ticks < MAX_DWELL_TICKS && immediate_dwell_ticks > MIN_DWELL_TICKS) {
+      // Too close or already past - switch to previous lobe timing
+      Timing::current_timing_mode = TIMING_IMMEDIATE;
+
+    } else {
+      when = trigger_tcnt + dwell_delay_ticks_1;
+
+    }
+  } 
   
-  // Calculate lead time, handling timer wraparound properly
-  // For 16-bit timer wraparound: treat differences > 32767 as negative (already passed)
-  uint16_t lead_time = when - current_ticks;  // Unsigned subtraction handles wraparound
-  
-  // Check if we have enough lead time or if the time has already passed
-  // If lead_time > 32767, the target time is in the past (wrapped around)
-  if (lead_time > 32767) {
+
+
+
+ if (Timing::current_timing_mode == TIMING_IMMEDIATE && !is_dwelling()) {
+    when = trigger_tcnt + dwell_delay_ticks_0;
 
     // Too close or already past - start dwell immediately
     Timing::current_timing_mode = TIMING_IMMEDIATE;  // Mark as immediate dwell
     System::spark_pin_low();  // Start dwell immediately (coil charging)
     Timing::dwell_actual_started_tcnt = System::get_timer_count();
-    Timing::state = Timing::DWELLING;
+    // State is now DWELLING (spark pin is LOW)
     
     // Calculate the original planned spark time to maintain timing accuracy
     // Original spark time = when + dwell_ticks
@@ -518,14 +749,27 @@ static inline void schedule_dwell() {
     System::set_spark_compare(original_spark_time);  // Maintain original spark timing
     System::enable_spark_interrupt();
     
-    return;
+    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
+    if (immediate_dwell_ticks < MIN_DWELL_TICKS ) {
+      // If we are already past the original spark time, fire spark immediately
+      when = trigger_tcnt + dwell_delay_ticks_1;
+      Timing::current_timing_mode = TIMING_PREVIOUS_LOBE;
+    } else if (immediate_dwell_ticks > MAX_DWELL_TICKS) {
+      // If we have enough time for a full dwell, schedule normally
+      when = trigger_tcnt + dwell_delay_ticks_0;
+      Timing::current_timing_mode = TIMING_SAME_LOBE;
+    }
+
+    
   }
   
-  // Safe to schedule normally
-  System::clear_dwell_flag();   // clear stale flag
-  System::set_dwell_compare(when);         // set absolute time
-  System::enable_dwell_interrupt(); // enable dwell interrupt
-  Timing::state = Timing::DWELL_SCHEDULED;
+  if (Timing::current_timing_mode != TIMING_IMMEDIATE) {
+      // Safe to schedule normally
+      System::clear_dwell_flag();   // clear stale flag
+      System::set_dwell_compare(when);         // set absolute time
+      System::enable_dwell_interrupt(); // enable dwell interrupt
+      // State is now DWELL_SCHEDULED (COMPA interrupt enabled)
+ }
 }
 
 // Schedule a COMPB one-shot for spark fire (dwell duration from now)
@@ -538,77 +782,91 @@ static inline void schedule_spark() {
 
 static inline void start_dwell() {
   // Fast pin clear - LOW to start dwell
-  Timing::state = Timing::DWELLING;
-  System::spark_pin_low();
+  System::spark_pin_low();  // State becomes DWELLING when pin goes LOW
 
   // Schedule spark to fire after dwell period
   schedule_spark();
 }
 
-// Fire spark (called from COMPB ISR)
-static inline void fire_spark() {
-  // Fast pin set - HIGH to fire spark
-  System::spark_pin_high();
-  Timing::state = Timing::SPARK_FIRED;
-  Timing::dwell_actual_ended_tcnt = System::get_timer_count();
 
-}
 
 }
 // External interrupt: crank trigger
 ISR(INT0_vect) {
   uint16_t tcnt_candidate = System::get_timer_count();  // Snapshot Timer1 as early as possible
+  uint16_t millis_candidate = millis(); // Snapshot millis for timestamp
+  uint16_t last_millis_local = Timing::last_trigger_millis;
+  
+  // Capture entry state
+  bool dwelling_entry = Timing::is_dwelling();
+  bool dwell_scheduled_entry = Timing::is_dwell_scheduled();
 
   Timing::last_trigger_millis = millis();  // Update last trigger time
-  if (Timing::n_starting_triggers++ <= Timing::NUMBER_STARTUP_TRIGGERS) {
+  if (Timing::n_starting_triggers <= Timing::NUMBER_STARTUP_TRIGGERS) {
     // During startup phase, just count triggers to stabilize
     Timing::period_ticks = tcnt_candidate - Timing::trigger_tcnt;
+    Timing::n_starting_triggers++;
     Timing::current_timing_mode = Timing::TIMING_STARTUP;
     Timing::predicted_period_ticks = Timing::period_ticks;
     Timing::trigger_tcnt = tcnt_candidate;
+    
+    // Store startup trigger event
+    Timing::store_trigger_event(dwelling_entry, dwell_scheduled_entry, tcnt_candidate, Timing::current_timing_mode);
     return;
   } 
 
   Timing::engine_running = true;
 
-    // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
-  uint16_t period_ticks_candidate = (uint16_t)(tcnt_candidate - Timing::trigger_tcnt);
+  // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
+  uint32_t period_ticks_candidate = (uint32_t)(tcnt_candidate - Timing::trigger_tcnt);
+  uint32_t period_millis_candidate = millis_candidate - last_millis_local;
 
-  
+  uint32_t expected_period_ticks = period_millis_candidate * (Timing::TIMER_TICKS_PER_SEC / 1000);
+  // Adjust for possible Timer1 wraparound (every 65536 ticks)
+  uint32_t num_wraps = (expected_period_ticks) / 0x10000; // Round to nearest)
+  period_ticks_candidate = period_ticks_candidate + num_wraps * 0x10000;
+
+  int32_t error = (int32_t)period_ticks_candidate - (int32_t)expected_period_ticks;
+  if (error < -20000 || error > 20000) {
+    if (error > 0) {
+      period_ticks_candidate -= 0x10000;
+    } else {
+      period_ticks_candidate += 0x10000;
+    }
+  }
 
 
-  const uint16_t min_valid_ticks = max((Timing::period_ticks/3) , Timing::MIN_PERIOD_TICKS); // 33% or absolute min
+  const uint32_t min_valid_ticks = max((Timing::period_ticks/3) , Timing::MIN_PERIOD_TICKS); // 33% or absolute min
 
   // 30% window filter: ignore triggers that are less than 30% of the previous period
   // Only apply if we have a valid previous period (after first pulse)
   if (period_ticks_candidate < min_valid_ticks ) {
-
     return;
   }
 
-    if (period_ticks_candidate < Timing::CUTOFF_PERIOD_TICKS) {
-      Timing::spark_enabled = false;
-    }
-    // Update engine timing state
-    if (Timing::spark_enabled) {
-      Timing::period_ticks = period_ticks_candidate;
-
-      Timing::predicted_period_ticks = Timing::period_ticks;
-      Timing::trigger_tcnt=tcnt_candidate;
-
-      // Schedule dwell start (calculations done inside using predicted period)
-      Timing::schedule_dwell();
-
-
- 
-    }
-
-
-
+  if (period_ticks_candidate < Timing::CUTOFF_PERIOD_TICKS) {
+    Timing::spark_enabled = false;
+  }
   
+  // Update engine timing state
+  if (Timing::spark_enabled) {
+    Timing::period_ticks = period_ticks_candidate;
+    Timing::period_millis = millis_candidate - last_millis_local;
+    Timing::predicted_period_ticks = Timing::period_ticks;
+    Timing::trigger_tcnt = tcnt_candidate;
 
-
-
+    // Capture timing mode before schedule_dwell modifies it
+    uint8_t timing_mode_before = Timing::current_timing_mode;
+    
+    // Schedule dwell start (calculations done inside using predicted period)
+    Timing::schedule_dwell();
+    
+    // Store trigger event with final state (timing mode captured before and after)
+    Timing::store_trigger_event(dwelling_entry, dwell_scheduled_entry, tcnt_candidate, timing_mode_before);
+  } else {
+    // Store trigger event when spark is not enabled
+    Timing::store_trigger_event(dwelling_entry, dwell_scheduled_entry, tcnt_candidate, Timing::current_timing_mode);
+  }
 }
 
 
@@ -638,6 +896,9 @@ void setup() {
   Serial.print(F("Minimum period ticks: ")); Serial.println(Timing::MIN_PERIOD_TICKS);
   Serial.print(F("Initialized at ")); Serial.print(Timing::TIMER_TICKS_PER_SEC); Serial.println(F(" ticks per second"));
   Serial.print(F("Nominal dwell ticks: ")); Serial.println(Timing::NOMINAL_DWELL_TICKS);
+  Serial.print(F("Max dwell ticks: ")); Serial.println(Timing::MAX_DWELL_TICKS);
+  Serial.print(F("Min dwell ticks: ")); Serial.println(Timing::MIN_DWELL_TICKS);
+  Serial.print(F("Max RPM: ")); Serial.println(Timing::MAX_RPM);
 
   // Initialize spark pin
   System::set_spark_pin_output();

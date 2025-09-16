@@ -165,16 +165,20 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
     last_valid_trigger_idx = None
     last_valid_trigger_time = None
     T0_time = None  # Time of previous trigger (for first trigger handling)
+    trigger_num = 0  # Track valid trigger count (excludes noise)
     
     for idx in range(len(trigger_indices) - 1):
         T1_idx = trigger_indices[idx]
         T1_time = signal_changes[T1_idx][0]
         T0_time = T1_time if T0_time is None else T0_time
-        trigger_num = idx + 1
         
         # Check if this trigger was pre-identified as noise
         is_noise = noise_flags[idx]
         noise_reason = "pattern detection" if is_noise else ""
+        
+        # Only increment trigger_num for valid (non-noise) triggers
+        if not is_noise:
+            trigger_num += 1
         
         # Calculate period based on whether this trigger is noise or not
         if is_noise:
@@ -333,8 +337,10 @@ def generate_csv_output(results: List[Dict]):
             'theoretical_delay_us', 'error_degrees', 'is_noise', 'noise_reason'
         ])
         
-        # Data rows
+        # Data rows - exclude noise triggers from CSV output
         for r in results:
+            if r.get('is_noise', False):
+                continue  # Skip noise triggers
             writer.writerow([
                 r['trigger_num'],
                 f"{r['trigger_time_ms']:.3f}",
@@ -354,7 +360,9 @@ def generate_csv_output(results: List[Dict]):
                 r['noise_reason']
             ])
     
-    print(f"Generated wokwi-logic-analysis.csv with {len(results)} trigger events")
+    valid_count = sum(1 for r in results if not r.get('is_noise', False))
+    noise_count = sum(1 for r in results if r.get('is_noise', False))
+    print(f"Generated wokwi-logic-analysis.csv with {valid_count} valid triggers (excluded {noise_count} noise spikes)")
 
 def create_timing_plot(results: List[Dict]):
     """Create plots showing timing analysis and dwell characteristics."""
