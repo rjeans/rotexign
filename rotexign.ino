@@ -11,6 +11,8 @@
 
 #include <avr/interrupt.h>
 
+// Enable diagnostic logging and ring buffer - comment out to save memory
+//#define ENABLE_DIAGNOSTIC_LOGGING
 
 // Direct port control for SPARK_PIN (digital pin 3 = PD3 on ATmega328P)
 #define SPARK_PORT  PORTD
@@ -199,6 +201,7 @@ namespace Timing {
   volatile uint16_t dwell_actual_ended_tcnt = 0;   // Timer count when dwell actually ended
   volatile uint8_t current_timing_mode = TIMING_STARTUP; // Track which timing mode is being used
 
+#ifdef ENABLE_DIAGNOSTIC_LOGGING
   // Trigger ring buffer for debugging
   struct TriggerEvent {
     uint32_t trigger_id;
@@ -233,6 +236,7 @@ namespace Timing {
   volatile uint32_t capture_start_trigger = 1780;  // Start capturing after trigger N
   volatile bool capture_active = false;
   volatile bool capture_complete = false;
+#endif
 
   // Inline state detection functions
   static inline bool is_dwelling() {
@@ -250,8 +254,10 @@ namespace Timing {
   // No get_current_state needed - use individual boolean functions directly
 
   // Forward declarations
+#ifdef ENABLE_DIAGNOSTIC_LOGGING
   static void dump_trigger_buffer();
   static const char* get_timing_mode_name(uint8_t mode);
+#endif
 
 
 
@@ -517,12 +523,12 @@ namespace Timing {
     // Clear all timer flags
     System::clear_all_timer_flags();
     
+#ifdef ENABLE_DIAGNOSTIC_LOGGING
     // Dump trigger buffer if capture was active or we have data
     if (capture_complete || trigger_head != trigger_tail) {
       Serial.println(F("Engine stopped - dumping trigger buffer"));
       dump_trigger_buffer();
     } else{
-
       Serial.print(" Number of triggers: "); Serial.print(next_trigger_id - 1);
       Serial.println(F(" Engine stopped - no trigger data to dump"));
     }
@@ -534,10 +540,12 @@ namespace Timing {
     next_trigger_id = 1;
     capture_active = false;
     capture_complete = false;
+#endif
     
     Serial.println(F("Engine stopped - all timing variables reset"));
   }
 
+#ifdef ENABLE_DIAGNOSTIC_LOGGING
   // Store trigger event in ring buffer (with capture control)
   static inline void store_trigger_event(bool dwelling_entry, bool dwell_scheduled_entry, 
                                          uint16_t trigger_ticks, uint8_t timing_mode_entry) {
@@ -589,7 +597,14 @@ namespace Timing {
       }
     }
   }
+#else
+  // Stub function when diagnostic logging is disabled
+  static inline void store_trigger_event(bool, bool, uint16_t, uint8_t) {
+    // Do nothing when logging disabled
+  }
+#endif
 
+#ifdef ENABLE_DIAGNOSTIC_LOGGING
   // Helper function to print boolean as string
   static const char* bool_to_string(bool value) {
     return value ? "true" : "false";
@@ -661,6 +676,7 @@ namespace Timing {
     Serial.println();
     Serial.println(F("}"));
   }
+#endif
 
 
 
