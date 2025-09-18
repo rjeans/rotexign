@@ -14,10 +14,10 @@ static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 
 // Timing constants  
 static const float IDLE_DURATION_S = 3.0f;
-static const float IDLE_RPM = 1500.0f;
+static const float IDLE_RPM = 250.0f;
 static const float MAX_RPM = 6900.0f;
-static const float ACCELERATION_TIME_S = 1.0f;
-static const float MAX_RPM_DURATION_S = 3.0f;  
+static const float ACCELERATION_TIME_S = 5.0f;
+static const float MAX_RPM_DURATION_S = 0.0f;  
 
 // State machine states
 typedef enum {
@@ -44,6 +44,7 @@ static float state_start_time = 0;
 static float last_pulse_time = 0;
 static uint32_t pulse_count = 0;
 static uint32_t revolution_count = 0;
+static bool is_ready = false;
 
 // Angular motion parameters for current state
 static float initial_omega = 0;  // Angular velocity at start of state (deg/s)
@@ -316,7 +317,7 @@ static void monitoring_timer_event(void *user_data) {
 // Spark noise handler
 static void spark_handler(void *user_data, pin_t pin, uint32_t value) {
     chip_state_t *chip = (chip_state_t*)user_data;
-    
+    if (!is_ready) return;  // Ignore sparks if not ready
     // 10% chance to inject noise
     if ((rand() % 10) == 0 && !noise_active) {
         noise_active = true;
@@ -335,7 +336,9 @@ static void noise_timer_event(void *user_data) {
 // Ready pin handler - start simulation
 static void ready_pin_change(void *user_data, pin_t pin, uint32_t value) {
     float current_time = get_current_time_ms() / 1000.0f;
-    
+
+    is_ready = (value == HIGH);
+
     // Start idling
     sim_state = STATE_IDLING;
     state_start_time = current_time;

@@ -160,14 +160,14 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
                         # The trigger after the short period (i+1) is noise
                         noise_flags[i+1] = True
     
-    # Process each trigger (skip last one - no next trigger)  
+    # Process each trigger including the last one
     previous_valid_period_ns = None
     last_valid_trigger_idx = None
     last_valid_trigger_time = None
     T0_time = None  # Time of previous trigger (for first trigger handling)
     trigger_num = 0  # Track valid trigger count (excludes noise)
     
-    for idx in range(len(trigger_indices) - 1):
+    for idx in range(len(trigger_indices)):
         T1_idx = trigger_indices[idx]
         T1_time = signal_changes[T1_idx][0]
         T0_time = T1_time if T0_time is None else T0_time
@@ -176,9 +176,8 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
         is_noise = noise_flags[idx]
         noise_reason = "pattern detection" if is_noise else ""
         
-        # Only increment trigger_num for valid (non-noise) triggers
-        if not is_noise:
-            trigger_num += 1
+        # Increment trigger_num for ALL triggers (including noise)
+        trigger_num += 1
         
         # Calculate period based on whether this trigger is noise or not
         if is_noise:
@@ -206,17 +205,25 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
         
         period_us = period_ns / 1000.0
         
-        # For spark search, always use immediate next trigger (not skipping noise)
-        T2_idx = trigger_indices[idx + 1]
-        T2_time_spark_search = signal_changes[T2_idx][0]
-        
-        # Check if the NEXT trigger is flagged as noise (affects filtering)
-        next_is_noise = noise_flags[idx+1] if idx+1 < len(noise_flags) else False
+        # For spark search, use next trigger if available, otherwise search to end of data
+        if idx < len(trigger_indices) - 1:
+            T2_idx = trigger_indices[idx + 1]
+            T2_time_spark_search = signal_changes[T2_idx][0]
+            next_is_noise = noise_flags[idx+1] if idx+1 < len(noise_flags) else False
+        else:
+            # Last trigger - search from this trigger to end of VCD data
+            T2_time_spark_search = signal_changes[-1][0] if signal_changes else T1_time + 100_000_000  # 100ms window
+            next_is_noise = False
         
         # Additional noise checks if not already flagged
         if not is_noise and not next_is_noise:
-            # Handle zero or very small periods
-            if period_ns <= 1000:  # Less than 1 microsecond - likely duplicate
+            # Special handling for first trigger (idx == 0)
+            # Don't mark as noise just because it has no period
+            if idx == 0:
+                # First trigger - keep it valid unless it's a spike
+                pass
+            # Handle zero or very small periods (but not for first trigger)
+            elif period_ns <= 1000:  # Less than 1 microsecond - likely duplicate
                 is_noise = True
                 noise_reason = "duplicate"
             
@@ -276,9 +283,13 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
                 dwell_delay_us = None
             
             # Convert delay to degrees (180° per trigger period)
-            degrees_per_us = 180.0 / period_us
-            delay_degrees = delay_us * degrees_per_us
-            advance_degrees = 47.0 - delay_degrees  # 47° is TDC position
+            if period_us > 0:
+                degrees_per_us = 180.0 / period_us
+                delay_degrees = delay_us * degrees_per_us
+                advance_degrees = 47.0 - delay_degrees  # 47° is TDC position
+            else:
+                delay_degrees = None
+                advance_degrees = None
         else:
             # Missing spark
             delay_us = None
@@ -338,11 +349,13 @@ def generate_csv_output(results: List[Dict]):
         ])
         
         # Data rows - exclude noise triggers from CSV output
+        csv_trigger_num = 0
         for r in results:
             if r.get('is_noise', False):
                 continue  # Skip noise triggers
+            csv_trigger_num += 1
             writer.writerow([
-                r['trigger_num'],
+                csv_trigger_num,
                 f"{r['trigger_time_ms']:.3f}",
                 f"{r['diagnostics_time_ms']:.3f}",
                 f"{r['period_us']:.1f}",
