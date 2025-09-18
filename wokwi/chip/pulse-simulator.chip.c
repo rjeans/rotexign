@@ -18,8 +18,8 @@ static const float CRANK_START_RPM = 400.0f;
 static const float CRANK_END_RPM = 1100.0f;  // Match Arduino's IDLE_MIN_RPM
 static const float IDLE_DURATION_S = 2.0f;
 static const float IDLE_RPM = 1500.0f;
-static const float MAX_RPM = 6900.0f;
-static const float ACCELERATION_TIME_S = 30.0f;
+static const float MAX_RPM = 8000.0f;
+static const float ACCELERATION_TIME_S = 5.0f;
 static const float MAX_RPM_DURATION_S = 2.0f;
 static const float FINAL_DECEL_TIME_S = 2.0f;  
 

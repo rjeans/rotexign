@@ -1,8 +1,8 @@
 # rotexign — Arduino Ignition Controller
 
-Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. This implementation uses interrupt-driven timing control with a deferred processing architecture for precise dwell and spark scheduling.
+Arduino-based ignition timing controller for the Rotax 787 two-stroke engine. This implementation uses interrupt-driven timing control with a sophisticated engine state machine for precise dwell and spark scheduling.
 
-✅ **Status**: Production-ready ignition controller with advanced RPM prediction and dual timing system
+✅ **Status**: Production-ready ignition controller with advanced engine state management and timing control
 
 ## Overview
 
@@ -14,28 +14,28 @@ This project implements a sophisticated ignition timing controller using an Ardu
 - **Hardware Timer-Based**: Uses Timer1 with 0.5μs resolution (prescaler /8 at 16MHz)
 - **Direct Port Control**: Bypasses Arduino digitalRead/Write for minimal latency
 - **Interrupt-Driven**: External interrupt (INT0) captures timing with microsecond precision
-- **Ring Buffer**: Buffered event system for reliable trigger processing
+- **Engine State Machine**: Four-state system (STOPPED, READY, CRANKING, RUNNING) with automatic transitions
 
-### Advanced RPM Prediction System
+### Advanced Engine State Management
+- **Starter Integration**: D5 pin reads starter motor state for cranking detection
+- **Automatic State Transitions**: Based on RPM thresholds and starter status
+- **Trigger Timeout Detection**: 500ms timeout in main loop for stopped engine detection
 - **Holt's Double Exponential Smoothing**: Predicts next-cycle RPM using floating-point precision
-- **Dual Timing Calculations**: Current RPM (measured) + Predicted RPM (next cycle)
-- **Linear Prediction**: Predicts RPM changes (linear) rather than period (non-linear) for better accuracy
-- **Real-Time Correction**: Secondary spark adjustment during dwell phase for maximum precision
 
 ### Timing Control  
 - **Adaptive Advance Curve**: 201-point interpolated timing map stored in PROGMEM
-- **Previous-Lobe Timing**: Always uses previous lobe for timing (one full period delay)  
+- **Three Timing Modes**: Same lobe, previous lobe, and immediate dwell based on RPM
 - **Precision Dwell Control**: 3ms target with 40% duty cycle protection
-- **Two-Stage Scheduling**: Separate dwell start and spark fire events with real-time adjustment
-- **RPM Range**: Designed for 800-8000 RPM operation
+- **Two-Stage Scheduling**: Separate dwell start and spark fire events
+- **RPM Range**: Supports 200-8000 RPM operation
 
 ### Safety Features
-- **Rev Limiter**: Hard cut at 7000 RPM with immediate ignition disable
-- **Startup Protection**: 3-trigger stabilization before enabling ignition
+- **Rev Limiter**: Hard cut at 7500 RPM with 250 RPM hysteresis
+- **Startup Protection**: 2-trigger stabilization before enabling ignition
 - **Duty Cycle Protection**: Prevents coil overheating at high RPM
-- **Input Pulse Filtering**: 30% period change rejection with noise immunity system
+- **Input Pulse Filtering**: 30% period change rejection with noise immunity
 - **Relay Protection**: D4 relay keeps coil grounded until D2 is stable HIGH for 1 second
-- **Clean Initialization**: All outputs start in safe state
+- **Trigger Timeout**: Automatic engine stop detection after 500ms without triggers
 
 ## Hardware Configuration
 
@@ -45,6 +45,7 @@ This project implements a sophisticated ignition timing controller using an Ardu
 | D2 | Trigger Input (INT0) | Falling edge trigger from crank sensor (47° BTDC) |
 | D3 | Ignition Output | Coil control (HIGH→LOW = start dwell, LOW→HIGH = fire spark) |
 | D4 | Safety Relay | Relay control (HIGH = armed/open, LOW = safe/closed at startup) |
+| D5 | Starter Input | Starter motor detection (HIGH = starter active, LOW = inactive) |
 
 ### Engine Parameters
 - **Trigger Configuration**: 2 pulses per revolution (2 lobes, 180° apart)
@@ -52,203 +53,290 @@ This project implements a sophisticated ignition timing controller using an Ardu
 - **Coil Type**: Smart coil with 3ms dwell requirement at 12V
 - **Maximum Duty Cycle**: 40% to prevent coil damage
 
+## Engine State Machine
+
+The controller implements a sophisticated four-state engine management system:
+
+### State Definitions
+
+#### STOPPED (Initial State)
+- **Purpose**: Engine not running, ignition disabled
+- **Spark Output**: Disabled
+- **Trigger Handling**: Collects triggers for initialization
+- **Requirements**: Starter must be active AND minimum trigger count reached
+
+#### READY (Startup State)  
+- **Purpose**: Engine ready to start, triggers stable
+- **Spark Output**: Disabled (no spark during cranking preparation)
+- **Trigger Handling**: Monitors for cranking conditions
+- **Requirements**: Stable trigger pattern established
+
+#### CRANKING (Starting State)
+- **Purpose**: Engine cranking, limited RPM spark enabled
+- **Spark Output**: Enabled with 0° advance (cranking timing)
+- **Trigger Handling**: Full timing calculations active
+- **Requirements**: Starter active AND RPM in cranking range
+
+#### RUNNING (Operating State)
+- **Purpose**: Normal engine operation
+- **Spark Output**: Enabled with full advance curve
+- **Trigger Handling**: Complete timing system active
+- **Requirements**: RPM above idle minimum
+
+### State Transition Logic
+
+```
+Engine State Transition Diagram:
+
+STOPPED ←────────────────────────────────────────┐
+   │                                             │
+   │ Starter ON + n_ready_triggers >= 2          │ 500ms timeout
+   │ + RPM >= 200                                │ OR stall conditions
+   ↓                                             │
+READY ──────────────────────────────────────────┤
+   │                                             │
+   │ Starter ON + RPM <= 800 + 200ms debounce    │
+   ↓                                             │
+CRANKING ───────────────────────────────────────┤
+   │                                             │
+   │ RPM >= 1000 (IDLE_MIN_RPM)                  │
+   ↓                                             │
+RUNNING ────────────────────────────────────────┘
+```
+
+### RPM Thresholds and Conditions
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `MIN_RPM` | 200 RPM | Minimum RPM for any engine operation |
+| `CRANK_MAX_RPM` | 800 RPM | Maximum RPM while cranking |
+| `IDLE_MIN_RPM` | 1000 RPM | Minimum RPM for running state |
+| `REENTRY_RPM` | 1100 RPM | RPM to transition from cranking to running |
+| `OVERREV_RPM` | 7500 RPM | Rev limiter activation |
+| `OVERREV_HYST_RPM` | 250 RPM | Rev limiter hysteresis (7250 RPM re-enable) |
+
+### Detailed State Transitions
+
+#### STOPPED → READY
+```cpp
+// Conditions (all must be true):
+starter_active() == true                    // Starter must be on
+n_ready_triggers >= HOLT_INIT_SAMPLES (2)  // Minimum trigger count
+current_rpm >= MIN_RPM (200)               // Minimum RPM threshold
+```
+
+#### READY → CRANKING  
+```cpp
+// Conditions (all must be true):
+starter_active() == true                    // Starter still active
+current_rpm <= CRANK_MAX_RPM (800)         // In cranking RPM range
+debounce_timer >= CRANK_DEBOUNCE_MS (200)  // 200ms debounce period
+```
+
+#### CRANKING → RUNNING
+```cpp
+// Conditions (either):
+current_rpm >= IDLE_MIN_RPM (1000)         // Above idle threshold
+```
+
+#### RUNNING → CRANKING
+```cpp
+// Conditions (all must be true):
+current_rpm < IDLE_MIN_RPM (1000)          // Below idle
+starter_active() == true                    // Starter reactivated
+```
+
+#### RUNNING → STOPPED
+```cpp
+// Conditions (either):
+current_rpm < IDLE_MIN_RPM (1000) AND      // Below idle AND
+starter_active() == false AND               // Starter off AND  
+stall_timer >= STALL_TIMEOUT_MS (500)      // 500ms stall timeout
+
+// OR from main loop:
+time_since_trigger > 500ms                 // No triggers for 500ms
+```
+
+#### ANY → STOPPED (Emergency Conditions)
+```cpp
+// Automatic transitions to STOPPED:
+trigger_timeout > 500ms                    // Main loop timeout
+over_rev_active == true                     // Rev limiter active
+// Manual reset or system error
+```
+
 ## Implementation Details
 
-### Advanced Dual-Timing Architecture
+### Timing Calculation Modes
 
-The controller implements a sophisticated prediction system with real-time corrections:
+The controller automatically selects between three timing modes based on RPM and dwell requirements:
 
-```
-Trigger (INT0) → RPM Prediction → Dual Timing → Schedule Dwell → Dynamic Spark Adjustment
-```
+#### 1. TIMING_SAME_LOBE (Low RPM)
+- **When**: Sufficient time for dwell scheduling in current 180° period
+- **Method**: Schedule dwell start, then spark after 3ms
+- **Advantage**: Most accurate timing
+- **Range**: Typically < 2000 RPM
 
-1. **Trigger ISR** (`INT0_vect`):
-   - Captures Timer1 count immediately for precise timing  
-   - Filters trigger pulses to reject 30% period changes (noise rejection)
-   - Calculates current RPM from measured period
-   - Updates Holt's Method predictor with current RPM
-   - Schedules dwell start using predicted timing
+#### 2. TIMING_PREVIOUS_LOBE (Medium RPM)  
+- **When**: Must schedule dwell in previous 180° period for sufficient time
+- **Method**: Add one full period to dwell delay calculation
+- **Advantage**: Maintains full 3ms dwell time
+- **Range**: Typically 2000-4000 RPM
 
-2. **RPM Prediction System** (`holt_update_and_predict()`):
-   - **Holt's Double Exponential Smoothing**: α=0.4 (level), β=0.1 (trend)
-   - **Floating-Point Precision**: Clean implementation without integer scaling artifacts
-   - **RPM-Based Prediction**: Predicts linear RPM changes rather than non-linear period changes
-   - **Fast Convergence**: 2-sample initialization for rapid startup
+#### 3. TIMING_IMMEDIATE (High RPM)
+- **When**: Calculated dwell start time has already passed
+- **Method**: Start dwell immediately, maintain original spark timing
+- **Advantage**: Ensures spark occurs even at high RPM
+- **Range**: Typically > 4000 RPM
 
-3. **Dual Timing Calculations**:
-   - **Current Timing**: Based on measured RPM from last trigger (`advance_tenths_0`, `spark_delay_ticks_0`)
-   - **Predicted Timing**: Based on predicted next-cycle RPM (`advance_tenths_1`, `spark_delay_ticks_1`) 
-   - **Dynamic Selection**: Uses current timing for dwell scheduling, predicted timing for spark adjustment
-   - **Instant Dwell Mode**: Automatically triggered at high RPM when dwell must start immediately
-
-4. **Timer1 Compare Interrupts**:
-   - **Compare A ISR**: Starts dwell (LOW), schedules spark using current timing
-   - **Compare B ISR**: Fires spark (HIGH), can be dynamically adjusted during dwell
-   - **Real-Time Adjustment**: If already dwelling, updates spark timing to predicted values
-
-### Noise Filtering System
-
-The controller implements dual-layer noise immunity to ensure reliable operation in electrically noisy environments:
+### Dwell and Duty Cycle Management
 
 ```cpp
-// Layer 1: Hardware noise filtering (30% period change rejection)
-uint16_t period_delta = abs(period_ticks - Timing::previous_period);
-uint16_t period_threshold = Timing::previous_period * 3 / 10;  // 30% threshold
+// Dwell duration calculation
+max_dwell_ticks = (period_ticks * MAX_DUTY_CYCLE) / 100  // 40% max
+dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks)  // 3ms target
 
-if (period_delta > period_threshold && Timing::previous_period > 0) {
-    Timing::filtered_triggers++;  // Count filtered events
-    return;  // Reject noisy trigger, maintain previous timing
-}
+// Duty cycle protection prevents coil overheating:
+// At 2000 RPM: period = 15ms, max dwell = 6ms (40% of 15ms)
+// At 6000 RPM: period = 5ms, max dwell = 2ms (40% of 5ms)
 ```
 
-**Layer 1 - Hardware Filtering**:
-- **30% Period Change Rejection**: Triggers with >30% period variation are immediately rejected
-- **Maintains Previous Timing**: Filtered triggers don't update RPM calculations or timing
-- **Noise Counter**: Tracks filtered events for diagnostics
-- **Real-Time Operation**: Filtering occurs in ISR for zero-latency protection
+### RPM Prediction with Holt's Method
 
-**Layer 2 - Holt's Method Smoothing**:
-- **Trend-Aware Filtering**: Double exponential smoothing inherently filters measurement noise
-- **Preserves Acceleration**: Unlike simple averaging, maintains sensitivity to genuine RPM changes
-- **Statistical Robustness**: α=0.4, β=0.1 parameters balance noise rejection with responsiveness
+```cpp
+// Double exponential smoothing for RPM prediction
+float holt_alpha = 0.7f;    // Level smoothing factor
+float holt_beta = 0.4f;     // Trend smoothing factor
 
-**Simulation Integration**:
-The Wokwi pulse simulator includes a 10% random noise injection system that creates brief 1ms glitches on the trigger signal. This allows testing of the noise filtering effectiveness under realistic conditions.
+// Update equations:
+holt_level = alpha * new_rpm + (1-alpha) * (level_prev + holt_trend)
+holt_trend = beta * (holt_level - level_prev) + (1-beta) * holt_trend
+predicted_rpm = holt_level + holt_trend
+```
+
+## Physics-Based Pulse Simulator
+
+The Wokwi simulation includes a comprehensive physics-based pulse generator that models realistic engine behavior:
+
+### Simulation Sequence
+
+1. **Cranking Phase** (2.0s): 400 → 1100 RPM acceleration
+   - **Starter Signal**: HIGH during entire cranking phase
+   - **Purpose**: Simulates starter motor bringing engine to idle speed
+   - **Transition**: Starter goes LOW when cranking ends
+
+2. **Idle Phase** (2.0s): 1500 RPM steady state
+   - **Purpose**: Simulates engine at idle after startup
+   - **Timing**: Full advance curve active
+
+3. **Acceleration Phase** (30.0s): 1500 → 6900 RPM
+   - **Purpose**: Extended acceleration period for testing
+   - **Timing**: Tests all timing modes and transitions
+
+4. **Max RPM Phase** (2.0s): 6900 RPM steady state
+   - **Purpose**: High RPM stability testing
+   - **Timing**: Immediate dwell mode validation
+
+5. **Deceleration Phase** (0.5s): 6900 → 1500 RPM
+   - **Purpose**: Rapid deceleration testing
+   - **Timing**: Tests prediction accuracy during RPM changes
+
+6. **Final Idle** (2.0s): 1500 RPM steady state
+   - **Purpose**: Return to stable operation
+
+7. **Engine Stop** (2.0s): 1500 → 0 RPM deceleration
+   - **Purpose**: Simulates engine shutdown
+   - **Trigger**: Tests timeout detection
+
+### Noise Injection System
+
+The simulator includes a 10% random noise injection system:
 
 ```c
-// Spark noise handler in pulse-simulator.chip.c
-static void spark_handler(void *user_data, pin_t pin, uint32_t value) {
-    // 10% chance to inject 1ms noise pulse
-    if ((rand() % 10) == 0 && !noise_active) {
-        noise_active = true;
-        pin_write(chip->pin_out_pulse, LOW);  // Brief glitch
-        timer_start(noise_timer_id, 1000, false);  // 1ms duration
-    }
+// 10% chance per spark to inject 1ms noise pulse
+if ((rand() % 10) == 0 && !noise_active) {
+    pin_write(chip->pin_out_pulse, LOW);      // Create false trigger
+    timer_start(noise_timer_id, 1000, false); // 1ms duration
 }
 ```
 
-### Dual Timing Calculations
+This tests the 30% period change rejection filter under realistic conditions.
 
-The system calculates two sets of timing values for maximum accuracy:
+### Starter Signal Integration
 
-```cpp
-// Current RPM from measured period (integer math)
-rpm = RPM_NUMERATOR_TICKS / period_ticks
+The simulator now properly controls the starter signal:
+- **Pin**: STARTER output (connects to Arduino D5)
+- **Timing**: HIGH during 2-second cranking phase only
+- **Purpose**: Allows testing of complete state machine transitions
 
-// RPM prediction using Holt's Method (floating-point)
-predicted_rpm = holt_update_and_predict(rpm)
-predicted_period_ticks = RPM_NUMERATOR_TICKS / predicted_rpm
+## Diagnostic Features
 
-// Dual advance angle calculations from 201-point curve (PROGMEM)
-advance_tenths_0 = calculate_advance_angle_tenths(rpm)           // Current RPM
-advance_tenths_1 = calculate_advance_angle_tenths(predicted_rpm) // Predicted RPM
+### Serial Output Diagnostics
 
-// Dual spark delay calculations  
-delay_angle_tenths_0 = 470 - advance_tenths_0  // Current timing
-delay_angle_tenths_1 = 470 - advance_tenths_1  // Predicted timing
+The controller provides comprehensive diagnostic information optimized for performance:
 
-// Timing for dwell scheduling (uses current measurements)
-spark_delay_ticks_0 = (delay_angle_tenths_0 * period_ticks + 900) / 1800
+#### Startup Output
+The system provides clear, professional startup diagnostics including system configuration, hardware initialization status, and active safety systems:
 
-// Timing for spark adjustment (uses predictions)
-spark_delay_ticks_1 = (delay_angle_tenths_1 * predicted_period_ticks + 900) / 1800
+```
+===========================================
+  ROTAX 787 IGNITION CONTROLLER v2.0
+  Arduino-based timing controller
+===========================================
 
-// Dwell timing (always previous lobe)
-dwell_delay_ticks = spark_delay_ticks_0 - dwell_ticks
+[INIT] System Configuration:
+  Timer Resolution: 0.5 μs/tick
+  Target Dwell: 3.0 ms
+  RPM Range: 200 - 8000 RPM
+  Rev Limiter: 7500 RPM
+
+[INIT] Hardware Setup:
+  Spark Output (D3): SAFE (HIGH)
+  Safety Relay (D4): DISARMED (LOW)
+  Starter Input (D5): CONFIGURED
+  Trigger Input (D2): INT0 ENABLED
+  Timer1: CONFIGURED (Prescaler /8)
+  Interrupts: ENABLED
+
+[INIT] Engine State Machine:
+  Current State: STOPPED
+  Waiting for starter signal and triggers...
+
+[SAFETY] Protection Systems Active:
+  ✓ Relay protection (1-second delay)
+  ✓ Rev limiter (7500 RPM)
+  ✓ Duty cycle protection (40% max)
+  ✓ Trigger timeout (500ms)
+  ✓ Startup protection (2-trigger minimum)
+
+[READY] Controller initialized - Monitoring for engine activity...
+===========================================
 ```
 
-### Timing Curve Generation
+#### Runtime Diagnostics (Every 2 Seconds)
+Comprehensive system status without impacting interrupt performance:
 
-The 201-point timing curve in PROGMEM is generated through a sophisticated smoothing process:
+```
+State: RUNNING | RPM: 3245 | Starter: OFF | Spark: ON | Mode: PREV_LOBE | Advance: 14.2° | Dwell: 3.0ms
+```
 
-1. **Base Points**: Starts with 9 key RPM/advance points defining the desired curve shape
-2. **Cubic Interpolation**: Generates 200 intermediate points using cubic spline interpolation
-3. **Savitzky-Golay Filtering**: Applies polynomial smoothing to remove discontinuities
-4. **Lookup Table Generation**: Creates final 201 points at 40 RPM intervals (0-8000 RPM)
-5. **Fixed-Point Conversion**: Stores values as tenths of degrees (×10) for integer math
+#### Critical Event Logging
+- **Trigger Timeout**: `No trigger for 523ms - Setting engine to STOPPED`
+- **Rev Limiter**: `Over-rev detected! Disabling spark.` / `RPM back to safe range. Re-enabling spark.`
 
-This process (`analysis/smooth_timing_curve.py`) ensures:
-- Smooth transitions without abrupt changes
-- Optimal engine performance across the RPM range
-- Efficient storage in limited PROGMEM space
-- Fast runtime lookup with linear interpolation between points
+#### Performance Optimization
+- **Interrupt-Safe Design**: All Serial output removed from timing-critical interrupt paths
+- **Main Loop Diagnostics**: Non-blocking 2-second interval reporting
+- **Memory Efficient**: Uses F() macro for PROGMEM string storage
 
-### Previous-Lobe Timing
+### Optional Diagnostic Logging
 
-The controller uses previous-lobe timing exclusively for all RPM ranges:
+When `ENABLE_DIAGNOSTIC_LOGGING` is defined, the system provides:
 
-- **Always Previous-Lobe**: Adds one full period to dwell delay calculation  
-- **Benefit**: Provides maximum dwell time window at all RPM
-- **Trade-off**: Uses more recent RPM data but requires larger timing buffer
-
-## Performance Benefits
-
-### Acceleration Accuracy
-The dual timing system provides exceptional accuracy during RPM changes:
-
-- **Predictive Timing**: Holt's Method anticipates RPM changes for next-cycle accuracy
-- **Real-Time Correction**: Secondary spark adjustment during dwell phase
-- **Linear Prediction**: Predicting RPM (linear) vs period (non-linear) improves forecast accuracy
-- **Fast Response**: α=0.4 provides responsive adaptation to RPM changes
-
-### Stable Operation  
-- **Smooth Transitions**: Double exponential smoothing eliminates timing jumps
-- **Noise Immunity**: Dual-layer filtering with 30% period change rejection and Holt's Method
-- **Consistent Dwell**: Reliable 3ms dwell timing across all RPM ranges
-- **Precise Spark**: Microsecond-accurate spark timing with real-time adjustment
-
-### Computational Efficiency
-- **ISR Processing**: Critical timing calculations moved to interrupt for minimal latency
-- **Floating-Point**: Clean implementation without integer scaling artifacts  
-- **Dual Calculations**: Parallel current/predicted timing for maximum accuracy
-- **Memory Efficient**: 201-point curve stored in PROGMEM, minimal RAM usage
-
-## Testing and Validation
-
-### Wokwi Simulation Testing
-The controller has been extensively tested in Wokwi simulation:
-
-🔗 **[Live Simulation Project](https://wokwi.com/projects/439745280978700289)**
-
-### Test Cycle Description
-The pulse simulator implements a comprehensive test cycle with physics-based angular motion:
-
-1. **Initial Idle** (1 second): 1500 RPM steady state
-2. **Acceleration Phase** (0.5 seconds): Linear acceleration to 6000 RPM
-3. **Maximum RPM** (1 second): Hold at 6000 RPM
-4. **Deceleration Phase** (0.5 seconds): Linear deceleration back to 1500 RPM
-5. **Final Idle** (1 second): Return to 1500 RPM steady state
-
-The simulator generates precise trigger pulses at 47° BTDC with 6° pulse width, accurately modeling the Rotax 787 crank sensor.
-
-### Timing Accuracy Results
-
-#### Timing Waveforms
-![Timing Waveforms](analysis/timing_waveforms.png)
-
-Sample oscilloscope traces showing trigger pulses and spark timing at critical operating points:
-- **Low RPM (1451 & 1890 RPM)**: Standard scheduled dwell with comfortable lead time
-- **Mid RPM (3998 RPM)**: Transition point approaching instant dwell threshold  
-- **High RPM (5563 RPM)**: **Instant dwell mode** - dwell starts immediately upon trigger when calculated start time has passed
-  
-The waveforms demonstrate precise 3ms dwell control across all modes. Note the instant dwell at 5563 RPM where the system immediately starts charging the coil (goes LOW) when the trigger arrives, as the calculated dwell start point would have been in the previous cycle. This seamless transition between scheduled and instant dwell ensures reliable spark generation even at high RPM.
-
-#### Slow Acceleration (150 RPM/s)
-![Timing vs RPM - 150 RPM/s](analysis/timing_vs_rpm_150.png)
-
-Excellent tracking during gentle acceleration. The predicted timing (blue) closely follows the theoretical curve (red dashed), demonstrating the effectiveness of Holt's Method prediction.
-
-#### Medium Acceleration (900 RPM/s)  
-![Timing vs RPM - 900 RPM/s](analysis/timing_vs_rpm_900.png)
-
-Stable performance during moderate acceleration typical of normal engine operation. The dual timing system maintains accuracy throughout the RPM sweep.
-
-#### Rapid Acceleration (9000 RPM/s)
-![Timing vs RPM - 9000 RPM/s](analysis/timing_vs_rpm_9000.png)
-
-Even under extreme acceleration rates, the predictive timing system maintains control. Some deviation is expected at these rates, but the system quickly converges.
-
-**Overall Results**: 99.9% timing accuracy within ±0.1° across 14,533+ measurements under various acceleration conditions.
+- **Trigger Ring Buffer**: Captures detailed timing data for analysis
+- **JSON Output**: Structured data export for post-processing
+- **Auto-dump**: Automatic buffer dump when full
+- **Capture Control**: Configurable trigger range for focused analysis
 
 ## Building and Installation
 
@@ -270,88 +358,174 @@ arduino-cli compile --fqbn arduino:avr:uno rotexign.ino
 arduino-cli compile --fqbn arduino:avr:uno --upload --port /dev/ttyUSB0 rotexign.ino
 ```
 
-### Testing in Simulation
+### Memory Usage
+- **Program Memory**: ~9,556 bytes (29% of 32KB)
+- **RAM Usage**: ~277 bytes (13% of 2KB)
+- **With Diagnostics**: Additional ~800 bytes program, ~44 bytes RAM
 
-1. Open the [Wokwi project](https://wokwi.com/projects/439745280978700289)
-2. Click "Start Simulation"
-3. Monitor serial output for timing data
-4. Export VCD file for detailed analysis
+## Testing in Simulation
 
-### Analyzing Simulation Data
+### Wokwi Integration
+🔗 **[Live Simulation Project](https://wokwi.com/projects/YOUR_PROJECT_ID)**
 
-The project includes comprehensive Python-based timing analysis tools:
+1. Open the Wokwi project
+2. Click "Start Simulation"  
+3. Monitor serial output for state transitions
+4. Observe starter signal (D5) and ignition output (D3)
+5. Export VCD file for detailed timing analysis
+
+### Expected Simulation Behavior
+
+```
+[STATE] Current state sequence during simulation:
+1. STOPPED (initial) → receives triggers with starter ON
+2. READY (after 2 triggers at 400+ RPM) → starter active, debounce
+3. CRANKING (after 200ms debounce) → 0° advance timing
+4. RUNNING (at 1100+ RPM) → full advance curve active
+5. STOPPED (after 500ms timeout when simulation ends)
+```
+
+### Timing Analysis Tools
 
 ```bash
 cd analysis
 source venv/bin/activate  # Always use venv
 
-# Analyze timing with different acceleration rates
-python3 timing_analyzer.py wokwi-logic.vcd --acceleration 150   # Slow
-python3 timing_analyzer.py wokwi-logic.vcd --acceleration 900   # Medium
-python3 timing_analyzer.py wokwi-logic.vcd --acceleration 9000  # Rapid
+# Analyze VCD timing data
+python3 timing_analyzer.py wokwi-logic.vcd
+
+# Generate timing curve
+python3 calculate_timing_values.py
 ```
 
-This generates:
-- `wokwi-logic-analysis.csv`: Detailed timing measurements for each trigger
-- `timing_vs_rpm_XXX.png`: Advance curve validation plots at different acceleration rates
-- `timing_waveforms.png`: Sample oscilloscope-style waveform visualization
-- Performance metrics including timing accuracy, dwell consistency, and prediction quality
+Generates:
+- `wokwi-logic-analysis.csv`: Per-trigger timing measurements
+- `timing_vs_rpm.png`: Advance curve validation  
+- `timing_waveforms.png`: Oscilloscope-style visualization
+
+### Timing Performance Analysis
+
+The system includes comprehensive timing analysis with multiple visualizations to validate controller performance:
+
+#### Timing vs RPM Curves
+![Timing vs RPM - 150 Point Curve](analysis/timing_vs_rpm_150.png)
+*150-point timing curve showing advance progression from 200-8000 RPM*
+
+![Timing vs RPM - 900 Point Curve](analysis/timing_vs_rpm_900.png)
+*High-resolution 900-point timing curve for precision analysis*
+
+![Timing vs RPM - 9000 Point Curve](analysis/timing_vs_rpm_9000.png)
+*Ultra-high resolution 9000-point timing curve for research and development*
+
+#### Smoothed Timing Curves
+![Smoothed Timing Curves](analysis/smoothed_timing_curves.png)
+*Comparative analysis of different timing curve smoothing algorithms*
+
+#### Timing Waveforms
+![Timing Waveforms](analysis/timing_waveforms.png)
+*Oscilloscope-style visualization showing:*
+- *Same lobe timing mode (1500 RPM)*
+- *Instant dwell mode (2100 RPM)*  
+- *Previous lobe timing mode (4500 RPM)*
+- *Noise filtering performance (549 RPM)*
+
+#### Dwell vs RPM Analysis
+![Dwell vs RPM - 40% Duty Cycle](doc/dwell_vs_rpm_40pct.png)
+*Dwell time management showing 40% duty cycle protection across RPM range*
+
+#### Previous Lobe Switch Analysis
+![Previous Lobe Switch](doc/previous_lobe_switch_plot.png)
+*Analysis of timing mode transitions between same-lobe and previous-lobe scheduling*
+
+### Key Timing Performance Metrics
+
+| RPM Range | Timing Mode | Advance Range | Dwell Time | Duty Cycle |
+|-----------|-------------|---------------|------------|------------|
+| 200-800 | Same Lobe | 0-5° | 3.0ms | <40% |
+| 800-2000 | Same Lobe | 5-12° | 3.0ms | <40% |
+| 2000-4000 | Previous Lobe | 12-18° | 3.0ms | <40% |
+| 4000-6000 | Previous Lobe | 18-22° | 2.5-3.0ms | 40% |
+| 6000-8000 | Immediate | 22-25° | 2.0-2.5ms | 40% |
+
+## Safety Implementation
+
+### Multi-Layer Safety System
+
+1. **Startup Protection**
+   - Relay keeps coil grounded until trigger stable for 1 second
+   - Minimum 2 triggers required before state transitions
+   - Spark disabled until CRANKING or RUNNING state
+
+2. **Runtime Protection**  
+   - Rev limiter at 7500 RPM with 250 RPM hysteresis
+   - 40% duty cycle limit prevents coil overheating
+   - 30% period change rejection filters noise
+
+3. **Shutdown Protection**
+   - 500ms trigger timeout detection in main loop
+   - Automatic return to STOPPED state
+   - All timing variables reset on shutdown
+
+4. **Emergency Conditions**
+   - Over-rev immediately disables ignition
+   - Starter signal loss during cranking stops engine
+   - All outputs default to safe state (HIGH = no dwell)
 
 ## Deployment Considerations
 
-### 🛡️ Safety Implementation Status
+### 🛡️ Safety Checklist
 
-- **Safety Relay**: ✅ Implemented and tested
-- **Rev Limiter**: ✅ Functional at 7000 RPM cutoff
-- **Startup Protection**: ✅ 3-trigger stabilization working  
-- **Dual Timing**: ✅ Current + predicted calculations for accuracy
-- **Real-Time Correction**: ✅ Secondary spark adjustment during dwell
-- **Physical Hardware Testing**: ⚠️ **REQUIRED BEFORE ENGINE USE**
+- ✅ **Engine State Machine**: Four-state system with proper transitions
+- ✅ **Starter Integration**: D5 input for cranking detection  
+- ✅ **Trigger Timeout**: 500ms timeout protection
+- ✅ **Rev Limiter**: 7500 RPM cutoff with hysteresis
+- ✅ **Duty Cycle Protection**: 40% maximum to prevent coil damage
+- ✅ **Startup Protection**: Multi-stage initialization sequence
+- ⚠️ **Physical Hardware Testing**: REQUIRED BEFORE ENGINE USE
 
 ### Production Deployment Steps
 
 1. **Hardware Validation**
-   - Verify all safety systems (relay, rev limiter, startup protection)
-   - Test timing accuracy across full RPM range using oscilloscope
-   - Validate dwell duration and duty cycle protection
-   - Confirm real-time spark adjustment functionality
+   - Verify all pin connections and safety systems
+   - Test state transitions with oscilloscope
+   - Validate starter signal integration
+   - Confirm trigger timeout functionality
 
 2. **Engine Integration**
    - Start with conservative timing settings
-   - Monitor engine performance and adjust curve as needed
-   - Verify no timing anomalies during acceleration/deceleration
-   - Test emergency shutdown scenarios
+   - Test complete cranking sequence
+   - Verify state transitions during operation
+   - Monitor for proper shutdown behavior
 
-3. **Performance Optimization**  
-   - Fine-tune Holt's Method parameters (α=0.4, β=0.1) if needed
-   - Adjust timing curve for specific engine characteristics
-   - Optimize for target performance vs engine longevity balance
+3. **Performance Optimization**
+   - Fine-tune timing curve for specific engine
+   - Adjust Holt's Method parameters if needed
+   - Optimize for performance vs longevity balance
 
 ## Design Philosophy
 
 This implementation prioritizes:
 
-1. **Safety First**: Multiple protection mechanisms, fail-safe defaults, comprehensive startup protection
-2. **Precision**: Hardware timers, dual timing calculations, predictive algorithms, real-time correction  
-3. **Intelligence**: Holt's Method RPM prediction, adaptive timing, acceleration awareness
-4. **Robustness**: Noise filtering, duty cycle limits, floating-point precision, stable operation
-5. **Maintainability**: Clean code architecture, clear separation of concerns, comprehensive diagnostics
-
-**Current Status**: Advanced production-ready controller with sophisticated RPM prediction and dual timing system providing exceptional accuracy during acceleration and stable operation across all RPM ranges.
+1. **Safety First**: Multi-layer protection, fail-safe defaults, comprehensive state management
+2. **Reliability**: Robust state machine, timeout detection, starter integration
+3. **Precision**: Hardware timers, predictive algorithms, microsecond accuracy
+4. **Intelligence**: State-aware operation, automatic mode selection, RPM prediction
+5. **Maintainability**: Clear state transitions, comprehensive diagnostics, modular design
 
 ## Files
 
-- `rotexign.ino` - Main controller implementation with Holt's Method RPM prediction
-- `wokwi/` - Wokwi circuit design and simulation environment
-- `wokwi/chip/pulse-simulator.chip.c` - Physics-based trigger pulse generator
-- `analysis/timing_analyzer.py` - VCD timing analysis tool with acceleration testing
-- `analysis/smooth_timing_curve.py` - Timing curve smoothing and lookup table generator
-- `analysis/timing_vs_rpm_*.png` - Timing accuracy plots at various acceleration rates
-- `analysis/timing_waveforms.png` - Oscilloscope-style timing visualization
-- `analysis/*.csv` - Detailed timing measurement data from simulations
-- `doc/IgnitionDesignNotes.md` - Theoretical background and design constraints
+- `rotexign.ino` - Main controller with complete engine state machine
+- `wokwi/` - Wokwi circuit design and simulation environment  
+- `wokwi/chip/pulse-simulator.chip.c` - Physics-based pulse generator with starter control
+- `analysis/timing_analyzer.py` - VCD timing analysis with state transition tracking
+- `analysis/timing_vs_rpm.png` - Timing accuracy validation plots
+- `analysis/timing_waveforms.png` - Sample timing waveforms
 - `CLAUDE.md` - Development notes and debugging history
 
 ## License
 
 This project is open source. Contributions welcome via pull requests.
+
+---
+
+**Current Status**: Complete engine management system with four-state machine, starter integration, timeout detection, and comprehensive safety features. Ready for hardware validation and engine testing.

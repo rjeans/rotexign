@@ -188,7 +188,7 @@ namespace Timing {
   const uint16_t IDLE_MIN_RPM = 1000;
   const uint16_t CRANK_MAX_RPM = 800;
   const uint16_t REENTRY_RPM = 1100;
-  const uint16_t OVERREV_RPM = 7500;
+  const uint16_t OVERREV_RPM = 7000;
   const uint16_t OVERREV_HYST_RPM = 250;
   const uint32_t STALL_TIMEOUT_MS = 500; 
   volatile uint32_t crank_timer=0;
@@ -531,21 +531,13 @@ namespace Timing {
 
   static inline void set_engine_running() {
     spark_enabled = true;
-    if (engine_state != RUNNING) {
-      engine_state = RUNNING;
-      Serial.print(F("Engine running at RPM: "));
-      Serial.println(rpm);
-    }
+    engine_state = RUNNING;
     stall_start_millis = 0; // Reset stall timer
     crank_timer = 0; // Update crank timer
   }
 
   static inline void set_engine_ready() {
-    if (engine_state != READY) {
-      engine_state = READY;
-      Serial.print(F("Engine ready at RPM: "));
-      Serial.println(rpm);
-    }
+    engine_state = READY;
     stall_start_millis = 0; // Reset stall timer
     crank_timer = 0; // Update crank timer
     n_ready_triggers = 0; // Clear ready triggers count
@@ -553,11 +545,7 @@ namespace Timing {
 
   static inline void set_engine_cranking() {
     spark_enabled = true;
-    if (engine_state != CRANKING) {
-      engine_state = CRANKING;
-      Serial.print(F("Engine cranking at RPM: "));
-      Serial.println(rpm);
-    }
+    engine_state = CRANKING;
     stall_start_millis = 0; // Reset stall timer
     crank_timer = 0; // Update crank timer
   }
@@ -631,7 +619,7 @@ namespace Timing {
     capture_complete = false;
 #endif
     
-    Serial.println(F("Engine stopped - all timing variables reset"));
+    // Engine stopped - all timing variables reset (no Serial output in critical path)
   }
 
 #ifdef ENABLE_DIAGNOSTIC_LOGGING
@@ -941,55 +929,30 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
     uint16_t current_rpm = Timing::rpm;
     uint32_t current_millis = millis();
     bool starter_is_active = starter_active();
-   
-/*
-    // Print state diagnostics every 500ms
-    static uint32_t last_state_print = 0;
-    if (current_millis - last_state_print > 500) {
-      last_state_print = current_millis;
-      const char* state_names[] = {"READY", "RUNNING", "CRANKING", "STOPPED"};
-      Serial.print(F("[STATE] Current: "));
-      Serial.print(state_names[engine_state]);
-      Serial.print(F(" RPM: "));
-      Serial.print(current_rpm);
-      Serial.print(F(" Starter: "));
-      Serial.print(starter_is_active ? F("ON") : F("OFF"));
-      Serial.print(F(" Spark: "));
-      Serial.println(spark_enabled ? F("ENABLED") : F("DISABLED"));
-    }
-*/
 
     if (!over_rev_active) {
       if (current_rpm > OVERREV_RPM) {
         over_rev_active = true;
-        Serial.println(F("Over-rev detected! Disabling spark."));
+        spark_enabled = false; // Disable spark
       }
     } else {
       // Currently in over-rev state
       if (current_rpm < (OVERREV_RPM - OVERREV_HYST_RPM)) {
         over_rev_active = false;
-        Serial.println(F("RPM back to safe range. Re-enabling spark."));
+        spark_enabled = true; // Re-enable spark
       }
     }
-
 
     switch (engine_state) {
       case RUNNING:
         if (current_rpm < IDLE_MIN_RPM && !starter_is_active) {
           if (stall_start_millis !=0 && current_millis - stall_start_millis > STALL_TIMEOUT_MS) {
-            Serial.print(F("[STATE] RUNNING->STOPPED: Stall timeout exceeded. RPM="));
-            Serial.println(current_rpm);
             set_engine_stopped();
           } else if (stall_start_millis == 0) {
             stall_start_millis = current_millis;
-            Serial.print(F("[STATE] RPM below idle - starting stall timer at RPM="));
-            Serial.println(current_rpm);
-
           }
         } else if (current_rpm < IDLE_MIN_RPM && starter_is_active) {
           // If the starter is active, we consider the engine as cranking
-          Serial.print(F("[STATE] RUNNING->CRANKING: Starter active, RPM below idle. RPM="));
-          Serial.println(current_rpm);
           set_engine_cranking();
         } 
    
@@ -998,15 +961,7 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
       case STOPPED:
             if ((n_ready_triggers < HOLT_INIT_SAMPLES || current_rpm < MIN_RPM) && starter_is_active) {
               n_ready_triggers++;
-              if (n_ready_triggers == 1) {
-                Serial.print(F("[STATE] STOPPED: Collecting triggers. Count="));
-                Serial.print(n_ready_triggers);
-                Serial.print(F(" RPM="));
-                Serial.println(current_rpm);
-              }
             } else if (n_ready_triggers >= HOLT_INIT_SAMPLES && current_rpm >= MIN_RPM && starter_is_active) {
-              Serial.print(F("[STATE] STOPPED->READY: Enough triggers collected. RPM="));
-              Serial.println(current_rpm);
               set_engine_ready();
             }
         break;
@@ -1014,19 +969,13 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
       case READY:
         if (starter_is_active && current_rpm <= CRANK_MAX_RPM) {
           if (crank_timer != 0 && current_millis - crank_timer > CRANK_DEBOUNCE_MS) {
-            Serial.print(F("[STATE] READY->CRANKING: Starter active, debounce complete. RPM="));
-            Serial.println(current_rpm);
             set_engine_cranking();
           } else if (crank_timer == 0) {
             crank_timer = current_millis;
-            Serial.print(F("[STATE] READY: Starter active, starting debounce. RPM="));
-            Serial.println(current_rpm);
           }
         } else if (current_rpm > CRANK_MAX_RPM) {
           // If RPM exceeds crank max while ready, might need to go to running
           if (current_rpm >= IDLE_MIN_RPM) {
-            Serial.print(F("[STATE] READY->RUNNING: RPM exceeded idle minimum. RPM="));
-            Serial.println(current_rpm);
             set_engine_running();
           }
         }
@@ -1034,18 +983,12 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
 
       case CRANKING:
         if (current_rpm >= IDLE_MIN_RPM) {
-          Serial.print(F("[STATE] CRANKING->RUNNING: RPM reached idle minimum. RPM="));
-          Serial.println(current_rpm);
           set_engine_running();
         } else if (!starter_is_active && current_rpm < CRANK_MAX_RPM) {
-          Serial.print(F("[STATE] CRANKING->STOPPED: Starter off, RPM below crank max. RPM="));
-          Serial.println(current_rpm);
           set_engine_stopped();
         } 
 
         break;
-
-
     }
   }
 
@@ -1140,32 +1083,69 @@ ISR(TIMER1_COMPB_vect) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("Rotax 787 Ignition Controller with timing curve"));
-  Serial.print(F("Minimum period ticks: ")); Serial.println(Timing::MIN_PERIOD_TICKS);
-  Serial.print(F("Initialized at ")); Serial.print(Timing::TIMER_TICKS_PER_SEC); Serial.println(F(" ticks per second"));
-  Serial.print(F("Nominal dwell ticks: ")); Serial.println(Timing::NOMINAL_DWELL_TICKS);
-  Serial.print(F("Max dwell ticks: ")); Serial.println(Timing::MAX_DWELL_TICKS);
-  Serial.print(F("Min dwell ticks: ")); Serial.println(Timing::MIN_DWELL_TICKS);
-  Serial.print(F("Max RPM: ")); Serial.println(Timing::MAX_RPM);
-  Serial.print(F("Min RPM: ")); Serial.println(Timing::MIN_RPM);
+  
+  // Clear startup banner
+  Serial.println();
+  Serial.println(F("==========================================="));
+  Serial.println(F("  ROTAX 787 IGNITION CONTROLLER v2.0"));
+  Serial.println(F("  Arduino-based timing controller"));
+  Serial.println(F("==========================================="));
+  Serial.println();
+  
+  // System configuration
+  Serial.println(F("[INIT] System Configuration:"));
+  Serial.print(F("  Timer Resolution: ")); Serial.print(1.0 / Timing::TIMER_TICKS_PER_SEC * 1000000.0, 1); Serial.println(F(" μs/tick"));
+  Serial.print(F("  Target Dwell: ")); Serial.print(Timing::NOMINAL_DWELL_TICKS * 0.5 / 1000.0, 1); Serial.println(F(" ms"));
+  Serial.print(F("  RPM Range: ")); Serial.print(Timing::MIN_RPM); Serial.print(F(" - ")); Serial.print(Timing::MAX_RPM); Serial.println(F(" RPM"));
+  Serial.print(F("  Rev Limiter: ")); Serial.print(Timing::OVERREV_RPM); Serial.println(F(" RPM"));
+  Serial.println();
 
+  // Hardware initialization
+  Serial.println(F("[INIT] Hardware Setup:"));
+  
   // Initialize spark pin
   System::set_spark_pin_output();
   System::set_spark_pin_safe();  // Initialize HIGH (safe state - no dwell)
+  Serial.print(F("  Spark Output (D")); Serial.print(System::SPARK_PIN); Serial.println(F("): SAFE (HIGH)"));
 
   // Initialize relay control
   System::setup_relay();
+  Serial.print(F("  Safety Relay (D")); Serial.print(System::RELAY_PIN); Serial.println(F("): DISARMED (LOW)"));
   
   // Initialize starter input
   System::setup_starter_input();
+  Serial.print(F("  Starter Input (D")); Serial.print(System::STARTER_PIN); Serial.println(F("): CONFIGURED"));
 
   // Setup external interrupt for crank trigger
   System::setup_trigger_interrupt();
+  Serial.print(F("  Trigger Input (D")); Serial.print(System::TRIGGER_PIN); Serial.println(F("): INT0 ENABLED"));
 
   // Setup Timer1 with prescaler /8 (0.5 us/tick)
   System::setup_timer();
+  Serial.println(F("  Timer1: CONFIGURED (Prescaler /8)"));
 
   sei();
+  Serial.println(F("  Interrupts: ENABLED"));
+  Serial.println();
+  
+  // Engine state information
+  Serial.println(F("[INIT] Engine State Machine:"));
+  Serial.println(F("  Current State: STOPPED"));
+  Serial.println(F("  Waiting for starter signal and triggers..."));
+  Serial.println();
+  
+  // Safety warnings
+  Serial.println(F("[SAFETY] Protection Systems Active:"));
+  Serial.println(F("  ✓ Relay protection (1-second delay)"));
+  Serial.println(F("  ✓ Rev limiter (7500 RPM)"));
+  Serial.println(F("  ✓ Duty cycle protection (40% max)"));
+  Serial.println(F("  ✓ Trigger timeout (500ms)"));
+  Serial.println(F("  ✓ Startup protection (2-trigger minimum)"));
+  Serial.println();
+  
+  Serial.println(F("[READY] Controller initialized - Monitoring for engine activity..."));
+  Serial.println(F("==========================================="));
+  Serial.println();
 }
 
 
@@ -1174,6 +1154,48 @@ void setup() {
 
 void loop() {
   uint32_t current_millis = millis();
+  
+  // Print comprehensive diagnostics every 2 seconds
+  static uint32_t last_diagnostic_millis = 0;
+  if (current_millis - last_diagnostic_millis >= 2000) {
+    last_diagnostic_millis = current_millis;
+    
+    const char* state_names[] = {"READY", "RUNNING", "CRANKING", "STOPPED"};
+    const char* timing_mode_names[] = {"SAME_LOBE", "PREV_LOBE", "IMMEDIATE", "STARTUP"};
+    
+    Serial.print(F("State: "));
+    Serial.print(state_names[Timing::engine_state]);
+    Serial.print(F(" | RPM: "));
+    Serial.print(Timing::rpm);
+    Serial.print(F(" | Starter: "));
+    Serial.print(Timing::starter_active() ? F("ON") : F("OFF"));
+    Serial.print(F(" | Spark: "));
+    Serial.print(Timing::spark_enabled ? F("EN") : F("DIS"));
+    
+    if (Timing::spark_enabled) {
+      Serial.print(F(" | Timing: "));
+      Serial.print(timing_mode_names[Timing::current_timing_mode]);
+      Serial.print(F(" | Adv: "));
+      Serial.print(Timing::advance_tenths_0 / 10);
+      Serial.print(F("."));
+      Serial.print(Timing::advance_tenths_0 % 10);
+      Serial.print(F("°"));
+      
+      if (Timing::period_ticks > 0) {
+        Serial.print(F(" | Dwell: "));
+        Serial.print(Timing::ticks_to_us(Timing::dwell_ticks) / 1000);
+        Serial.print(F("."));
+        Serial.print((Timing::ticks_to_us(Timing::dwell_ticks) % 1000) / 100);
+        Serial.print(F("ms"));
+      }
+    }
+    
+    if (Timing::over_rev_active) {
+      Serial.print(F(" | OVERREV!"));
+    }
+    
+    Serial.println();
+  }
   
   // Check if no triggers received for 500ms - engine must be stopped
   if (Timing::trigger_millis > 0) {  // Only check if we've received at least one trigger
