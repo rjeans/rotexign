@@ -13,20 +13,26 @@ static const float DEGREES_PER_REVOLUTION = 360.0f;
 static const float PULSES_PER_REVOLUTION = 2.0f;  // Two pulses per revolution
 
 // Timing constants  
-static const float IDLE_DURATION_S = 3.0f;
-static const float IDLE_RPM = 250.0f;
+static const float CRANK_DURATION_S = 2.0f;
+static const float CRANK_START_RPM = 400.0f;
+static const float CRANK_END_RPM = 1100.0f;  // Match Arduino's IDLE_MIN_RPM
+static const float IDLE_DURATION_S = 2.0f;
+static const float IDLE_RPM = 1500.0f;
 static const float MAX_RPM = 6900.0f;
-static const float ACCELERATION_TIME_S = 5.0f;
-static const float MAX_RPM_DURATION_S = 0.0f;  
+static const float ACCELERATION_TIME_S = 30.0f;
+static const float MAX_RPM_DURATION_S = 2.0f;
+static const float FINAL_DECEL_TIME_S = 2.0f;  
 
 // State machine states
 typedef enum {
     STATE_WAITING_FOR_READY,
+    STATE_CRANKING,
     STATE_IDLING,
     STATE_ACCELERATING,
     STATE_AT_MAX_RPM,
     STATE_DECELERATING,
     STATE_FINAL_IDLE,
+    STATE_FINAL_DECEL,
     STATE_STOPPED
 } SimulatorState;
 
@@ -35,6 +41,7 @@ typedef struct {
     pin_t pin_out_pulse;
     pin_t pin_ready;
     pin_t pin_spark;
+    pin_t pin_starter;  // Starter output pin (HIGH during cranking)
 } chip_state_t;
 
 // Global state
@@ -195,10 +202,45 @@ static void monitoring_timer_event(void *user_data) {
             // Ensure output is HIGH
             if (global_chip) {
                 pin_write(global_chip->pin_out_pulse, HIGH);
+                pin_write(global_chip->pin_starter, LOW);  // Starter off
+            }
+            break;
+            
+        case STATE_CRANKING:
+            if (time_in_state >= CRANK_DURATION_S) {
+                // Transition to idling
+                sim_state = STATE_IDLING;
+                state_start_time = current_time;
+                
+                // Turn off starter
+                if (global_chip) {
+                    pin_write(global_chip->pin_starter, LOW);
+                    printf("[PULSE_GEN] STARTER pin set LOW at %.3fs\n", current_time);
+                }
+                
+                // Calculate current RPM at end of cranking (should be ~1100)
+                float current_omega = initial_omega + alpha * CRANK_DURATION_S;
+                float current_rpm = current_omega / 6.0f;
+                
+                // Set up angular motion for transition from current RPM to idle RPM
+                // Brief acceleration from 1100 to 1500 RPM
+                initial_omega = current_omega;  // Start from current velocity
+                float idle_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                alpha = (idle_omega - initial_omega) / 0.5f;  // Accelerate to idle over 0.5s
+                
+                printf("[PULSE_GEN] t=%.1fs Cranking complete at %.0f RPM, accelerating to idle %.0f RPM\n",
+                       current_time, current_rpm, IDLE_RPM);
             }
             break;
             
         case STATE_IDLING:
+            // Check if we're still transitioning to idle RPM
+            if (alpha != 0 && time_in_state >= 0.5f) {
+                // Transition complete, maintain constant idle RPM
+                initial_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                alpha = 0;
+            }
+            
             if (time_in_state >= IDLE_DURATION_S) {
                 // Transition to acceleration
                 sim_state = STATE_ACCELERATING;
@@ -251,14 +293,14 @@ static void monitoring_timer_event(void *user_data) {
                 // Use the current actual angular velocity (which should be constant in this state)
                 float current_omega = initial_omega;  // No acceleration in MAX_RPM state
                 
-                // Set up angular motion for deceleration to 0 RPM (simulating ignition off)
+                // Set up angular motion for deceleration back to idle
                 state_start_time = current_time;
                 initial_omega = current_omega;  // Start from actual current velocity
-                float final_omega = 0;  // Decelerate to 0 RPM
+                float final_omega = rpm_to_deg_per_sec(IDLE_RPM);  // Decelerate to idle RPM
                 alpha = (final_omega - initial_omega) / ACCELERATION_TIME_S;
                 
-                printf("[PULSE_GEN] t=%.1fs Starting deceleration: %.0f to 0 RPM over %.1fs (ignition off)\n",
-                       current_time, MAX_RPM, ACCELERATION_TIME_S);
+                printf("[PULSE_GEN] t=%.1fs Starting deceleration: %.0f to %.0f RPM over %.1fs\n",
+                       current_time, MAX_RPM, IDLE_RPM, ACCELERATION_TIME_S);
                 printf("[PULSE_GEN] t=%.1fs Angular: ω₀=%.1f°/s, α=%.1f°/s²\n",
                        current_time, initial_omega, alpha);
             }
@@ -266,16 +308,43 @@ static void monitoring_timer_event(void *user_data) {
             
         case STATE_DECELERATING:
             if (time_in_state >= ACCELERATION_TIME_S) {
-                // Transition to stopped state (0 RPM) to simulate turning ignition off
-                sim_state = STATE_STOPPED;
+                // Transition to final idle
+                sim_state = STATE_FINAL_IDLE;
+                state_start_time = current_time;
                 
-                // Calculate actual velocity at end of deceleration (should be ~0)
-                float actual_omega = initial_omega + alpha * ACCELERATION_TIME_S;
-                float actual_rpm = actual_omega / 6.0f;
+                // Set up angular motion for final idle (constant RPM)
+                initial_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                alpha = 0;  // No acceleration during idle
+                
+                printf("[PULSE_GEN] t=%.2fs Back to idle at %.0f RPM\n", 
+                       current_time, IDLE_RPM);
+            }
+            break;
+            
+        case STATE_FINAL_IDLE:
+            if (time_in_state >= IDLE_DURATION_S) {
+                // Transition to final deceleration to 0
+                sim_state = STATE_FINAL_DECEL;
+                state_start_time = current_time;
+                
+                // Set up angular motion to decelerate to 0 RPM
+                initial_omega = rpm_to_deg_per_sec(IDLE_RPM);
+                float final_omega = 0;  // Decelerate to 0 RPM
+                alpha = (final_omega - initial_omega) / FINAL_DECEL_TIME_S;
+                
+                printf("[PULSE_GEN] t=%.1fs Starting final deceleration: %.0f to 0 RPM over %.1fs\n",
+                       current_time, IDLE_RPM, FINAL_DECEL_TIME_S);
+            }
+            break;
+            
+        case STATE_FINAL_DECEL:
+            if (time_in_state >= FINAL_DECEL_TIME_S) {
+                // Transition to stopped
+                sim_state = STATE_STOPPED;
                 
                 // Stop all angular motion
                 state_start_time = current_time;
-                initial_omega = 0;  // Force to exactly 0 for stopped state
+                initial_omega = 0;
                 alpha = 0;
                 
                 // Cancel any pending pulse timers
@@ -287,13 +356,8 @@ static void monitoring_timer_event(void *user_data) {
                     pin_write(global_chip->pin_out_pulse, HIGH);
                 }
                 
-                printf("[PULSE_GEN] t=%.2fs Engine stopped (0 RPM) - simulating ignition off at %.2fs\n", 
-                       current_time, current_time);
+                printf("[PULSE_GEN] t=%.2fs Engine stopped (0 RPM)\n", current_time);
             }
-            break;
-            
-        case STATE_FINAL_IDLE:
-            // Stay in final idle state indefinitely
             break;
             
         case STATE_STOPPED:
@@ -305,7 +369,7 @@ static void monitoring_timer_event(void *user_data) {
     static float last_diagnostic = 0;
     if (current_time - last_diagnostic >= 2.0f && sim_state != STATE_WAITING_FOR_READY) {
         float current_rpm = (initial_omega + alpha * time_in_state) / 6.0f;
-        const char* state_names[] = {"WAITING", "IDLING", "ACCELERATING", "MAX_RPM", "DECELERATING", "FINAL_IDLE", "STOPPED"};
+        const char* state_names[] = {"WAITING", "CRANKING", "IDLING", "ACCELERATING", "MAX_RPM", "DECELERATING", "FINAL_IDLE", "FINAL_DECEL", "STOPPED"};
         
         printf("[PULSE_GEN] t=%.1fs State=%s RPM=%.0f Pulses=%u Revs=%u\n",
                current_time, state_names[sim_state], current_rpm, pulse_count, revolution_count);
@@ -337,22 +401,33 @@ static void noise_timer_event(void *user_data) {
 static void ready_pin_change(void *user_data, pin_t pin, uint32_t value) {
     float current_time = get_current_time_ms() / 1000.0f;
 
-    is_ready = (value == HIGH);
+    // Only start on rising edge
+    if (value != HIGH) return;
+    
+    is_ready = true;
 
-    // Start idling
-    sim_state = STATE_IDLING;
+    // Start cranking
+    sim_state = STATE_CRANKING;
     state_start_time = current_time;
     pulse_count = 0;
     revolution_count = 0;
     
-    // Set up angular motion for idling (constant RPM)
-    initial_omega = rpm_to_deg_per_sec(IDLE_RPM);
-    alpha = 0;  // No acceleration during idle
+    // Turn on starter
+    if (global_chip) {
+        pin_write(global_chip->pin_starter, HIGH);
+        printf("[PULSE_GEN] STARTER pin set HIGH at %.3fs\n", current_time);
+    }
+    
+    // Set up angular motion for cranking (accelerating from 400 to 1100 RPM)
+    initial_omega = rpm_to_deg_per_sec(CRANK_START_RPM);
+    float final_omega = rpm_to_deg_per_sec(CRANK_END_RPM);
+    alpha = (final_omega - initial_omega) / CRANK_DURATION_S;  // Acceleration during cranking
     
     // Schedule first pulse
     schedule_next_pulse();
     
-    printf("[PULSE_GEN] READY triggered - Starting idle at %.0f RPM\n", IDLE_RPM);
+    printf("[PULSE_GEN] READY triggered - Starting cranking: %.0f to %.0f RPM over %.1fs\n", 
+           CRANK_START_RPM, CRANK_END_RPM, CRANK_DURATION_S);
 }
 
 // Initialize the chip
@@ -363,6 +438,11 @@ void chip_init(void) {
     chip->pin_out_pulse = pin_init("PULSE", OUTPUT_HIGH);
     chip->pin_ready = pin_init("READY", INPUT);
     chip->pin_spark = pin_init("SPARK", INPUT);
+    chip->pin_starter = pin_init("STARTER", OUTPUT);  // Starter output
+    
+    // Ensure starter is initially LOW
+    pin_write(chip->pin_starter, LOW);
+    printf("[PULSE_GEN] STARTER pin initialized as OUTPUT (LOW)\n");
     
     // Set up timers
     const timer_config_t pulse_start_config = {
@@ -410,6 +490,8 @@ void chip_init(void) {
     pin_watch(chip->pin_ready, &ready_config);
     
     printf("[PULSE_GEN] Initialized - Physics-based timing with one-shot timers\n");
-    printf("[PULSE_GEN] Settings: Idle %.0f RPM for %.1fs, accelerate to %.0f RPM in %.1fs, then decelerate to 0\n",
-           IDLE_RPM, IDLE_DURATION_S, MAX_RPM, ACCELERATION_TIME_S);
+    printf("[PULSE_GEN] Sequence: Crank %.0f->%.0f RPM (%.1fs) -> Idle %.0f RPM (%.1fs) -> Accel to %.0f RPM (%.1fs)\n",
+           CRANK_START_RPM, CRANK_END_RPM, CRANK_DURATION_S, IDLE_RPM, IDLE_DURATION_S, MAX_RPM, ACCELERATION_TIME_S);
+    printf("[PULSE_GEN]          -> Max RPM %.0f (%.1fs) -> Decel to idle (%.1fs) -> Final idle (%.1fs) -> Stop (%.1fs)\n",
+           MAX_RPM, MAX_RPM_DURATION_S, ACCELERATION_TIME_S, IDLE_DURATION_S, FINAL_DECEL_TIME_S);
 }
