@@ -31,6 +31,7 @@ namespace System {
 
 constexpr uint8_t SPARK_PIN = 3;         // Output pin for spark pulse
 constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
+constexpr uint8_t STARTER_PIN = 5;       // D5 - Starter input (HIGH = starter active, LOW = starter inactive)  
 constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
 
   // Set the prescaler bits for a prescaler of 8.
@@ -149,6 +150,11 @@ constexpr uint16_t PRESCALE_BITS = _BV(CS11);
   static inline void disarm_relay() {
     digitalWrite(RELAY_PIN, LOW);  // Close relay to ground coil (safe)
   }
+  
+  // Starter input setup  
+  static inline void setup_starter_input() {
+    pinMode(STARTER_PIN, INPUT);  // Configure D5 as input for starter signal (LOW = inactive, HIGH = active)
+  }
 
 }
 
@@ -188,7 +194,10 @@ namespace Timing {
   volatile uint32_t crank_timer=0;
   volatile uint32_t stall_start_millis = 0; // Time when RPM dropped below CRANK_MAX_RPM
   const uint32_t CRANK_DEBOUNCE_MS = 200;
-  volatile bool starter_active = true; // Assume starter is active at startup (TODO: add pin input)
+  // Inline function to read starter state from D4 pin (HIGH = starter active, LOW = starter inactive)
+  static inline bool starter_active() {
+    return digitalRead(System::STARTER_PIN) == HIGH;
+  }
   volatile bool over_rev_active = false; // Track if over-rev condition is active
 
 
@@ -945,25 +954,18 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
         Serial.println(F("RPM back to safe range. Re-enabling spark."));
       }
     }
-    if (current_millis - trigger_millis < STALL_TIMEOUT_MS && !starter_active) {
-      engine_state = STOPPED;
-      crank_timer=0;
-      stall_start_millis = 0;
-      set_engine_stopped();
-      return;
 
-    }
 
     switch (engine_state) {
       case RUNNING:
-        if (current_rpm < IDLE_MIN_RPM && !starter_active) {
+        if (current_rpm < IDLE_MIN_RPM && !starter_active()) {
           if (stall_start_millis !=0 && current_millis - stall_start_millis > STALL_TIMEOUT_MS) {
             set_engine_stopped();
           } else if (stall_start_millis == 0) {
             stall_start_millis = current_millis;
             Serial.println(F("RPM below idle - starting stall timer"));
           }
-        } else if (current_rpm < IDLE_MIN_RPM && starter_active) {
+        } else if (current_rpm < IDLE_MIN_RPM && starter_active()) {
           // If the starter is active, we consider the engine as starting
           set_engine_starting();
         } 
@@ -979,7 +981,7 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
         break;
 
       case STARTED:
-        if (starter_active && current_rpm <= CRANK_MAX_RPM) {
+        if (starter_active() && current_rpm <= CRANK_MAX_RPM) {
           if (crank_timer != 0 &&current_millis - crank_timer > CRANK_DEBOUNCE_MS) {
             set_engine_cranking();
           } else if (crank_timer ==0 ) {
@@ -991,7 +993,7 @@ static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate
       case CRANKING:
         if (current_rpm >= REENTRY_RPM) {
           set_engine_running();
-        } else if (!starter_active && current_rpm < CRANK_MAX_RPM) {
+        } else if (!starter_active() && current_rpm < CRANK_MAX_RPM) {
           set_engine_stopped();
         } 
 
@@ -1114,6 +1116,9 @@ void setup() {
 
   // Initialize relay control
   System::setup_relay();
+  
+  // Initialize starter input
+  System::setup_starter_input();
 
   // Setup external interrupt for crank trigger
   System::setup_trigger_interrupt();
