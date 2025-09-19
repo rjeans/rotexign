@@ -217,12 +217,14 @@ namespace Timing {
   volatile uint32_t max_dwell_ticks = 0; // Maximum dwell duration based on duty cycle
   
   // Holt's Method (Double Exponential Smoothing) variables
-  // Using simple integer arithmetic with minimal scaling  
-  volatile float holt_alpha = 0.7f;         
-  volatile float holt_beta = 0.4f;           
-  volatile float holt_trend = 0.0f;           
-  volatile float holt_level = 0.0f;          
-  volatile uint8_t holt_init_count = 0;      // Counter for initialization samples
+  // Using fixed-point integer arithmetic with Q16 format (16 fractional bits)
+  // Q16 format: 1.0 = 65536, 0.5 = 32768, etc.
+  constexpr uint32_t Q16_ONE = 65536;  // 1.0 in Q16 format
+  constexpr uint32_t Q16_ALPHA = 45875;  // 0.7 in Q16 format (0.7 * 65536)
+  constexpr uint32_t Q16_BETA = 26214;   // 0.4 in Q16 format (0.4 * 65536)
+  volatile int32_t holt_level_q16 = 0;   // Level in Q16 fixed-point
+  volatile int32_t holt_trend_q16 = 0;   // Trend in Q16 fixed-point
+  volatile uint8_t holt_init_count = 0;  // Counter for initialization samples
  volatile uint16_t current_ticks_after_calculation = 0; 
   volatile uint16_t dwell_delay_ticks_0 = 0; // Timer count when dwell started
   volatile uint16_t dwell_delay_ticks_1 = 0; // Timer count when dwell started
@@ -347,11 +349,13 @@ namespace Timing {
     if (holt_init_count < HOLT_INIT_SAMPLES) {
       if (holt_init_count == 0) {
         // First sample: set initial level, zero trend
-        holt_level = (float)new_value;
-      } else  {
-        holt_trend=(float)(new_value - holt_level);
-        holt_level = (float)new_value;
-      } 
+        holt_level_q16 = ((uint32_t)new_value) << 16;  // Convert to Q16 format
+      } else {
+        // Second sample: calculate initial trend
+        int32_t new_value_q16 = ((uint32_t)new_value) << 16;
+        holt_trend_q16 = new_value_q16 - holt_level_q16;
+        holt_level_q16 = new_value_q16;
+      }
       holt_init_count++;
     }
   }
@@ -362,19 +366,35 @@ namespace Timing {
       holt_initialize(new_value);
       return new_value; // Not enough data yet
     } else {
+      // Convert new value to Q16 format
+      int32_t new_value_q16 = ((uint32_t)new_value) << 16;
 
-    float level_prev = holt_level;
-    holt_level = holt_alpha * (float)new_value + (1.0f - holt_alpha) * (level_prev + holt_trend);
-    holt_trend = holt_beta * (holt_level - level_prev) + (1.0f - holt_beta) * holt_trend;
-    float forecast = holt_level + holt_trend;
+      // Save previous level
+      int32_t level_prev_q16 = holt_level_q16;
 
+      // Update level: level = alpha * new_value + (1 - alpha) * (level_prev + trend)
+      // level = alpha * new_value + (1 - alpha) * level_prev + (1 - alpha) * trend
+      int64_t level_part1 = ((int64_t)Q16_ALPHA * new_value_q16) >> 16;
+      int64_t level_part2 = ((int64_t)(Q16_ONE - Q16_ALPHA) * (level_prev_q16 + holt_trend_q16)) >> 16;
+      holt_level_q16 = level_part1 + level_part2;
 
+      // Update trend: trend = beta * (level - level_prev) + (1 - beta) * trend
+      int64_t trend_part1 = ((int64_t)Q16_BETA * (holt_level_q16 - level_prev_q16)) >> 16;
+      int64_t trend_part2 = ((int64_t)(Q16_ONE - Q16_BETA) * holt_trend_q16) >> 16;
+      holt_trend_q16 = trend_part1 + trend_part2;
 
-    uint16_t predicted_uint = (uint16_t)constrain(forecast, 0,65535); // Clamp to valid range
+      // Calculate forecast: forecast = level + trend
+      int32_t forecast_q16 = holt_level_q16 + holt_trend_q16;
 
-    return predicted_uint;
-  }
+      // Convert back to integer (Q16 to regular)
+      int32_t predicted = forecast_q16 >> 16;
 
+      // Clamp to valid range
+      if (predicted < 0) predicted = 0;
+      if (predicted > 65535) predicted = 65535;
+
+      return (uint16_t)predicted;
+    }
   }
 
 
@@ -575,8 +595,8 @@ namespace Timing {
     dwell_ticks = 0;
     
     // Reset Holt's Method variables
-    holt_trend = 0.0f;
-    holt_level = 0.0f;
+    holt_trend_q16 = 0;
+    holt_level_q16 = 0;
     holt_init_count = 0;
     
     // Reset timing calculation variables
