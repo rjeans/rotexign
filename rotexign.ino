@@ -1,429 +1,346 @@
-/*
-  Rotax 787 Ignition Controller
-  -----------------------------
-  This Arduino sketch implements a programmable ignition controller for the Rotax 787 engine.
-  It uses Timer1 and external interrupts to precisely control ignition timing and dwell based on engine RPM.
-  The timing advance curve is stored in PROGMEM and interpolated for smooth operation.
-  Output is provided on FIRE_PIN, and diagnostic information is printed periodically via Serial.
-  Author: Richard Jeans
-  Date: 31 Aug 2025
-*/
+/*******************************************************************************
+ * ROTAX 787 IGNITION CONTROLLER
+ *
+ * Description:
+ *   Programmable ignition controller for the Rotax 787 2-stroke engine.
+ *   Provides precise spark timing control based on engine RPM with configurable
+ *   advance curves and safety features.
+ *
+ * Features:
+ *   - Hardware timer-based precision timing (0.5μs resolution)
+ *   - RPM-based advance curve with 201-point interpolation
+ *   - Predictive timing using Holt's double exponential smoothing
+ *   - Multiple timing modes (same-lobe, previous-lobe, immediate)
+ *   - Engine state management (stopped, ready, cranking, running)
+ *   - Safety features: rev limiter, duty cycle protection, relay control
+ *   - Fixed-point arithmetic for deterministic ISR performance
+ *
+ * Hardware Requirements:
+ *   - Arduino Uno/Nano (ATmega328P @ 16MHz)
+ *   - Pin D2: Crank trigger input (falling edge, 2 pulses per revolution)
+ *   - Pin D3: Ignition coil output (HIGH = fire spark, LOW = dwell)
+ *   - Pin D4: Safety relay control (HIGH = armed, LOW = safe)
+ *   - Pin D5: Starter signal input (HIGH = cranking, LOW = not cranking)
+ *
+ * Version: 2.1.0
+ * Author:  Richard Jeans
+ * Date:    January 2025
+ * License: MIT
+ *
+ * SAFETY WARNING:
+ *   This controller directly controls ignition timing. Incorrect operation
+ *   could cause engine damage, fire, or injury. Use at your own risk.
+ *   Always include appropriate safety mechanisms and kill switches.
+ ******************************************************************************/
 
 #include <avr/interrupt.h>
 
-// Enable diagnostic logging and ring buffer - comment out to save memory
+// =============================================================================
+// COMPILE-TIME CONFIGURATION
+// =============================================================================
+
+// Uncomment to enable diagnostic logging (uses more memory)
 //#define ENABLE_DIAGNOSTIC_LOGGING
 
-// Direct port control for SPARK_PIN (digital pin 3 = PD3 on ATmega328P)
-#define SPARK_PORT  PORTD
-#define SPARK_DDR   DDRD
-#define SPARK_BIT   PD3
+// =============================================================================
+// HARDWARE CONFIGURATION CONSTANTS
+// =============================================================================
 
+namespace Config {
+  // Pin assignments
+  constexpr uint8_t TRIGGER_PIN = 2;  // D2 - External interrupt 0
+  constexpr uint8_t SPARK_PIN = 3;    // D3 - Timer1 output capable
+  constexpr uint8_t RELAY_PIN = 4;    // D4 - Safety relay control
+  constexpr uint8_t STARTER_PIN = 5;  // D5 - Starter signal input
 
+  // Direct port manipulation for spark pin (D3 = PD3)
+  #define SPARK_PORT PORTD
+  #define SPARK_DDR  DDRD
+  #define SPARK_BIT  PD3
 
-namespace System {
+  // Timer1 configuration
+  constexpr uint16_t TIMER1_PRESCALER_BITS = _BV(CS11);  // Prescaler = 8
+  constexpr uint32_t TIMER_TICKS_PER_SEC = F_CPU / 8UL;  // 2,000,000 ticks/sec
+  constexpr float TIMER_RESOLUTION_US = 0.5f;            // 0.5 μs per tick
 
+  // Engine configuration
+  constexpr uint8_t PULSES_PER_REVOLUTION = 2;  // 2-stroke with dual pickups
+  constexpr uint16_t TRIGGER_BTDC_TENTHS = 470; // Trigger at 47.0° BTDC
 
-  volatile uint32_t last_diagnostic_millis = 0;
-  volatile uint32_t startup_millis = 0;
-  volatile bool relay_armed = false;
+  // RPM thresholds
+  constexpr uint16_t MIN_RPM = 200;              // Minimum detectable RPM
+  constexpr uint16_t MAX_RPM = 8000;             // Maximum operational RPM
+  constexpr uint16_t CRANK_MAX_RPM = 800;        // Maximum cranking RPM
+  constexpr uint16_t IDLE_MIN_RPM = 1000;        // Minimum idle RPM
+  constexpr uint16_t OVERREV_RPM = 7000;         // Rev limiter engagement
+  constexpr uint16_t OVERREV_HYST_RPM = 250;     // Rev limiter hysteresis
 
+  // Timing parameters (in tenths of milliseconds)
+  constexpr uint16_t NOMINAL_DWELL_TS = 30;  // 3.0ms nominal dwell time
+  constexpr uint16_t MIN_DWELL_TS = 29;      // 2.9ms minimum dwell
+  constexpr uint16_t MAX_DWELL_TS = 31;      // 3.1ms maximum dwell
+  constexpr uint16_t MAX_DUTY_CYCLE = 40;    // 40% maximum coil duty cycle
 
-constexpr uint8_t SPARK_PIN = 3;         // Output pin for spark pulse
-constexpr uint8_t RELAY_PIN = 4;         // D4 - Relay control (HIGH = open/armed, LOW = closed/safe)
-constexpr uint8_t STARTER_PIN = 5;       // D5 - Starter input (HIGH = starter active, LOW = starter inactive)  
-constexpr uint8_t TRIGGER_PIN = 2;       // D2 - Crank trigger input
+  // Timing parameters (converted to ticks)
+  constexpr uint32_t NOMINAL_DWELL_TICKS = (uint16_t)(( (uint32_t)NOMINAL_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
+  constexpr uint16_t MIN_DWELL_TICKS = (uint16_t)(( (uint32_t)MIN_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
+  constexpr uint16_t MAX_DWELL_TICKS = (uint16_t)(( (uint32_t)MAX_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
 
-  // Set the prescaler bits for a prescaler of 8.
-  // The CS10 bit is NOT set.
-constexpr uint16_t PRESCALE_BITS = _BV(CS11); 
+  // Period limits (in ticks)
+  constexpr uint32_t MIN_PERIOD_TICKS = (TIMER_TICKS_PER_SEC * 60UL) / (PULSES_PER_REVOLUTION * MAX_RPM);
+  constexpr uint32_t MAX_PERIOD_TICKS = (TIMER_TICKS_PER_SEC * 60UL) / (PULSES_PER_REVOLUTION * MIN_RPM);
 
-  // Low-level spark pin control
-  static inline void spark_pin_high() {
+  // State machine timing
+  constexpr uint32_t STALL_TIMEOUT_MS = 500;     // Time to detect stall
+  constexpr uint32_t CRANK_DEBOUNCE_MS = 200;    // Cranking state debounce
+  constexpr uint32_t RELAY_ARM_DELAY_MS = 1000;  // Safety relay arm delay
+
+  // Advance angles
+  constexpr uint16_t CRANKING_ADVANCE_TENTHS = 0;  // 0° advance while cranking
+
+  // Holt's smoothing parameters (Q16 fixed-point: 1.0 = 65536)
+  constexpr uint32_t Q16_ONE = 65536;
+  constexpr uint32_t Q16_ALPHA = 45875;  // 0.7 * 65536
+  constexpr uint32_t Q16_BETA = 26214;   // 0.4 * 65536
+  constexpr uint8_t HOLT_INIT_SAMPLES = 2;
+
+  // Diagnostic configuration
+  constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 2000;
+  #ifdef ENABLE_DIAGNOSTIC_LOGGING
+    constexpr uint16_t TRIGGER_BUFFER_SIZE = 16;
+  #endif
+}
+
+// =============================================================================
+// HARDWARE ABSTRACTION LAYER
+// =============================================================================
+
+namespace Hardware {
+  using namespace Config;
+
+  // System state (non-volatile for main loop access)
+  uint32_t startup_millis = 0;
+  bool relay_armed = false;
+
+  // --------------------------------------------------------------------------
+  // Spark pin control (using direct port manipulation for speed)
+  // --------------------------------------------------------------------------
+
+  inline void spark_pin_high() {
     SPARK_PORT |= _BV(SPARK_BIT);
   }
-  
-  static inline void spark_pin_low() {
+
+  inline void spark_pin_low() {
     SPARK_PORT &= ~_BV(SPARK_BIT);
   }
-  
 
-  
-  static inline void set_spark_pin_output() {
+  inline void set_spark_pin_output() {
     SPARK_DDR |= _BV(SPARK_BIT);
   }
-  
-  static inline void set_spark_pin_safe() {
-    spark_pin_high();  // HIGH = safe state (no dwell)
+
+  inline void set_spark_pin_safe() {
+    spark_pin_high();  // HIGH = safe (no dwell)
   }
-  
-  // Timer1 interrupt flag clearing
-  static inline void clear_dwell_flag() {
+
+  // --------------------------------------------------------------------------
+  // Timer1 control
+  // --------------------------------------------------------------------------
+
+  inline uint16_t get_timer_count() {
+    return TCNT1;
+  }
+
+  inline void reset_timer_count() {
+    TCNT1 = 0;
+  }
+
+  inline void clear_dwell_flag() {
     TIFR1 = _BV(OCF1A);
   }
-  
-  static inline void clear_spark_flag() {
+
+  inline void clear_spark_flag() {
     TIFR1 = _BV(OCF1B);
   }
-  
-  static inline void clear_all_timer_flags() {
+
+  inline void clear_all_timer_flags() {
     TIFR1 = _BV(TOV1) | _BV(OCF1A) | _BV(OCF1B);
   }
-  
-  // Timer1 interrupt enable/disable
-  static inline void enable_dwell_interrupt() {
+
+  inline void enable_dwell_interrupt() {
     TIMSK1 |= _BV(OCIE1A);
   }
-  
-  static inline void enable_spark_interrupt() {
+
+  inline void enable_spark_interrupt() {
     TIMSK1 |= _BV(OCIE1B);
   }
-  
-  static inline void disable_dwell_interrupt() {
+
+  inline void disable_dwell_interrupt() {
     TIMSK1 &= ~_BV(OCIE1A);
   }
-  
-  static inline void disable_spark_interrupt() {
+
+  inline void disable_spark_interrupt() {
     TIMSK1 &= ~_BV(OCIE1B);
   }
-  
-  // Timer1 compare register setters
-  static inline void set_dwell_compare(uint16_t when) {
 
+  inline void set_dwell_compare(uint16_t when) {
     OCR1A = when;
   }
-  
-  static inline void set_spark_compare(uint16_t when) {
 
+  inline void set_spark_compare(uint16_t when) {
     OCR1B = when;
   }
 
-  static inline uint16_t get_spark_compare() {
-
-    return OCR1B;
-  }
-  
-  // Timer1 counter getter/setter
-  static inline uint16_t get_timer_count() {
-    return TCNT1;
-  }
-  
-  static inline void reset_timer_count() {
-    TCNT1 = 0;
-  }
-  
-  // Timer1 setup
-  static inline void setup_timer() {
+  inline void setup_timer() {
     TCCR1A = 0;  // Normal mode
-    TCCR1B = PRESCALE_BITS;
+    TCCR1B = TIMER1_PRESCALER_BITS;
     reset_timer_count();
     clear_all_timer_flags();
   }
 
+  // --------------------------------------------------------------------------
+  // External interrupt setup
+  // --------------------------------------------------------------------------
 
-  
-  // External interrupt (INT0) setup for trigger input
-  static inline void setup_trigger_interrupt() {
-    // Configure pin as input with pullup
+  inline void setup_trigger_interrupt() {
     pinMode(TRIGGER_PIN, INPUT_PULLUP);
-    
-    // Configure INT0 for falling edge
-    EICRA = (1 << ISC01);  // ISC01 = 1, ISC00 = 0: falling edge
-    
-    // Clear any pending interrupt flag
-    EIFR = (1 << INTF0);
-    
-    // Enable INT0
-    EIMSK = (1 << INT0);
+    EICRA = (1 << ISC01);  // Falling edge on INT0
+    EIFR = (1 << INTF0);   // Clear pending flag
+    EIMSK = (1 << INT0);   // Enable INT0
   }
-  
+
+  // --------------------------------------------------------------------------
   // Relay control
-  static inline void setup_relay() {
+  // --------------------------------------------------------------------------
+
+  inline void setup_relay() {
     pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, LOW);  // Start with relay closed (safe state)
-  }
-  
-  static inline void arm_relay() {
-    digitalWrite(RELAY_PIN, HIGH);  // Open relay to arm coil
-  }
-  
-  static inline void disarm_relay() {
-    digitalWrite(RELAY_PIN, LOW);  // Close relay to ground coil (safe)
-  }
-  
-  // Starter input setup  
-  static inline void setup_starter_input() {
-    pinMode(STARTER_PIN, INPUT);  // Configure D5 as input for starter signal (LOW = inactive, HIGH = active)
+    digitalWrite(RELAY_PIN, LOW);  // Start safe
   }
 
-}
-
-
-
-namespace Timing {
-
-    enum TimingState {
-    SPARK_FIRED,     // Spark has fired, waiting for next trigger
-    DWELL_SCHEDULED, // Dwell start scheduled via timer interrupt
-    DWELLING         // Currently dwelling (coil charging), spark scheduled
-  };
-
-  enum TimingMode {
-    TIMING_SAME_LOBE = 0,      // Using spark_delay_ticks_0 (same 180° period)
-    TIMING_PREVIOUS_LOBE = 1,   // Using spark_delay_ticks_1 (previous 180° period)
-    TIMING_IMMEDIATE = 2,       // Immediate dwell (no scheduling possible)
-    TIMING_STARTUP = 3,         // Startup triggers (no ignition yet)
-  };
-
-  enum EngineState {
-    READY = 0,
-    RUNNING = 1,
-    CRANKING = 2,
-    STOPPED= 3
-  };
-
-  // Current state variables
-  // Note:
-  volatile EngineState engine_state = STOPPED;
-  const uint16_t IDLE_MIN_RPM = 1000;
-  const uint16_t CRANK_MAX_RPM = 800;
-  const uint16_t REENTRY_RPM = 1100;
-  const uint16_t OVERREV_RPM = 7000;
-  const uint16_t OVERREV_HYST_RPM = 250;
-  const uint32_t STALL_TIMEOUT_MS = 500; 
-  volatile uint32_t crank_timer=0;
-  volatile uint32_t stall_start_millis = 0; // Time when RPM dropped below CRANK_MAX_RPM
-  const uint32_t CRANK_DEBOUNCE_MS = 200;
-  // Inline function to read starter state from D4 pin (HIGH = starter active, LOW = starter inactive)
-  static inline bool starter_active() {
-    return digitalRead(System::STARTER_PIN) == HIGH;
+  inline void arm_relay() {
+    digitalWrite(RELAY_PIN, HIGH);
   }
-  volatile bool over_rev_active = false; // Track if over-rev condition is active
 
-
-
- 
-
-  // State is now determined from hardware conditions - no state variable needed
-  volatile uint32_t trigger_millis = 0; // Time of last trigger in milliseconds
-  volatile bool spark_enabled = false; // Set true to enable spark output
-  volatile uint8_t n_ready_triggers = 0; // Number of initial ticks collected before stable
-  volatile uint32_t period_ticks = 0; // Period in ticks between last two triggers
-  volatile uint32_t period_millis = 0; // Period in milliseconds between last two triggers
-  volatile uint32_t predicted_period_ticks = 0; // Predicted next period using Holt's Method
-  volatile uint16_t predicted_rpm = 0; // Candidate period from most recent trigger
-  volatile uint16_t trigger_tcnt = 0;
-  volatile uint16_t dwell_ticks = 0; // Dwell duration in ticks
-  volatile uint32_t max_dwell_ticks = 0; // Maximum dwell duration based on duty cycle
-  
-  // Holt's Method (Double Exponential Smoothing) variables
-  // Using fixed-point integer arithmetic with Q16 format (16 fractional bits)
-  // Q16 format: 1.0 = 65536, 0.5 = 32768, etc.
-  constexpr uint32_t Q16_ONE = 65536;  // 1.0 in Q16 format
-  constexpr uint32_t Q16_ALPHA = 45875;  // 0.7 in Q16 format (0.7 * 65536)
-  constexpr uint32_t Q16_BETA = 26214;   // 0.4 in Q16 format (0.4 * 65536)
-  volatile int32_t holt_level_q16 = 0;   // Level in Q16 fixed-point
-  volatile int32_t holt_trend_q16 = 0;   // Trend in Q16 fixed-point
-  volatile uint8_t holt_init_count = 0;  // Counter for initialization samples
- volatile uint16_t current_ticks_after_calculation = 0; 
-  volatile uint16_t dwell_delay_ticks_0 = 0; // Timer count when dwell started
-  volatile uint16_t dwell_delay_ticks_1 = 0; // Timer count when dwell started
-  volatile uint16_t spark_delay_ticks_0 = 0; // Delay from trigger to spark
-  volatile uint16_t spark_delay_ticks_1 = 0; // Delay from trigger to spark plus 180 degrees
-  volatile uint16_t rpm = 0; // Current RPM
-  volatile uint16_t advance_tenths_0 = 0; // Advance angle in tenths of degrees
-  volatile uint16_t advance_tenths_1 = 0; // Advance angle in tenths of degrees
-  volatile uint16_t delay_angle_tenths_0 = 0; // Delay angle in tenths of degrees
-  volatile uint16_t delay_angle_tenths_1 = 0; // Delay angle in tenths of degrees
-  volatile uint16_t dwell_actual_started_tcnt = 0; // Timer count when dwell actually started
-  volatile uint16_t dwell_actual_ended_tcnt = 0;   // Timer count when dwell actually ended
-  volatile uint8_t current_timing_mode = TIMING_STARTUP; // Track which timing mode is being used
-
-#ifdef ENABLE_DIAGNOSTIC_LOGGING
-  // Trigger ring buffer for debugging
-  struct TriggerEvent {
-    uint32_t trigger_id;
-    uint32_t trigger_millis;
-    uint16_t trigger_ticks;      // trigger_tcnt value
-    bool dwelling_entry;
-    bool dwell_scheduled_entry;
-    bool dwelling_exit;
-    bool dwell_scheduled_exit;
-    bool spark_enabled;          // whether spark is enabled for this trigger
-    uint8_t timing_mode_entry;   // timing mode at entry to schedule_dwell
-    uint8_t timing_mode_exit;    // timing mode at exit from schedule_dwell
-    uint16_t rpm;
-    uint32_t period_millis;      // period in milliseconds
-    uint32_t period_ticks;       // actual period measured
-    uint32_t predicted_period_ticks; // predicted period (from Holt's method)
-    uint16_t spark_delay_ticks_0; // delay from trigger to spark (same lobe)
-    uint16_t spark_delay_ticks_1; // delay from trigger to spark (previous lobe)
-    uint16_t dwell_ticks;        // dwell duration in ticks
-    uint32_t max_dwell_ticks;    // max dwell allowed based on duty cycle
-    uint16_t dwell_time_0;     // trigger_tcnt + dwell_delay_ticks_0
-    uint16_t dwell_time_1;     // trigger_tcnt + dwell_delay_ticks_1
-    uint16_t current_time;     // current_ticks_after_calculation
-  };
-
-  static constexpr uint16_t TRIGGER_BUFFER_SIZE = 16;
-  volatile TriggerEvent trigger_buffer[TRIGGER_BUFFER_SIZE];
-  volatile uint16_t trigger_head = 0;
-  volatile uint16_t trigger_tail = 0;
-  volatile bool trigger_buffer_full = false;
-  volatile bool keep_rotating_buffer = false; // Default: keep adding when full
-  volatile bool dump_buffer_on_full = true;  // Default: auto-dump when buffer is full
-  volatile bool buffer_dumped = false;  // Track if buffer has been dumped
-  volatile uint32_t next_trigger_id = 0;
-  
-  // Capture control
-  volatile uint32_t capture_start_trigger = 8654;  // Start capturing after trigger N
-  volatile bool capture_active = false;
-  volatile bool capture_complete = false;
-#endif
-
-  // Inline state detection functions
-  static inline bool is_dwelling() {
-    // Dwelling when spark pin is LOW (coil charging)
-    return (SPARK_PORT & _BV(SPARK_BIT)) == 0;
+  inline void disarm_relay() {
+    digitalWrite(RELAY_PIN, LOW);
   }
-  
-  static inline bool is_dwell_scheduled() {
-    // Dwell scheduled when COMPA interrupt is enabled
+
+  // --------------------------------------------------------------------------
+  // Starter input
+  // --------------------------------------------------------------------------
+
+  inline void setup_starter_input() {
+    pinMode(STARTER_PIN, INPUT);
+  }
+
+  inline bool starter_active() {
+    return digitalRead(STARTER_PIN) == HIGH;
+  }
+
+  // --------------------------------------------------------------------------
+  // State detection
+  // --------------------------------------------------------------------------
+
+  inline bool is_dwelling() {
+    return (SPARK_PORT & _BV(SPARK_BIT)) == 0;  // LOW = dwelling
+  }
+
+  inline bool is_dwell_scheduled() {
     return (TIMSK1 & _BV(OCIE1A)) != 0;
   }
-  
-  // is_spark_scheduled removed - redundant with is_dwelling
-  
-  // No get_current_state needed - use individual boolean functions directly
+}
+
+// =============================================================================
+// ENGINE STATE MANAGEMENT
+// =============================================================================
+
+namespace Engine {
+  using namespace Config;
+
+  // Engine state enumeration
+  enum State {
+    STOPPED = 0,
+    READY = 1,
+    CRANKING = 2,
+    RUNNING = 3
+  };
+
+  // Timing mode enumeration
+  enum TimingMode {
+    TIMING_SAME_LOBE = 0,      // Fire in same 180° period
+    TIMING_PREVIOUS_LOBE = 1,  // Fire in previous 180° period
+    TIMING_IMMEDIATE = 2,       // Immediate dwell (emergency)
+    TIMING_STARTUP = 3          // Initial state
+  };
+
+  // State variables (volatile for ISR access)
+  volatile State engine_state = STOPPED;
+  volatile TimingMode timing_mode = TIMING_STARTUP;
+  volatile bool spark_enabled = false;
+  volatile bool over_rev_active = false;
+
+  // State timers
+  volatile uint32_t stall_start_millis = 0;
+  volatile uint32_t crank_timer = 0;
+  volatile uint8_t n_ready_triggers = 0;
 
   // Forward declarations
-#ifdef ENABLE_DIAGNOSTIC_LOGGING
-  static void dump_trigger_buffer();
-  static const char* get_timing_mode_name(uint8_t mode);
-#endif
+  void set_engine_stopped();
+  void set_engine_ready();
+  void set_engine_cranking();
+  void set_engine_running();
+}
 
+// =============================================================================
+// TIMING CALCULATIONS AND PREDICTION
+// =============================================================================
 
+namespace Timing {
+  using namespace Config;
 
+  // --------------------------------------------------------------------------
+  // Timing variables (volatile for ISR access)
+  // --------------------------------------------------------------------------
 
+  // Trigger measurements
+  volatile uint32_t trigger_millis = 0;
+  volatile uint16_t trigger_tcnt = 0;
+  volatile uint32_t period_millis = 0;
+  volatile uint32_t period_ticks = 0;
 
+  // RPM and prediction
+  volatile uint16_t rpm = 0;
+  volatile uint16_t predicted_rpm = 0;
+  volatile uint32_t predicted_period_ticks = 0;
 
-  // Calculate the number of timer ticks per second with a prescaler of 8.
-  // 16,000,000 Hz / 8 = 2,000,000 ticks/sec
-  constexpr uint32_t TIMER_TICKS_PER_SEC = (F_CPU / 8UL);
-  
+  // Timing calculations
+  volatile uint16_t dwell_ticks = 0;
+  volatile uint32_t max_dwell_ticks = 0;
+  volatile uint16_t advance_tenths_0 = 0;      // Current advance
+  volatile uint16_t advance_tenths_1 = 0;      // Predicted advance
+  volatile uint16_t delay_angle_tenths_0 = 0;  // Current delay angle
+  volatile uint16_t delay_angle_tenths_1 = 0;  // Predicted delay angle
+  volatile uint16_t spark_delay_ticks_0 = 0;   // Same lobe spark delay
+  volatile uint16_t spark_delay_ticks_1 = 0;   // Previous lobe spark delay
+  volatile uint16_t dwell_delay_ticks_0 = 0;   // Same lobe dwell delay
+  volatile uint16_t dwell_delay_ticks_1 = 0;   // Previous lobe dwell delay
 
-  const uint8_t  PULSES_PER_REVOLUTION = 2;  // Number of pulses per engine revolution
-  // The time per tick is the reciprocal of the ticks per second.
-  // 1 / 2,000,000 = 0.5 microseconds per tick
+  // Timing tracking
+  volatile uint16_t current_ticks_after_calculation = 0;
+  volatile uint16_t dwell_actual_started_tcnt = 0;
+  volatile uint16_t dwell_actual_ended_tcnt = 0;
 
-  constexpr uint32_t RPM_NUMERATOR_TICKS = TIMER_TICKS_PER_SEC * 60UL / PULSES_PER_REVOLUTION;
+  // Holt's method state (Q16 fixed-point)
+  volatile int32_t holt_level_q16 = 0;
+  volatile int32_t holt_trend_q16 = 0;
+  volatile uint8_t holt_init_count = 0;
 
-  const uint16_t MAX_DUTY_CYCLE = 40; 
-  const uint16_t NOMINAL_DWELL_TS = 30;
-  const uint16_t MAX_DWELL_TS = 31;
-  const uint16_t MIN_DWELL_TS = 29;
-  constexpr uint32_t NOMINAL_DWELL_TICKS = (uint16_t)(( (uint32_t)NOMINAL_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
-  constexpr uint16_t MAX_DWELL_TICKS = (uint16_t)(( (uint32_t)MAX_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
-  constexpr uint16_t MIN_DWELL_TICKS = (uint16_t)(( (uint32_t)MIN_DWELL_TS * (uint32_t)TIMER_TICKS_PER_SEC) / 10000UL);
-  const uint16_t MAX_RPM = 8000;
-  const uint32_t MIN_PERIOD_TICKS =  (uint32_t)(RPM_NUMERATOR_TICKS / (uint32_t(MAX_RPM)));
-  const uint16_t MIN_RPM = 200;
-  const uint32_t MAX_PERIOD_TICKS =  (uint32_t)(RPM_NUMERATOR_TICKS / (uint32_t(MIN_RPM)));
-  const uint16_t CUTOFF_RPM = 7000;
-  const uint32_t CUTOFF_PERIOD_TICKS =  (uint32_t)(RPM_NUMERATOR_TICKS / (uint32_t(CUTOFF_RPM)));
-  const uint16_t TRIGGER_BTDC_TENTHS = 470;  // 47.0 degrees in tenths
-  const uint16_t CRANKING_ADVANCE_TENTHS = 0;   // 0.0 degrees in tenths
+  // --------------------------------------------------------------------------
+  // Timing advance curve (PROGMEM)
+  // --------------------------------------------------------------------------
 
-  const uint8_t HOLT_INIT_SAMPLES = 2;  // Number of samples for initialization
-
-
-
-  // Convert Timer1 ticks at prescaler  back to microseconds (F_CPU = 16 MHz)
-  static inline uint16_t ticks_to_us(uint16_t ticks) {
-    return ticks/2 ;
-  }
-
-  // Initialize Holt's Method with first few samples
-  // Keep it simple: just use first sample for level, zero trend
-  static inline void holt_initialize(uint16_t new_value) {
-    if (holt_init_count < HOLT_INIT_SAMPLES) {
-      if (holt_init_count == 0) {
-        // First sample: set initial level, zero trend
-        holt_level_q16 = ((uint32_t)new_value) << 16;  // Convert to Q16 format
-      } else {
-        // Second sample: calculate initial trend
-        int32_t new_value_q16 = ((uint32_t)new_value) << 16;
-        holt_trend_q16 = new_value_q16 - holt_level_q16;
-        holt_level_q16 = new_value_q16;
-      }
-      holt_init_count++;
-    }
-  }
-
-
-  static inline uint16_t holt_update_and_predict(uint16_t new_value) {
-    if (holt_init_count < HOLT_INIT_SAMPLES) {
-      holt_initialize(new_value);
-      return new_value; // Not enough data yet
-    } else {
-      // Convert new value to Q16 format
-      int32_t new_value_q16 = ((uint32_t)new_value) << 16;
-
-      // Save previous level
-      int32_t level_prev_q16 = holt_level_q16;
-
-      // Update level: level = alpha * new_value + (1 - alpha) * (level_prev + trend)
-      // level = alpha * new_value + (1 - alpha) * level_prev + (1 - alpha) * trend
-      int64_t level_part1 = ((int64_t)Q16_ALPHA * new_value_q16) >> 16;
-      int64_t level_part2 = ((int64_t)(Q16_ONE - Q16_ALPHA) * (level_prev_q16 + holt_trend_q16)) >> 16;
-      holt_level_q16 = level_part1 + level_part2;
-
-      // Update trend: trend = beta * (level - level_prev) + (1 - beta) * trend
-      int64_t trend_part1 = ((int64_t)Q16_BETA * (holt_level_q16 - level_prev_q16)) >> 16;
-      int64_t trend_part2 = ((int64_t)(Q16_ONE - Q16_BETA) * holt_trend_q16) >> 16;
-      holt_trend_q16 = trend_part1 + trend_part2;
-
-      // Calculate forecast: forecast = level + trend
-      int32_t forecast_q16 = holt_level_q16 + holt_trend_q16;
-
-      // Convert back to integer (Q16 to regular)
-      int32_t predicted = forecast_q16 >> 16;
-
-      // Clamp to valid range
-      if (predicted < 0) predicted = 0;
-      if (predicted > 65535) predicted = 65535;
-
-      return (uint16_t)predicted;
-    }
-  }
-
-
-
-  static inline void calculate_rpm() {
-
-
-    if (!period_ticks) {
-      rpm = 0;
-    } else {
-      rpm = (uint16_t)(RPM_NUMERATOR_TICKS / (uint32_t(period_ticks)));
-    }
-
-    predicted_rpm=holt_update_and_predict(rpm);
-
-    if (!predicted_rpm) {
-      predicted_period_ticks = period_ticks;
-      predicted_rpm = rpm;
-    } else {
-      predicted_period_ticks = (uint32_t)(RPM_NUMERATOR_TICKS / (uint32_t(predicted_rpm)));
-    }
-  }
-
- 
-   
-
-
-  // Timing advance curve: {RPM, advance in tenths of degrees} (201 points, 40 RPM resolution)
-  static const uint16_t timing_rpm_curve[][2] PROGMEM = {
+  // 201-point advance curve: {RPM, advance_tenths}
+  const uint16_t timing_curve[][2] PROGMEM = {
     {0, 0}, {40, 2}, {80, 4}, {120, 6}, {160, 8}, {200, 10}, {240, 12}, {280, 15},
     {320, 17}, {360, 19}, {400, 22}, {440, 24}, {480, 26}, {520, 29}, {560, 31}, {600, 34},
     {640, 36}, {680, 39}, {720, 42}, {760, 44}, {800, 47}, {840, 49}, {880, 52}, {920, 55},
@@ -455,34 +372,142 @@ namespace Timing {
     {7960, 110}, {8000, 110}
   };
 
-  const uint8_t TIMING_RPM_POINTS = 201;
-  const uint16_t MAX_TIMING_RPM = 8000;
+  constexpr uint8_t TIMING_CURVE_POINTS = 201;
+  constexpr uint16_t MAX_TIMING_RPM = 8000;
+
+  // --------------------------------------------------------------------------
+  // Utility functions
+  // --------------------------------------------------------------------------
+
+  inline uint16_t ticks_to_us(uint16_t ticks) {
+    return ticks / 2;  // 0.5μs per tick
+  }
+
+  inline uint32_t calculate_rpm_numerator() {
+    return TIMER_TICKS_PER_SEC * 60UL / PULSES_PER_REVOLUTION;
+  }
+
+  // --------------------------------------------------------------------------
+  // Holt's double exponential smoothing (fixed-point implementation)
+  // --------------------------------------------------------------------------
+
+  void holt_initialize(uint16_t new_value) {
+    if (holt_init_count < HOLT_INIT_SAMPLES) {
+      if (holt_init_count == 0) {
+        holt_level_q16 = ((uint32_t)new_value) << 16;
+      } else {
+        int32_t new_value_q16 = ((uint32_t)new_value) << 16;
+        holt_trend_q16 = new_value_q16 - holt_level_q16;
+        holt_level_q16 = new_value_q16;
+      }
+      holt_init_count++;
+    }
+  }
+
+  uint16_t holt_update_and_predict(uint16_t new_value) {
+    if (holt_init_count < HOLT_INIT_SAMPLES) {
+      holt_initialize(new_value);
+      return new_value;
+    }
+
+    // Convert to Q16
+    int32_t new_value_q16 = ((uint32_t)new_value) << 16;
+    int32_t level_prev_q16 = holt_level_q16;
+
+    // Update level
+    int64_t level_part1 = ((int64_t)Q16_ALPHA * new_value_q16) >> 16;
+    int64_t level_part2 = ((int64_t)(Q16_ONE - Q16_ALPHA) * (level_prev_q16 + holt_trend_q16)) >> 16;
+    holt_level_q16 = level_part1 + level_part2;
+
+    // Update trend
+    int64_t trend_part1 = ((int64_t)Q16_BETA * (holt_level_q16 - level_prev_q16)) >> 16;
+    int64_t trend_part2 = ((int64_t)(Q16_ONE - Q16_BETA) * holt_trend_q16) >> 16;
+    holt_trend_q16 = trend_part1 + trend_part2;
+
+    // Calculate forecast
+    int32_t forecast_q16 = holt_level_q16 + holt_trend_q16;
+    int32_t predicted = forecast_q16 >> 16;
+
+    // Clamp to valid range
+    if (predicted < 0) predicted = 0;
+    if (predicted > 65535) predicted = 65535;
+
+    return (uint16_t)predicted;
+  }
+
+  void reset_holt() {
+    holt_level_q16 = 0;
+    holt_trend_q16 = 0;
+    holt_init_count = 0;
+  }
+
+  // --------------------------------------------------------------------------
+  // RPM and period calculations
+  // --------------------------------------------------------------------------
+
+  void calculate_rpm() {
+    const uint32_t rpm_numerator = calculate_rpm_numerator();
+
+    if (!period_ticks) {
+      rpm = 0;
+    } else {
+      rpm = (uint16_t)(rpm_numerator / period_ticks);
+    }
+
+    predicted_rpm = holt_update_and_predict(rpm);
+
+    if (!predicted_rpm) {
+      predicted_period_ticks = period_ticks;
+      predicted_rpm = rpm;
+    } else {
+      predicted_period_ticks = rpm_numerator / predicted_rpm;
+    }
+  }
+
+  void adjust_period_for_wraparound(uint32_t& period_ticks_candidate, uint32_t period_millis_candidate) {
+    uint32_t expected_period_ticks = period_millis_candidate * (TIMER_TICKS_PER_SEC / 1000UL);
+    uint32_t num_wraps = expected_period_ticks / 0x10000;
+    period_ticks_candidate = period_ticks_candidate + num_wraps * 0x10000;
+
+    int32_t error = (int32_t)period_ticks_candidate - (int32_t)expected_period_ticks;
+    if (error < -20000 || error > 20000) {
+      if (error > 0) {
+        period_ticks_candidate -= 0x10000;
+      } else {
+        period_ticks_candidate += 0x10000;
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Advance angle calculation (linear interpolation)
+  // --------------------------------------------------------------------------
 
   // Calculate timing advance angle from RPM using linear interpolation
   static inline uint16_t calculate_advance_angle_tenths(uint16_t therpm) {
 
 
     // Edge cases
-    uint16_t rpm_min = pgm_read_word(&timing_rpm_curve[0][0]);
-    uint16_t adv_min = pgm_read_word(&timing_rpm_curve[0][1]);
+    uint16_t rpm_min = pgm_read_word(&timing_curve[0][0]);
+    uint16_t adv_min = pgm_read_word(&timing_curve[0][1]);
     if (therpm <= rpm_min) {
       return (uint16_t)(adv_min);
     }
 
-    uint16_t rpm_max = pgm_read_word(&timing_rpm_curve[TIMING_RPM_POINTS - 1][0]);
-    uint16_t adv_max = pgm_read_word(&timing_rpm_curve[TIMING_RPM_POINTS - 1][1]);
+    uint16_t rpm_max = pgm_read_word(&timing_curve[TIMING_CURVE_POINTS - 1][0]);
+    uint16_t adv_max = pgm_read_word(&timing_curve[TIMING_CURVE_POINTS - 1][1]);
     if (therpm >= rpm_max) {
       return (uint16_t)(adv_max);
     }
 
     // Must avoid overflow
-    uint16_t i = (uint32_t(therpm) * (TIMING_RPM_POINTS - 1) + MAX_TIMING_RPM - 1) / MAX_TIMING_RPM;
+    uint16_t i = (uint32_t(therpm) * (TIMING_CURVE_POINTS - 1) + MAX_TIMING_RPM - 1) / MAX_TIMING_RPM;
 
-    uint16_t rpm_low  = pgm_read_word(&timing_rpm_curve[i - 1][0]);
-    uint16_t rpm_high = pgm_read_word(&timing_rpm_curve[i][0]);
+    uint16_t rpm_low  = pgm_read_word(&timing_curve[i - 1][0]);
+    uint16_t rpm_high = pgm_read_word(&timing_curve[i][0]);
 
-    uint16_t adv_low_u  = pgm_read_word(&timing_rpm_curve[i - 1][1]);
-    uint16_t adv_high_u = pgm_read_word(&timing_rpm_curve[i][1]);
+    uint16_t adv_low_u  = pgm_read_word(&timing_curve[i - 1][1]);
+    uint16_t adv_high_u = pgm_read_word(&timing_curve[i][1]);
 
     // Do math in signed to handle negative slope
     int16_t  adv_low  = (int16_t)adv_low_u;
@@ -505,702 +530,680 @@ namespace Timing {
     return (uint16_t)result_tenths;
   }
 
-  // Calculate spark delay from trigger to spark fire
-  static inline void calculate_spark_delay() {
-    // Calculate RPM and advance angle
-    if (engine_state == CRANKING) {
-      advance_tenths_0 = CRANKING_ADVANCE_TENTHS;
-      advance_tenths_1 = CRANKING_ADVANCE_TENTHS;
+  // --------------------------------------------------------------------------
+  // Timing calculations
+  // --------------------------------------------------------------------------
+
+  void calculate_spark_delay() {
+    // Select advance angle based on engine state
+    if (Engine::engine_state == Engine::CRANKING) {
+      advance_tenths_0 = Config::CRANKING_ADVANCE_TENTHS;
+      advance_tenths_1 = Config::CRANKING_ADVANCE_TENTHS;
     } else {
       advance_tenths_0 = calculate_advance_angle_tenths(rpm);
       advance_tenths_1 = calculate_advance_angle_tenths(predicted_rpm);
     }
 
+    // Calculate delay angle from trigger to spark
+    delay_angle_tenths_0 = Config::TRIGGER_BTDC_TENTHS - advance_tenths_0;
+    delay_angle_tenths_1 = Config::TRIGGER_BTDC_TENTHS - advance_tenths_1;
 
-    // Calculate delay angle: 47° - advance angle (in tenths)
-    delay_angle_tenths_0 = TRIGGER_BTDC_TENTHS - advance_tenths_0;
-    delay_angle_tenths_1 = TRIGGER_BTDC_TENTHS - advance_tenths_1;
-
-    // Calculate delay in ticks using predicted period for next cycle accuracy
-    // Delay_ticks = (delay_angle / 180°) * predicted_period_ticks
-    // Using tenths: delay_ticks = (delay_angle_tenths * predicted_period_ticks) / 1800
-    // Add 900 (which is half of 1800) to round the result to the nearest integer
+    // Convert angle to ticks
     spark_delay_ticks_0 = ((uint32_t)delay_angle_tenths_0 * (uint32_t)period_ticks + 900UL) / 1800UL;
     spark_delay_ticks_1 = (((uint32_t)delay_angle_tenths_1 + 1800UL) * (uint32_t)predicted_period_ticks + 900UL) / 1800UL;
-
-
-
   }
 
-  // Calculate dwell delay from trigger to dwell start
-  static inline void calculate_dwell_delay() {
-    // Always force a period (previous lobe)
-    dwell_delay_ticks_0 = spark_delay_ticks_0 -  dwell_ticks;
-    dwell_delay_ticks_1 = spark_delay_ticks_1 -  dwell_ticks;
-  }
-
-  // Calculate dwell duration based on predicted period and duty cycle limits  
-  // Using predicted period provides better dwell control during RPM changes
-  // Max dwell ticks can be bigger than 0xFFFF so use 32-bit
-  static inline void calculate_dwell() {
-    max_dwell_ticks = ((period_ticks + 50UL) / 100UL) * uint32_t(MAX_DUTY_CYCLE); // 40% max duty cycle with rounding
+  void calculate_dwell() {
+    max_dwell_ticks = ((period_ticks + 50UL) / 100UL) * uint32_t(MAX_DUTY_CYCLE);
     dwell_ticks = min(NOMINAL_DWELL_TICKS, max_dwell_ticks);
-
-  
   }
 
-  static inline void set_engine_running() {
-    spark_enabled = true;
-    engine_state = RUNNING;
-    stall_start_millis = 0; // Reset stall timer
-    crank_timer = 0; // Update crank timer
+  void calculate_dwell_delay() {
+    dwell_delay_ticks_0 = spark_delay_ticks_0 - dwell_ticks;
+    dwell_delay_ticks_1 = spark_delay_ticks_1 - dwell_ticks;
   }
 
-  static inline void set_engine_ready() {
-    engine_state = READY;
-    stall_start_millis = 0; // Reset stall timer
-    crank_timer = 0; // Update crank timer
-    n_ready_triggers = 0; // Clear ready triggers count
-  }
+  // --------------------------------------------------------------------------
+  // Complete timing reset
+  // --------------------------------------------------------------------------
 
-  static inline void set_engine_cranking() {
-    spark_enabled = true;
-    engine_state = CRANKING;
-    stall_start_millis = 0; // Reset stall timer
-    crank_timer = 0; // Update crank timer
-  }
-
-  // Reset all timing variables when engine stops
-  static inline void set_engine_stopped() {
-    // Disable all timer interrupts
-    System::disable_dwell_interrupt();
-    System::disable_spark_interrupt();
-    
-    // Set spark pin to safe state
-    System::set_spark_pin_safe();
-    
-    // Reset all timing state variables
-    // State is now determined by hardware conditions - no variable to reset
-    engine_state = STOPPED;
-    over_rev_active = false;
-    stall_start_millis = 0;
-    crank_timer = 0;
-    spark_enabled = false;
-    n_ready_triggers = 0;
-    period_ticks = 0;
-    predicted_period_ticks = 0;
-    period_millis = 0;
-    predicted_rpm = 0;
+  void reset_all_timing() {
+    trigger_millis = 0;
     trigger_tcnt = 0;
-    dwell_ticks = 0;
-    
-    // Reset Holt's Method variables
-    holt_trend_q16 = 0;
-    holt_level_q16 = 0;
-    holt_init_count = 0;
-    
-    // Reset timing calculation variables
-    dwell_delay_ticks_0 = 0;
-    dwell_delay_ticks_1 = 0;
-    spark_delay_ticks_0 = 0;
-    spark_delay_ticks_1 = 0;
-    current_ticks_after_calculation = 0;
+    period_millis = 0;
+    period_ticks = 0;
     rpm = 0;
+    predicted_rpm = 0;
+    predicted_period_ticks = 0;
+    dwell_ticks = 0;
+    max_dwell_ticks = 0;
     advance_tenths_0 = 0;
     advance_tenths_1 = 0;
     delay_angle_tenths_0 = 0;
     delay_angle_tenths_1 = 0;
+    spark_delay_ticks_0 = 0;
+    spark_delay_ticks_1 = 0;
+    dwell_delay_ticks_0 = 0;
+    dwell_delay_ticks_1 = 0;
+    current_ticks_after_calculation = 0;
     dwell_actual_started_tcnt = 0;
     dwell_actual_ended_tcnt = 0;
-    current_timing_mode = TIMING_STARTUP;
-    trigger_millis = 0;
-    
-    // Clear all timer flags
-    System::clear_all_timer_flags();
-    
-#ifdef ENABLE_DIAGNOSTIC_LOGGING
-    // Dump trigger buffer if capture was active or we have data
-    if (!dump_buffer_on_full) {
-      if (capture_complete || trigger_head != trigger_tail) {
-        Serial.println(F("Engine stopped - dumping trigger buffer"));
-        dump_trigger_buffer();
-      } else{
-        Serial.print(" Number of triggers: "); Serial.print(next_trigger_id - 1);
-        Serial.println(F(" Engine stopped - no trigger data to dump"));
-      }
+    reset_holt();
   }
-    
-    // Reset trigger buffer
+}
+
+// =============================================================================
+// DIAGNOSTIC LOGGING
+// =============================================================================
+
+#ifdef ENABLE_DIAGNOSTIC_LOGGING
+namespace Diagnostics {
+  using namespace Config;
+
+  struct TriggerEvent {
+    uint32_t trigger_id;
+    uint32_t trigger_millis;
+    uint16_t trigger_ticks;
+    bool dwelling_entry;
+    bool dwell_scheduled_entry;
+    bool dwelling_exit;
+    bool dwell_scheduled_exit;
+    bool spark_enabled;
+    uint8_t timing_mode_entry;
+    uint8_t timing_mode_exit;
+    uint16_t rpm;
+    uint32_t period_millis;
+    uint32_t period_ticks;
+    uint32_t predicted_period_ticks;
+    uint16_t advance_tenths_0;
+    uint16_t advance_tenths_1;
+    uint16_t delay_angle_tenths_0;
+    uint16_t delay_angle_tenths_1;
+    uint16_t spark_delay_ticks_0;
+    uint16_t spark_delay_ticks_1;
+    uint16_t dwell_ticks;
+    uint32_t max_dwell_ticks;
+    uint16_t dwell_time_0;
+    uint16_t dwell_time_1;
+    uint16_t current_time;
+    uint16_t ocr1a;
+    uint16_t dwell_actual_started_tcnt;
+    uint16_t dwell_actual_ended_tcnt;
+  };
+
+  volatile TriggerEvent trigger_buffer[TRIGGER_BUFFER_SIZE];
+  volatile uint16_t trigger_head = 0;
+  volatile uint16_t trigger_tail = 0;
+  volatile bool trigger_buffer_full = false;
+  volatile bool keep_rotating_buffer = false;
+  volatile bool dump_buffer_on_full = true;
+  volatile bool buffer_dumped = false;
+  volatile uint32_t next_trigger_id = 0;
+  volatile uint32_t capture_start_trigger = 46;
+  volatile bool capture_active = false;
+  volatile bool capture_complete = false;
+
+  const char* bool_to_string(bool value) {
+    return value ? "true" : "false";
+  }
+
+  const char* get_timing_mode_name(uint8_t mode) {
+    switch (mode) {
+      case Engine::TIMING_SAME_LOBE: return "SAME_LOBE";
+      case Engine::TIMING_PREVIOUS_LOBE: return "PREVIOUS_LOBE";
+      case Engine::TIMING_IMMEDIATE: return "IMMEDIATE";
+      case Engine::TIMING_STARTUP: return "STARTUP";
+      default: return "UNKNOWN";
+    }
+  }
+
+    void dump_trigger_buffer() {
+    if (buffer_dumped) return;
+
+    Serial.println(F("{"));
+    Serial.println(F("  \"trigger_events\": ["));
+
+    buffer_dumped = true;
+
+    uint16_t count = 0;
+    uint16_t idx = trigger_head;
+
+    if (trigger_buffer_full) {
+      count = TRIGGER_BUFFER_SIZE;
+    } else {
+      count = (trigger_head >= trigger_tail) ?
+              (trigger_head - trigger_tail) :
+              (TRIGGER_BUFFER_SIZE - trigger_tail + trigger_head);
+      idx -= count;
+    }
+
+    for (uint16_t i = 0; i < count; i++) {
+      volatile const TriggerEvent& event = trigger_buffer[idx];
+
+      Serial.println(F("    {"));
+      Serial.print(F("      \"trigger_id\": ")); Serial.print(event.trigger_id); Serial.println(F(","));
+      Serial.print(F("      \"millis\": ")); Serial.print(event.trigger_millis); Serial.println(F(","));
+      Serial.print(F("      \"trigger_ticks\": ")); Serial.print(event.trigger_ticks); Serial.println(F(","));
+      Serial.print(F("      \"dwelling_entry\": ")); Serial.print(bool_to_string(event.dwelling_entry)); Serial.println(F(","));
+      Serial.print(F("      \"dwell_scheduled_entry\": ")); Serial.print(bool_to_string(event.dwell_scheduled_entry)); Serial.println(F(","));
+      Serial.print(F("      \"dwelling_exit\": ")); Serial.print(bool_to_string(event.dwelling_exit)); Serial.println(F(","));
+      Serial.print(F("      \"dwell_scheduled_exit\": ")); Serial.print(bool_to_string(event.dwell_scheduled_exit)); Serial.println(F(","));
+      Serial.print(F("      \"spark_enabled\": ")); Serial.print(bool_to_string(event.spark_enabled)); Serial.println(F(","));
+      Serial.print(F("      \"timing_mode_entry\": \"")); Serial.print(get_timing_mode_name(event.timing_mode_entry)); Serial.println(F("\","));
+      Serial.print(F("      \"timing_mode_exit\": \"")); Serial.print(get_timing_mode_name(event.timing_mode_exit)); Serial.println(F("\","));
+      Serial.print(F("      \"rpm\": ")); Serial.print(event.rpm); Serial.println(F(","));
+      Serial.print(F("      \"period_millis\": ")); Serial.print(event.period_millis); Serial.println(F(","));
+      Serial.print(F("      \"period_ticks\": ")); Serial.print(event.period_ticks); Serial.println(F(","));
+      Serial.print(F("      \"predicted_period_ticks\": ")); Serial.print(event.predicted_period_ticks); Serial.println(F(","));
+      Serial.print(F("      \"advance_tenths_0\": ")); Serial.print(event.advance_tenths_0); Serial.println(F(","));
+      Serial.print(F("      \"advance_tenths_1\": ")); Serial.print(event.advance_tenths_1); Serial.println(F(","));
+      Serial.print(F("      \"delay_angle_tenths_0\": ")); Serial.print(event.delay_angle_tenths_0); Serial.println(F(","));
+      Serial.print(F("      \"delay_angle_tenths_1\": ")); Serial.print(event.delay_angle_tenths_1); Serial.println(F(","));
+      Serial.print(F("      \"spark_delay_ticks_0\": ")); Serial.print(event.spark_delay_ticks_0); Serial.println(F(","));
+      Serial.print(F("      \"spark_delay_ticks_1\": ")); Serial.print(event.spark_delay_ticks_1); Serial.println(F(","));
+      Serial.print(F("      \"dwell_ticks\": ")); Serial.print(event.dwell_ticks); Serial.println(F(","));
+      Serial.print(F("      \"max_dwell_ticks\": ")); Serial.print(event.max_dwell_ticks); Serial.println(F(","));
+      Serial.print(F("      \"dwell_time_0\": ")); Serial.print(event.dwell_time_0); Serial.println(F(","));
+      Serial.print(F("      \"dwell_time_1\": ")); Serial.print(event.dwell_time_1); Serial.println(F(","));
+      Serial.print(F("      \"current_time\": ")); Serial.print(event.current_time); Serial.println(F(","));
+      Serial.print(F("      \"ocr1a\": ")); Serial.print(event.ocr1a); Serial.println(F(","));
+      Serial.print(F("      \"dwell_actual_started_tcnt\": ")); Serial.print(event.dwell_actual_started_tcnt); Serial.println(F(","));
+      Serial.print(F("      \"dwell_actual_ended_tcnt\": ")); Serial.print(event.dwell_actual_ended_tcnt); Serial.println();
+      Serial.print(F("    }"));
+
+      if (i < count - 1) {
+        Serial.println(F(","));
+      } else {
+        Serial.println();
+      }
+
+      idx = (idx + 1) % TRIGGER_BUFFER_SIZE;
+    }
+
+    Serial.println(F("  ],"));
+    Serial.print(F("  \"total_triggers\": ")); Serial.print(count);
+    Serial.println();
+    Serial.println(F("}"));
+  }
+
+
+  void store_trigger_event(bool dwelling_entry, bool dwell_scheduled_entry,
+                           uint16_t trigger_ticks, uint8_t timing_mode_entry) {
+    uint32_t current_trigger_id = next_trigger_id;
+
+    if ((current_trigger_id >= capture_start_trigger && !capture_complete && !buffer_dumped) || keep_rotating_buffer) {
+      if (!capture_active) {
+        capture_active = true;
+        Serial.print(F("Trigger buffer capture started at trigger "));
+        Serial.println(current_trigger_id);
+      }
+
+      trigger_buffer[trigger_head].trigger_id = current_trigger_id;
+      trigger_buffer[trigger_head].trigger_millis = Timing::trigger_millis;
+      trigger_buffer[trigger_head].trigger_ticks = trigger_ticks;
+      trigger_buffer[trigger_head].dwelling_entry = dwelling_entry;
+      trigger_buffer[trigger_head].dwell_scheduled_entry = dwell_scheduled_entry;
+      trigger_buffer[trigger_head].dwelling_exit = Hardware::is_dwelling();
+      trigger_buffer[trigger_head].dwell_scheduled_exit = Hardware::is_dwell_scheduled();
+      trigger_buffer[trigger_head].spark_enabled = Engine::spark_enabled;
+      trigger_buffer[trigger_head].timing_mode_entry = timing_mode_entry;
+      trigger_buffer[trigger_head].timing_mode_exit = Engine::timing_mode;
+      trigger_buffer[trigger_head].rpm = Timing::rpm;
+      trigger_buffer[trigger_head].period_millis = Timing::period_millis;
+      trigger_buffer[trigger_head].period_ticks = Timing::period_ticks;
+      trigger_buffer[trigger_head].predicted_period_ticks = Timing::predicted_period_ticks;
+      trigger_buffer[trigger_head].advance_tenths_0 = Timing::advance_tenths_0;
+      trigger_buffer[trigger_head].advance_tenths_1 = Timing::advance_tenths_1;
+      trigger_buffer[trigger_head].delay_angle_tenths_0 = Timing::delay_angle_tenths_0;
+      trigger_buffer[trigger_head].delay_angle_tenths_1 = Timing::delay_angle_tenths_1;
+      trigger_buffer[trigger_head].spark_delay_ticks_0 = Timing::spark_delay_ticks_0;
+      trigger_buffer[trigger_head].spark_delay_ticks_1 = Timing::spark_delay_ticks_1;
+      trigger_buffer[trigger_head].dwell_ticks = Timing::dwell_ticks;
+      trigger_buffer[trigger_head].max_dwell_ticks = Timing::max_dwell_ticks;
+      trigger_buffer[trigger_head].dwell_time_0 = Timing::trigger_tcnt + Timing::dwell_delay_ticks_0;
+      trigger_buffer[trigger_head].dwell_time_1 = Timing::trigger_tcnt + Timing::dwell_delay_ticks_1;
+      trigger_buffer[trigger_head].current_time = Timing::current_ticks_after_calculation;
+      trigger_buffer[trigger_head].ocr1a = OCR1A;
+      trigger_buffer[trigger_head].dwell_actual_started_tcnt = Timing::dwell_actual_started_tcnt;
+      trigger_buffer[trigger_head].dwell_actual_ended_tcnt = Timing::dwell_actual_ended_tcnt;
+
+      trigger_head = (trigger_head + 1) % TRIGGER_BUFFER_SIZE;
+
+      if (trigger_head == trigger_tail) {
+        trigger_buffer_full = true;
+        trigger_tail = (trigger_tail + 1) % TRIGGER_BUFFER_SIZE;
+
+        if (!keep_rotating_buffer) {
+          capture_complete = true;
+          capture_active = false;
+          Serial.print(F("Trigger buffer capture complete (full) at trigger "));
+          Serial.println(current_trigger_id);
+        }
+
+        if (dump_buffer_on_full) {
+          Serial.print(F("Buffer full at trigger "));
+          Serial.print(current_trigger_id);
+          Serial.println(F(" - auto-dumping:"));
+          dump_trigger_buffer();
+          Serial.println(F("Auto-dump complete."));
+        }
+      }
+    }
+  }
+
+
+  void reset_diagnostics() {
     trigger_head = 0;
     trigger_tail = 0;
     trigger_buffer_full = false;
     next_trigger_id = 0;
     capture_active = false;
     capture_complete = false;
-#endif
-    
-    // Engine stopped - all timing variables reset (no Serial output in critical path)
+    buffer_dumped = false;
   }
-
-#ifdef ENABLE_DIAGNOSTIC_LOGGING
-  // Store trigger event in ring buffer (with capture control)
-  static inline void store_trigger_event(bool dwelling_entry, bool dwell_scheduled_entry, 
-                                         uint16_t trigger_ticks, uint8_t timing_mode_entry) {
-    uint32_t current_trigger_id = next_trigger_id;
-    
-    // Check if we should start capturing
-    if ((current_trigger_id >= capture_start_trigger && !capture_complete && !buffer_dumped) || keep_rotating_buffer) {
-
-      if (!capture_active) {
-        capture_active = true;
-        Serial.print(F("Trigger buffer capture started at trigger "));
-        Serial.println(current_trigger_id);
-      }
-      
-      // Store trigger event
-      trigger_buffer[trigger_head].trigger_id = current_trigger_id;
-      trigger_buffer[trigger_head].trigger_millis = trigger_millis;
-      trigger_buffer[trigger_head].trigger_ticks = trigger_ticks;
-      trigger_buffer[trigger_head].dwelling_entry = dwelling_entry;
-      trigger_buffer[trigger_head].dwell_scheduled_entry = dwell_scheduled_entry;
-      trigger_buffer[trigger_head].dwelling_exit = is_dwelling();
-      trigger_buffer[trigger_head].dwell_scheduled_exit = is_dwell_scheduled();
-      trigger_buffer[trigger_head].spark_enabled = spark_enabled;
-      trigger_buffer[trigger_head].timing_mode_entry = timing_mode_entry;
-      trigger_buffer[trigger_head].timing_mode_exit = current_timing_mode;  // current mode after schedule_dwell
-      trigger_buffer[trigger_head].rpm = rpm;
-      trigger_buffer[trigger_head].period_millis = period_millis;
-      trigger_buffer[trigger_head].period_ticks = period_ticks;
-      trigger_buffer[trigger_head].predicted_period_ticks = predicted_period_ticks;
-      trigger_buffer[trigger_head].spark_delay_ticks_0 = spark_delay_ticks_0;
-      trigger_buffer[trigger_head].spark_delay_ticks_1 = spark_delay_ticks_1;
-      trigger_buffer[trigger_head].dwell_ticks = dwell_ticks;
-      trigger_buffer[trigger_head].max_dwell_ticks = max_dwell_ticks;
-      trigger_buffer[trigger_head].dwell_time_0 = trigger_tcnt + dwell_delay_ticks_0;
-      trigger_buffer[trigger_head].dwell_time_1 = trigger_tcnt + dwell_delay_ticks_1;
-      trigger_buffer[trigger_head].current_time = current_ticks_after_calculation;
-      
-      // Advance head
-      trigger_head = (trigger_head + 1) % TRIGGER_BUFFER_SIZE;
-      
-      // Check if buffer is full
-      if (trigger_head == trigger_tail) {
-        trigger_buffer_full = true;
-        trigger_tail = (trigger_tail + 1) % TRIGGER_BUFFER_SIZE;
-        if (!keep_rotating_buffer) {
-          // Stop capturing if not rotating
-          capture_complete = true;
-          capture_active = false;
-          Serial.print(F("Trigger buffer capture complete (full) at trigger "));
-          Serial.println(current_trigger_id);
-        }
-      
-        
-        // Auto-dump if enabled and engine is running (spark enabled)
-        if (dump_buffer_on_full) { {
-          Serial.print(F("Buffer full at trigger "));
-          Serial.print(current_trigger_id);
-          Serial.println(F(" - auto-dumping:"));
-          dump_trigger_buffer();
-          Serial.println(F("Auto-dump complete."));
-        } 
-        
-        // Buffer is full, stop capturing
-        capture_complete = true;
-        capture_active = false;
-        Serial.print(F("Trigger buffer capture complete (full) at trigger "));
-        Serial.println(current_trigger_id);
-      }
-    }
-    }
-  }
+}
 #else
-  // Stub function when diagnostic logging is disabled
-  static inline void store_trigger_event(bool, bool, uint16_t, uint8_t) {
-    // Do nothing when logging disabled
-  }
+// Stub implementations when diagnostics disabled
+namespace Diagnostics {
+  inline void store_trigger_event(bool, bool, uint16_t, uint8_t) {}
+  inline void dump_trigger_buffer() {}
+  inline void reset_diagnostics() {}
+}
 #endif
 
-#ifdef ENABLE_DIAGNOSTIC_LOGGING
-  // Helper function to print boolean as string
-  static const char* bool_to_string(bool value) {
-    return value ? "true" : "false";
-  }
-  
-  // Get timing mode name from enum value
-  static const char* get_timing_mode_name(uint8_t mode) {
-    switch (mode) {
-      case TIMING_SAME_LOBE: return "TIMING_SAME_LOBE";
-      case TIMING_PREVIOUS_LOBE: return "TIMING_PREVIOUS_LOBE";
-      case TIMING_IMMEDIATE: return "TIMING_IMMEDIATE";
-      case TIMING_STARTUP: return "TIMING_STARTUP";
-      default: return "UNKNOWN";
-    }
-  }
+// =============================================================================
+// ENGINE STATE TRANSITIONS
+// =============================================================================
 
-  // Dump trigger buffer in JSON format
-  static void dump_trigger_buffer() {
-    if (buffer_dumped) {
-      return;
-    }
-    Serial.println(F("{"));
-    Serial.println(F("  \"trigger_events\": ["));
-    
-    buffer_dumped = true;
-    
-    uint16_t count = 0;
-    uint16_t idx = trigger_head;
-    
-    // Calculate number of entries
-    if (trigger_buffer_full) {
-      count = TRIGGER_BUFFER_SIZE;
-    } else {
-      count = (trigger_head >= trigger_tail) ? (trigger_head - trigger_tail) : 
-              (TRIGGER_BUFFER_SIZE - trigger_tail + trigger_head);
-      idx -= count;
-    }
-    
-    for (uint16_t i = 0; i < count; i++) {
-      volatile const TriggerEvent& event = trigger_buffer[idx];
-      
-      Serial.println(F("        {"));
-      Serial.print(F("            \"trigger_id\": "));     Serial.print(event.trigger_id); Serial.println(F(","));
-      Serial.print(F("            \"millis\": "));          Serial.print(event.trigger_millis); Serial.println(F(","));
-      Serial.print(F("            \"trigger_ticks\": "));  Serial.print(event.trigger_ticks); Serial.println(F(","));
-      Serial.print(F("            \"dwelling_entry\": "));  Serial.print(bool_to_string(event.dwelling_entry)); Serial.println(F(","));
-      Serial.print(F("            \"dwell_scheduled_entry\": ")); Serial.print(bool_to_string(event.dwell_scheduled_entry)); Serial.println(F(","));
-      Serial.print(F("            \"dwelling_exit\": "));   Serial.print(bool_to_string(event.dwelling_exit)); Serial.println(F(","));
-      Serial.print(F("            \"dwell_scheduled_exit\": ")); Serial.print(bool_to_string(event.dwell_scheduled_exit)); Serial.println(F(","));
-      Serial.print(F("            \"spark_enabled\": "));   Serial.print(bool_to_string(event.spark_enabled)); Serial.println(F(","));
-      Serial.print(F("            \"timing_mode_entry\": \"")); Serial.print(get_timing_mode_name(event.timing_mode_entry)); Serial.println(F("\","));
-      Serial.print(F("            \"timing_mode_exit\": \"")); Serial.print(get_timing_mode_name(event.timing_mode_exit)); Serial.println(F("\","));
-      Serial.print(F("            \"rpm\": "));          Serial.print(event.rpm); Serial.println(F(","));
-      Serial.print(F("            \"period_millis\": ")); Serial.print(event.period_millis); Serial.println(F(","));
-      Serial.print(F("            \"period_ticks\": "));  Serial.print(event.period_ticks); Serial.println(F(","));
-      Serial.print(F("            \"predicted_period_ticks\": ")); Serial.print(event.predicted_period_ticks); Serial.println(F(","));
-      Serial.print(F("            \"spark_delay_ticks_0\": ")); Serial.print(event.spark_delay_ticks_0); Serial.println(F(","));
-      Serial.print(F("            \"spark_delay_ticks_1\": ")); Serial.print(event.spark_delay_ticks_1); Serial.println(F(","));
-      Serial.print(F("            \"dwell_ticks\": "));  Serial.print(event.dwell_ticks); Serial.println(F(","));
-      Serial.print(F("            \"max_dwell_ticks\": "));  Serial.print(event.max_dwell_ticks); Serial.println(F(","));
-      Serial.print(F("            \"dwell_time_0\": "));  Serial.print(event.dwell_time_0); Serial.println(F(","));
-      Serial.print(F("            \"dwell_time_1\": "));  Serial.print(event.dwell_time_1); Serial.println(F(","));
-      Serial.print(F("            \"current_time\": "));  Serial.print(event.current_time); Serial.println();
-      Serial.print(F("        }"));
-      
-      if (i < count - 1) {
-        Serial.println(F(","));
-      } else {
-        Serial.println();
+namespace Engine {
+  void set_engine_stopped() {
+    Hardware::disable_dwell_interrupt();
+    Hardware::disable_spark_interrupt();
+    Hardware::set_spark_pin_safe();
+
+    engine_state = STOPPED;
+    Engine::timing_mode = Engine::TIMING_STARTUP;
+    spark_enabled = false;
+    over_rev_active = false;
+    stall_start_millis = 0;
+    crank_timer = 0;
+    n_ready_triggers = 0;
+
+    Timing::reset_all_timing();
+    Hardware::clear_all_timer_flags();
+
+    #ifdef ENABLE_DIAGNOSTIC_LOGGING
+    if (!Diagnostics::dump_buffer_on_full) {
+      if (Diagnostics::capture_complete || Diagnostics::trigger_head != Diagnostics::trigger_tail) {
+        Serial.println(F("Engine stopped - dumping trigger buffer"));
+        Diagnostics::dump_trigger_buffer();
       }
-      
-      idx = (idx + 1) % TRIGGER_BUFFER_SIZE;
     }
-    
-    Serial.println(F("  ],"));
-    Serial.print(F("  \"total_triggers\": ")); Serial.print(count);
-    Serial.println();
-    Serial.println(F("}"));
+    Diagnostics::reset_diagnostics();
+    #endif
   }
-#endif
 
-
-
-
-
-// Fire spark (called from COMPB ISR)
-static inline void fire_spark() {
-  // Fast pin set - HIGH to fire spark
-  System::spark_pin_high();  // State becomes SPARK_FIRED when pin goes HIGH
-  Timing::dwell_actual_ended_tcnt = System::get_timer_count();
-
-}
-
-
-// Schedule a COMPA one-shot at absolute tick 'when' (for dwell start)
-static inline void schedule_dwell() {
-  // Calculate all timing values
-  calculate_dwell();
-  calculate_spark_delay();
-  calculate_dwell_delay();
-
-  if (is_dwell_scheduled()) {
-    // if the dwell is already scheduled then it has overshot - need to reschedule
-    System::disable_dwell_interrupt();
-    Timing::current_timing_mode = TIMING_IMMEDIATE; // Force immediate dwell
-  } else if (is_dwelling()) {
-      System::set_spark_compare(spark_delay_ticks_0 + trigger_tcnt);
-  } 
-
-  uint16_t when;
-  current_ticks_after_calculation = System::get_timer_count();
-  //lead_time_after_calculation = trigger_tcnt + dwell_delay_ticks_0 - current_ticks_after_calculation;  // Unsigned subtraction handles wraparound
-
-  if (Timing::current_timing_mode == TIMING_STARTUP) {
-     if (spark_delay_ticks_0 < dwell_ticks) {
-       Timing::current_timing_mode = TIMING_PREVIOUS_LOBE;
-       when = trigger_tcnt + dwell_delay_ticks_1;
-     } else {
-       Timing::current_timing_mode = TIMING_SAME_LOBE;
-       when = trigger_tcnt + dwell_delay_ticks_0;
-     }
-
-
-  } else if (Timing::current_timing_mode == TIMING_SAME_LOBE) {
-    when = trigger_tcnt + dwell_delay_ticks_0;
-    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
-     // Check if we are too close to the dwell time
-    if (immediate_dwell_ticks < MAX_DWELL_TICKS && immediate_dwell_ticks > MIN_DWELL_TICKS) {
-      // Too close or already past - switch to previous lobe timing
-      Timing::current_timing_mode = TIMING_IMMEDIATE;
-
-    }
-  } else if (Timing::current_timing_mode == TIMING_PREVIOUS_LOBE) {
-    when = trigger_tcnt + dwell_delay_ticks_0;
-    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
-     // Check if the next dwell time is likely to be a candidate for immediate dwell
-    if (immediate_dwell_ticks < MAX_DWELL_TICKS && immediate_dwell_ticks > MIN_DWELL_TICKS) {
-      // Too close or already past - switch to previous lobe timing
-      Timing::current_timing_mode = TIMING_IMMEDIATE;
-
-    } else {
-      when = trigger_tcnt + dwell_delay_ticks_1;
-
-    }
-  } 
-  
-
-
-
- if (Timing::current_timing_mode == TIMING_IMMEDIATE && !is_dwelling()) {
-    when = trigger_tcnt + dwell_delay_ticks_0;
-
-    // Too close or already past - start dwell immediately
-    Timing::current_timing_mode = TIMING_IMMEDIATE;  // Mark as immediate dwell
-    System::spark_pin_low();  // Start dwell immediately (coil charging)
-    Timing::dwell_actual_started_tcnt = System::get_timer_count();
-    // State is now DWELLING (spark pin is LOW)
-    
-    // Calculate the original planned spark time to maintain timing accuracy
-    // Original spark time = when + dwell_ticks
-    uint16_t original_spark_time = when + Timing::dwell_ticks;
-
-    // Schedule spark timing at the original planned time (skip dwell interrupt)
-    System::clear_spark_flag();
-    System::set_spark_compare(original_spark_time);  // Maintain original spark timing
-    System::enable_spark_interrupt();
-    
-    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
-    if (immediate_dwell_ticks < MIN_DWELL_TICKS ) {
-      // If we are already past the original spark time, fire spark immediately
-      when = trigger_tcnt + dwell_delay_ticks_1;
-      Timing::current_timing_mode = TIMING_PREVIOUS_LOBE;
-    } else if (immediate_dwell_ticks > MAX_DWELL_TICKS) {
-      // If we have enough time for a full dwell, schedule normally
-      when = trigger_tcnt + dwell_delay_ticks_0;
-      Timing::current_timing_mode = TIMING_SAME_LOBE;
-    }
-
-    
+  void set_engine_ready() {
+    engine_state = READY;
+    stall_start_millis = 0;
+    crank_timer = 0;
+    n_ready_triggers = 0;
   }
-  
-  if (Timing::current_timing_mode != TIMING_IMMEDIATE) {
-      // Safe to schedule normally
-      System::clear_dwell_flag();   // clear stale flag
-      System::set_dwell_compare(when);         // set absolute time
-      System::enable_dwell_interrupt(); // enable dwell interrupt
-      // State is now DWELL_SCHEDULED (COMPA interrupt enabled)
- }
-}
 
-// Schedule a COMPB one-shot for spark fire (dwell duration from now)
-static inline void schedule_spark() {
-  uint16_t spark_time = System::get_timer_count() + dwell_ticks;
-  System::clear_spark_flag();
-  System::set_spark_compare(spark_time);
-  System::enable_spark_interrupt();
-}
-
-static inline void start_dwell() {
-  // Fast pin clear - LOW to start dwell
-  System::spark_pin_low();  // State becomes DWELLING when pin goes LOW
-
-  // Schedule spark to fire after dwell period
-  schedule_spark();
-}
-
-static inline void adjust_period_for_wraparound(uint32_t& period_ticks_candidate, uint32_t period_millis_candidate) {
-
-  uint32_t expected_period_ticks = period_millis_candidate * (Timing::TIMER_TICKS_PER_SEC / 1000UL);
-  // Adjust for possible Timer1 wraparound (every 65536 ticks)
-  uint32_t num_wraps = (expected_period_ticks) / 0x10000; // Round to nearest)
-  period_ticks_candidate = period_ticks_candidate + num_wraps * 0x10000;
-
-  int32_t error = (int32_t)period_ticks_candidate - (int32_t)expected_period_ticks;
-  if (error < -20000 || error > 20000) {
-    if (error > 0) {
-      period_ticks_candidate -= 0x10000;
-    } else {
-      period_ticks_candidate += 0x10000;
-    }
+  void set_engine_cranking() {
+    spark_enabled = true;
+    engine_state = CRANKING;
+    stall_start_millis = 0;
+    crank_timer = 0;
   }
-}
 
-  static inline void update_engine_state() {
+  void set_engine_running() {
+    spark_enabled = true;
+    engine_state = RUNNING;
+    stall_start_millis = 0;
+    crank_timer = 0;
+  }
+
+  void update_engine_state() {
     uint16_t current_rpm = Timing::rpm;
     uint32_t current_millis = millis();
-    bool starter_is_active = starter_active();
+    bool starter_is_active = Hardware::starter_active();
 
+    // Over-rev protection with hysteresis
     if (!over_rev_active) {
-      if (current_rpm > OVERREV_RPM) {
+      if (current_rpm > Config::OVERREV_RPM) {
         over_rev_active = true;
-        spark_enabled = false; // Disable spark
+        spark_enabled = false;
       }
     } else {
-      // Currently in over-rev state
-      if (current_rpm < (OVERREV_RPM - OVERREV_HYST_RPM)) {
+      if (current_rpm < (Config::OVERREV_RPM - Config::OVERREV_HYST_RPM)) {
         over_rev_active = false;
-        spark_enabled = true; // Re-enable spark
+        spark_enabled = true;
       }
     }
 
+    // State machine transitions
     switch (engine_state) {
       case RUNNING:
-        if (current_rpm < IDLE_MIN_RPM && !starter_is_active) {
-          if (stall_start_millis !=0 && current_millis - stall_start_millis > STALL_TIMEOUT_MS) {
+        if (current_rpm < Config::IDLE_MIN_RPM && !starter_is_active) {
+          if (stall_start_millis != 0 && current_millis - stall_start_millis > Config::STALL_TIMEOUT_MS) {
             set_engine_stopped();
           } else if (stall_start_millis == 0) {
             stall_start_millis = current_millis;
           }
-        } else if (current_rpm < IDLE_MIN_RPM && starter_is_active) {
-          // If the starter is active, we consider the engine as cranking
+        } else if (current_rpm < Config::IDLE_MIN_RPM && starter_is_active) {
           set_engine_cranking();
-        } 
-   
+        }
         break;
 
       case STOPPED:
-            if ((n_ready_triggers < HOLT_INIT_SAMPLES || current_rpm < MIN_RPM) && starter_is_active) {
-              n_ready_triggers++;
-            } else if (n_ready_triggers >= HOLT_INIT_SAMPLES && current_rpm >= MIN_RPM && starter_is_active) {
-              set_engine_ready();
-            }
+        if ((n_ready_triggers < Config::HOLT_INIT_SAMPLES || current_rpm < Config::MIN_RPM) && starter_is_active) {
+          n_ready_triggers++;
+        } else if (n_ready_triggers >= Config::HOLT_INIT_SAMPLES && current_rpm >= Config::MIN_RPM && starter_is_active) {
+          set_engine_ready();
+        }
         break;
 
       case READY:
-        if (starter_is_active && current_rpm <= CRANK_MAX_RPM) {
-          if (crank_timer != 0 && current_millis - crank_timer > CRANK_DEBOUNCE_MS) {
+        if (starter_is_active && current_rpm <= Config::CRANK_MAX_RPM) {
+          if (crank_timer != 0 && current_millis - crank_timer > Config::CRANK_DEBOUNCE_MS) {
             set_engine_cranking();
           } else if (crank_timer == 0) {
             crank_timer = current_millis;
           }
-        } else if (current_rpm > CRANK_MAX_RPM) {
-          // If RPM exceeds crank max while ready, might need to go to running
-          if (current_rpm >= IDLE_MIN_RPM) {
+        } else if (current_rpm > Config::CRANK_MAX_RPM) {
+          if (current_rpm >= Config::IDLE_MIN_RPM) {
             set_engine_running();
           }
         }
         break;
 
       case CRANKING:
-        if (current_rpm >= IDLE_MIN_RPM) {
+        if (current_rpm >= Config::IDLE_MIN_RPM) {
           set_engine_running();
-        } else if (!starter_is_active && current_rpm < CRANK_MAX_RPM) {
+        } else if (!starter_is_active && current_rpm < Config::CRANK_MAX_RPM) {
           set_engine_stopped();
-        } 
-
+        }
         break;
     }
   }
-
 }
-// External interrupt: crank trigger
+
+// =============================================================================
+// IGNITION CONTROL FUNCTIONS
+// =============================================================================
+
+// Fire spark (called from Timer1 Compare B ISR)
+inline void fire_spark() {
+  Hardware::spark_pin_high();
+  Timing::dwell_actual_ended_tcnt = Hardware::get_timer_count();
+}
+
+// Start dwell (called from Timer1 Compare A ISR)
+inline void start_dwell() {
+  Hardware::spark_pin_low();
+
+  // Schedule spark after dwell period
+  uint16_t spark_time = Hardware::get_timer_count() + Timing::dwell_ticks;
+  Hardware::clear_spark_flag();
+  Hardware::set_spark_compare(spark_time);
+  Hardware::enable_spark_interrupt();
+}
+
+// Schedule dwell start (called from trigger ISR)
+void schedule_dwell() {
+  using namespace Timing;
+  using namespace Engine;
+
+  // Calculate all timing values
+  calculate_dwell();
+  calculate_spark_delay();
+  calculate_dwell_delay();
+
+  // Handle already scheduled dwell
+  if (Hardware::is_dwell_scheduled()) {
+    Hardware::disable_dwell_interrupt();
+    Engine::timing_mode = Engine::TIMING_IMMEDIATE;
+  } else if (Hardware::is_dwelling()) {
+    Hardware::set_spark_compare(spark_delay_ticks_0 + trigger_tcnt);
+  }
+
+  uint16_t when;
+  current_ticks_after_calculation = Hardware::get_timer_count();
+
+  // Select timing mode
+  if (Engine::timing_mode == Engine::TIMING_STARTUP) {
+    if (spark_delay_ticks_0 < dwell_ticks) {
+      Engine::timing_mode = Engine::TIMING_PREVIOUS_LOBE;
+      when = trigger_tcnt + dwell_delay_ticks_1;
+    } else {
+      Engine::timing_mode = Engine::TIMING_SAME_LOBE;
+      when = trigger_tcnt + dwell_delay_ticks_0;
+    }
+  } else if (Engine::timing_mode == Engine::TIMING_SAME_LOBE) {
+    when = trigger_tcnt + dwell_delay_ticks_0;
+    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
+    if (immediate_dwell_ticks < Config::MAX_DWELL_TICKS && immediate_dwell_ticks > Config::MIN_DWELL_TICKS) {
+      Engine::timing_mode = Engine::TIMING_IMMEDIATE;
+    }
+  } else if (Engine::timing_mode == Engine::TIMING_PREVIOUS_LOBE) {
+    when = trigger_tcnt + dwell_delay_ticks_0;
+    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
+    if (immediate_dwell_ticks < Config::MAX_DWELL_TICKS && immediate_dwell_ticks > Config::MIN_DWELL_TICKS) {
+      Engine::timing_mode = Engine::TIMING_IMMEDIATE;
+    } else {
+      when = trigger_tcnt + dwell_delay_ticks_1;
+    }
+  }
+
+  // Handle immediate dwell
+  if (Engine::timing_mode == Engine::TIMING_IMMEDIATE && !Hardware::is_dwelling()) {
+    when = trigger_tcnt + dwell_delay_ticks_0;
+    Hardware::spark_pin_low();
+    dwell_actual_started_tcnt = Hardware::get_timer_count();
+
+    uint16_t original_spark_time = when + dwell_ticks;
+    Hardware::clear_spark_flag();
+    Hardware::set_spark_compare(original_spark_time);
+    Hardware::enable_spark_interrupt();
+
+    uint16_t immediate_dwell_ticks = when - current_ticks_after_calculation + dwell_ticks;
+    if (immediate_dwell_ticks < Config::MIN_DWELL_TICKS) {
+      when = trigger_tcnt + dwell_delay_ticks_1;
+      Engine::timing_mode = Engine::TIMING_PREVIOUS_LOBE;
+    } else if (immediate_dwell_ticks > Config::MAX_DWELL_TICKS) {
+      when = trigger_tcnt + dwell_delay_ticks_0;
+      Engine::timing_mode = Engine::TIMING_SAME_LOBE;
+    }
+  }
+
+  // Schedule normal dwell
+  if (Engine::timing_mode != Engine::TIMING_IMMEDIATE) {
+    Hardware::clear_dwell_flag();
+    Hardware::set_dwell_compare(when);
+    Hardware::enable_dwell_interrupt();
+  }
+}
+
+// =============================================================================
+// INTERRUPT SERVICE ROUTINES
+// =============================================================================
+
+// External interrupt: crank trigger (INT0)
 ISR(INT0_vect) {
-  uint16_t tcnt_candidate = System::get_timer_count();  // Snapshot Timer1 as early as possible
-  uint32_t millis_candidate = millis(); // Snapshot millis for timestamp
-  
+  uint16_t tcnt_candidate = Hardware::get_timer_count();
+  uint32_t millis_candidate = millis();
 
-  
-  // Capture entry state
-  bool dwelling_entry = Timing::is_dwelling();
-  bool dwell_scheduled_entry = Timing::is_dwell_scheduled();
+  // Capture entry state for diagnostics
+  bool dwelling_entry = Hardware::is_dwelling();
+  bool dwell_scheduled_entry = Hardware::is_dwell_scheduled();
 
-
-
-
-  // Calculate period in ticks for noise filtering (avoid expensive microsecond conversion)
+  // Calculate period
   uint32_t period_ticks_candidate = (uint32_t)(tcnt_candidate - Timing::trigger_tcnt);
   uint32_t period_millis_candidate = millis_candidate - Timing::trigger_millis;
 
-  // Adjust for possible Timer1 wraparound
+  // Adjust for Timer1 wraparound
   Timing::adjust_period_for_wraparound(period_ticks_candidate, period_millis_candidate);
 
-
-  const uint32_t min_valid_ticks = max((Timing::period_ticks/3) , Timing::MIN_PERIOD_TICKS); // 33% or absolute min
-
-  // 30% window filter: ignore triggers that are less than 30% of the previous period
-  // Only apply if we have a valid previous period (after first pulse)
-  if (period_ticks_candidate < min_valid_ticks && Timing::spark_enabled) {
+  // Noise filter: reject triggers < 33% of previous period
+  const uint32_t min_valid_ticks = max((Timing::period_ticks / 3), Config::MIN_PERIOD_TICKS);
+  if (period_ticks_candidate < min_valid_ticks && Engine::spark_enabled) {
     return;
   }
 
-#ifdef ENABLE_DIAGNOSTIC_LOGGING
-  Timing::next_trigger_id++;
-#endif
+  #ifdef ENABLE_DIAGNOSTIC_LOGGING
+  Diagnostics::next_trigger_id++;
+  #endif
 
-
-
+  // Update timing measurements
   Timing::period_ticks = period_ticks_candidate;
   Timing::period_millis = period_millis_candidate;
   Timing::predicted_period_ticks = Timing::period_ticks;
   Timing::trigger_tcnt = tcnt_candidate;
   Timing::trigger_millis = millis_candidate;
+
+  // Calculate RPM and update engine state
   Timing::calculate_rpm();
+  Engine::update_engine_state();
 
-  
+  // Capture timing mode before scheduling
+  uint8_t timing_mode_before = Engine::timing_mode;
 
-  Timing::update_engine_state();
-  
-
-
-  // Capture timing mode before schedule_dwell modifies it
-    uint8_t timing_mode_before = Timing::current_timing_mode;
-
-  // Update engine timing state
-  if (Timing::spark_enabled) {
-
-
-
-    
-    // Schedule dwell start (calculations done inside using predicted period)
-    Timing::schedule_dwell();
+  // Schedule ignition if enabled
+  if (Engine::spark_enabled) {
+    schedule_dwell();
   }
-    
-    // Store trigger event with final state (timing mode captured before and after)
-    Timing::store_trigger_event(dwelling_entry, dwell_scheduled_entry, tcnt_candidate, timing_mode_before);
-  
+
+  // Store diagnostic event
+  Diagnostics::store_trigger_event(dwelling_entry, dwell_scheduled_entry, tcnt_candidate, timing_mode_before);
 }
 
-
-
-// Timer1 COMPA interrupt (dwell start)
+// Timer1 Compare A interrupt: dwell start
 ISR(TIMER1_COMPA_vect) {
-    Timing::dwell_actual_started_tcnt = System::get_timer_count();
-    System::disable_dwell_interrupt(); // Disable dwell interrupt
-    Timing::start_dwell();
+  Timing::dwell_actual_started_tcnt = Hardware::get_timer_count();
+  Hardware::disable_dwell_interrupt();
+  start_dwell();
 }
 
-// Timer1 COMPB interrupt (spark fire)
+// Timer1 Compare B interrupt: spark fire
 ISR(TIMER1_COMPB_vect) {
-    System::disable_spark_interrupt(); // Disable spark interrupt
-    Timing::fire_spark();
-
-
+  Hardware::disable_spark_interrupt();
+  fire_spark();
 }
 
-
-
-
+// =============================================================================
+// MAIN PROGRAM
+// =============================================================================
 
 void setup() {
   Serial.begin(115200);
-  
-  // Clear startup banner
+
+  // Print startup banner
   Serial.println();
   Serial.println(F("==========================================="));
-  Serial.println(F("  ROTAX 787 IGNITION CONTROLLER v2.0"));
+  Serial.println(F("  ROTAX 787 IGNITION CONTROLLER v2.1"));
   Serial.println(F("  Arduino-based timing controller"));
   Serial.println(F("==========================================="));
   Serial.println();
-  
+
   // System configuration
   Serial.println(F("[INIT] System Configuration:"));
-  Serial.print(F("  Timer Resolution: ")); Serial.print(1.0 / Timing::TIMER_TICKS_PER_SEC * 1000000.0, 1); Serial.println(F(" μs/tick"));
-  Serial.print(F("  Target Dwell: ")); Serial.print(Timing::NOMINAL_DWELL_TICKS * 0.5 / 1000.0, 1); Serial.println(F(" ms"));
-  Serial.print(F("  RPM Range: ")); Serial.print(Timing::MIN_RPM); Serial.print(F(" - ")); Serial.print(Timing::MAX_RPM); Serial.println(F(" RPM"));
-  Serial.print(F("  Rev Limiter: ")); Serial.print(Timing::OVERREV_RPM); Serial.println(F(" RPM"));
+  Serial.print(F("  Timer Resolution: "));
+  Serial.print(Config::TIMER_RESOLUTION_US, 1);
+  Serial.println(F(" μs/tick"));
+  Serial.print(F("  Target Dwell: "));
+  Serial.print(Config::NOMINAL_DWELL_TS / 10.0, 1);
+  Serial.println(F(" ms"));
+  Serial.print(F("  RPM Range: "));
+  Serial.print(Config::MIN_RPM);
+  Serial.print(F(" - "));
+  Serial.print(Config::MAX_RPM);
+  Serial.println(F(" RPM"));
+  Serial.print(F("  Rev Limiter: "));
+  Serial.print(Config::OVERREV_RPM);
+  Serial.println(F(" RPM"));
   Serial.println();
 
   // Hardware initialization
   Serial.println(F("[INIT] Hardware Setup:"));
-  
-  // Initialize spark pin
-  System::set_spark_pin_output();
-  System::set_spark_pin_safe();  // Initialize HIGH (safe state - no dwell)
-  Serial.print(F("  Spark Output (D")); Serial.print(System::SPARK_PIN); Serial.println(F("): SAFE (HIGH)"));
 
-  // Initialize relay control
-  System::setup_relay();
-  Serial.print(F("  Safety Relay (D")); Serial.print(System::RELAY_PIN); Serial.println(F("): DISARMED (LOW)"));
-  
-  // Initialize starter input
-  System::setup_starter_input();
-  Serial.print(F("  Starter Input (D")); Serial.print(System::STARTER_PIN); Serial.println(F("): CONFIGURED"));
+  Hardware::set_spark_pin_output();
+  Hardware::set_spark_pin_safe();
+  Serial.print(F("  Spark Output (D"));
+  Serial.print(Config::SPARK_PIN);
+  Serial.println(F("): SAFE (HIGH)"));
 
-  // Setup external interrupt for crank trigger
-  System::setup_trigger_interrupt();
-  Serial.print(F("  Trigger Input (D")); Serial.print(System::TRIGGER_PIN); Serial.println(F("): INT0 ENABLED"));
+  Hardware::setup_relay();
+  Serial.print(F("  Safety Relay (D"));
+  Serial.print(Config::RELAY_PIN);
+  Serial.println(F("): DISARMED (LOW)"));
 
-  // Setup Timer1 with prescaler /8 (0.5 us/tick)
-  System::setup_timer();
+  Hardware::setup_starter_input();
+  Serial.print(F("  Starter Input (D"));
+  Serial.print(Config::STARTER_PIN);
+  Serial.println(F("): CONFIGURED"));
+
+  Hardware::setup_trigger_interrupt();
+  Serial.print(F("  Trigger Input (D"));
+  Serial.print(Config::TRIGGER_PIN);
+  Serial.println(F("): INT0 ENABLED"));
+
+  Hardware::setup_timer();
   Serial.println(F("  Timer1: CONFIGURED (Prescaler /8)"));
 
   sei();
   Serial.println(F("  Interrupts: ENABLED"));
   Serial.println();
-  
+
   // Engine state information
   Serial.println(F("[INIT] Engine State Machine:"));
   Serial.println(F("  Current State: STOPPED"));
   Serial.println(F("  Waiting for starter signal and triggers..."));
   Serial.println();
-  
+
   // Safety warnings
   Serial.println(F("[SAFETY] Protection Systems Active:"));
   Serial.println(F("  ✓ Relay protection (1-second delay)"));
-  Serial.println(F("  ✓ Rev limiter (7500 RPM)"));
+  Serial.println(F("  ✓ Rev limiter (7000 RPM)"));
   Serial.println(F("  ✓ Duty cycle protection (40% max)"));
   Serial.println(F("  ✓ Trigger timeout (500ms)"));
   Serial.println(F("  ✓ Startup protection (2-trigger minimum)"));
   Serial.println();
-  
-  Serial.println(F("[READY] Controller initialized - Monitoring for engine activity..."));
+
+  Serial.println(F("[READY] Controller initialized"));
   Serial.println(F("==========================================="));
   Serial.println();
 }
 
-
-
-
-
 void loop() {
   uint32_t current_millis = millis();
-  
-  // Print comprehensive diagnostics every 2 seconds
+
+  // Print diagnostics every 2 seconds
   static uint32_t last_diagnostic_millis = 0;
-  if (current_millis - last_diagnostic_millis >= 2000) {
+  if (current_millis - last_diagnostic_millis >= Config::DIAGNOSTIC_INTERVAL_MS) {
     last_diagnostic_millis = current_millis;
-    
-    const char* state_names[] = {"READY", "RUNNING", "CRANKING", "STOPPED"};
+
+    const char* state_names[] = {"STOPPED", "READY", "CRANKING", "RUNNING"};
     const char* timing_mode_names[] = {"SAME_LOBE", "PREV_LOBE", "IMMEDIATE", "STARTUP"};
-    
+
     Serial.print(F("State: "));
-    Serial.print(state_names[Timing::engine_state]);
+    Serial.print(state_names[Engine::engine_state]);
     Serial.print(F(" | RPM: "));
     Serial.print(Timing::rpm);
     Serial.print(F(" | Starter: "));
-    Serial.print(Timing::starter_active() ? F("ON") : F("OFF"));
+    Serial.print(Hardware::starter_active() ? F("ON") : F("OFF"));
     Serial.print(F(" | Spark: "));
-    Serial.print(Timing::spark_enabled ? F("EN") : F("DIS"));
-    
-    if (Timing::spark_enabled) {
+    Serial.print(Engine::spark_enabled ? F("EN") : F("DIS"));
+
+    if (Engine::spark_enabled) {
       Serial.print(F(" | Timing: "));
-      Serial.print(timing_mode_names[Timing::current_timing_mode]);
+      Serial.print(timing_mode_names[Engine::timing_mode]);
       Serial.print(F(" | Adv: "));
       Serial.print(Timing::advance_tenths_0 / 10);
       Serial.print(F("."));
       Serial.print(Timing::advance_tenths_0 % 10);
       Serial.print(F("°"));
-      
+
       if (Timing::period_ticks > 0) {
         Serial.print(F(" | Dwell: "));
         Serial.print(Timing::ticks_to_us(Timing::dwell_ticks) / 1000);
@@ -1209,37 +1212,35 @@ void loop() {
         Serial.print(F("ms"));
       }
     }
-    
-    if (Timing::over_rev_active) {
+
+    if (Engine::over_rev_active) {
       Serial.print(F(" | OVERREV!"));
     }
-    
+
     Serial.println();
   }
-  
-  // Check if no triggers received for 500ms - engine must be stopped
-  if (Timing::trigger_millis > 0) {  // Only check if we've received at least one trigger
-    uint32_t time_since_trigger = current_millis - Timing::trigger_millis;
 
-    if (current_millis > Timing::trigger_millis && time_since_trigger > 500 && Timing::engine_state != Timing::STOPPED) {
+  // Check for trigger timeout
+  if (Timing::trigger_millis > 0) {
+    uint32_t time_since_trigger = current_millis - Timing::trigger_millis;
+    if (current_millis > Timing::trigger_millis &&
+        time_since_trigger > Config::STALL_TIMEOUT_MS &&
+        Engine::engine_state != Engine::STOPPED) {
       Serial.print(F("No trigger for "));
       Serial.print(time_since_trigger);
       Serial.println(F("ms - Setting engine to STOPPED"));
-      Timing::set_engine_stopped();
+      Engine::set_engine_stopped();
     }
   }
-  
+
   // Arm relay when trigger pin is HIGH (with startup delay)
-  if (!System::relay_armed && digitalRead(System::TRIGGER_PIN)) {
-    if (System::startup_millis == 0) {
-      System::startup_millis = current_millis;  // Record the time when trigger went HIGH
-    } else if (current_millis - System::startup_millis > 1000) {  // 1-second delay
-      System::arm_relay();  // Open relay to arm coil
-      System::relay_armed = true;
-      Serial.println(F("Relay armed and ready")); 
+  if (!Hardware::relay_armed && digitalRead(Config::TRIGGER_PIN)) {
+    if (Hardware::startup_millis == 0) {
+      Hardware::startup_millis = current_millis;
+    } else if (current_millis - Hardware::startup_millis > Config::RELAY_ARM_DELAY_MS) {
+      Hardware::arm_relay();
+      Hardware::relay_armed = true;
+      Serial.println(F("Relay armed and ready"));
     }
-  } 
+  }
 }
-
-
-

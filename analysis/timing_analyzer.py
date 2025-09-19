@@ -14,17 +14,17 @@ from typing import List, Tuple, Dict, Optional
 
 # Signal mappings for VCD parsing
 SIGNAL_MAPPINGS = {
-    # Current VCD format (D2=trigger, D3=spark)  
+    # Current VCD format (D2=trigger, D3=spark)
     '0!': 'trigger_fall',   # D2 falling edge
     '1!': 'trigger_rise',   # D2 rising edge
     '0"': 'dwell_start',    # D3 falling edge (dwell start)
     '1"': 'spark_fire',     # D3 rising edge (spark fire)
-    
-    # Legacy format support  
-    '0#': 'd4_fall',
-    '1#': 'd4_rise',
-    '0$': 'dwell_start',
-    '1$': 'spark_fire',
+
+    # D4 and D5 signals (ignored for timing analysis)
+    '0#': 'd4_fall',        # D4 relay pin fall (ignored)
+    '1#': 'd4_rise',        # D4 relay pin rise (used for ready signal)
+    '0$': 'd5_fall',        # D5 starter pin fall (ignored)
+    '1$': 'd5_rise',        # D5 starter pin rise (ignored)
 }
 
 def parse_vcd_file(vcd_file: str) -> List[Tuple[int, str]]:
