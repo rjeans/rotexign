@@ -234,7 +234,8 @@ namespace Hardware {
   }
 
   inline bool starter_active() {
-    return digitalRead(STARTER_PIN) == HIGH;
+   // return digitalRead(STARTER_PIN) == HIGH;
+   return true;
   }
 
   // --------------------------------------------------------------------------
