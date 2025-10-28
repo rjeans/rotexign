@@ -65,7 +65,7 @@ namespace Config {
 
   // Engine configuration
   constexpr uint8_t PULSES_PER_REVOLUTION = 2;  // 2-stroke with dual pickups
-  constexpr uint16_t TRIGGER_BTDC_TENTHS = 470; // Trigger at 47.0° BTDC
+  constexpr uint16_t TRIGGER_BTDC_TENTHS = 435; // Trigger at 43.5° BTDC
 
   // RPM thresholds
   constexpr uint16_t MIN_RPM = 200;              // Minimum detectable RPM
