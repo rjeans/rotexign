@@ -34,11 +34,11 @@ This document provides the theoretical background, physical principles, and desi
   
 
 ### 2.5 Trigger and Advance Angles
-- The trigger point occurs **47° before TDC** of the piston.
+- The trigger point occurs **43.5° before TDC** of the piston.
 - Ignition advance curve determines how many degrees before TDC the spark occurs.
 - Window available for dwell when using the same lobe:
   
-  $$t_{\text{window}} = \frac{(47^\circ - \text{advance})}{360^\circ} \cdot \frac{60000}{\text{RPM}}$$
+  $$t_{\text{window}} = \frac{(43.5^\circ - \text{advance})}{360^\circ} \cdot \frac{60000}{\text{RPM}}$$
   
 - If $t_{\text{window}} < t_{\text{dwell}}$, then previous-lobe timing must be used.
 
