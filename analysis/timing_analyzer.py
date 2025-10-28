@@ -286,7 +286,7 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
             if period_us > 0:
                 degrees_per_us = 180.0 / period_us
                 delay_degrees = delay_us * degrees_per_us
-                advance_degrees = 47.0 - delay_degrees  # 47° is TDC position
+                advance_degrees = 43.5 - delay_degrees  # 43.5° is TDC position
             else:
                 delay_degrees = None
                 advance_degrees = None
@@ -303,7 +303,7 @@ def analyze_triggers(vcd_file: str) -> List[Dict]:
         
         # Convert theoretical advance to delay in microseconds
         # theoretical_advance is degrees BTDC, delay is degrees ATDC
-        theoretical_delay_degrees = 47.0 - theoretical_advance  # 47° is TDC position
+        theoretical_delay_degrees = 43.5 - theoretical_advance  # 43.5° is TDC position
         degrees_per_us = 180.0 / period_us if period_us > 0 else 0
         theoretical_delay_us = theoretical_delay_degrees / degrees_per_us if degrees_per_us > 0 else None
         
